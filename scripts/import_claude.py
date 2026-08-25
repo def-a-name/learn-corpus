@@ -430,7 +430,7 @@ def unit_skip_reason(unit: ExportUnit) -> str:
     if parsed is None or not parsed.human_user_count:
         return "runtime_only_session" if unit.prefilter_skip_reason == "runtime_only_session" else "no_human_user"
     if not parsed.exchanges:
-        return "no_confirmed_exchange"
+        return "no_final_visible"
     trivial = {"hi", "hello", "hey", "你好", "您好", "test", "测试"}
     normalized_users = {
         re.sub(r"[\s.!！?？,，]+", "", exchange.user_text).lower() for exchange in parsed.exchanges

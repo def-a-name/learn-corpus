@@ -97,7 +97,7 @@ def build_inventory(
                 skip_reasons[reason] += 1
             else:
                 retained += 1
-            if reason in {"no_confirmed_exchange", "document_classification_review"}:
+            if reason == "document_classification_review":
                 status = "review"
             elif reason:
                 status = "excluded"
