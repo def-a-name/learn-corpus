@@ -18,6 +18,7 @@ from wiki_core import (
     REPO_ROOT,
     clean_message,
     derive_title,
+    format_line_locator,
     load_manifest,
     redact_secrets,
     relative_to_repo,
@@ -94,6 +95,8 @@ class ExportUnit:
     locator: str
     content: str
     content_hash: str
+    start_line: int = 1
+    end_line: int = 1
     cwd: str = ""
     claude_version: str = ""
     user_turns: int | None = None
@@ -109,7 +112,7 @@ class _PendingExchange:
     turn_index: int
     user_text: str
     user_locator: str
-    assistant_blocks: list[tuple[int, str, bool]]
+    assistant_blocks: list[tuple[int, str, bool, int, int]]
     interrupted: bool = False
 
 
@@ -205,7 +208,7 @@ def _parse_assistant_block(raw: str) -> tuple[str, int, int, int]:
     return clean_message(without_tools), tool_count, tool_result_count, reasoning_count
 
 
-def parse_session(section: str, locator: str) -> SessionParse:
+def parse_session(section: str, locator: str, start_line: int = 1) -> SessionParse:
     matches = list(MESSAGE_HEADING.finditer(section))
     exchanges: list[ClaudeExchange] = []
     pending: _PendingExchange | None = None
@@ -226,8 +229,11 @@ def parse_session(section: str, locator: str) -> SessionParse:
         nonlocal pending, omitted_process, omitted_unpaired
         if pending is None:
             return
-        selected: tuple[int, str, bool] | None = None
-        last_tool_block = max((index for index, _, has_tool in pending.assistant_blocks if has_tool), default=-1)
+        selected: tuple[int, str, bool, int, int] | None = None
+        last_tool_block = max(
+            (index for index, _, has_tool, _, _ in pending.assistant_blocks if has_tool),
+            default=-1,
+        )
         if not pending.interrupted:
             candidates = [
                 item for item in pending.assistant_blocks if item[1] and not item[2] and item[0] > last_tool_block
@@ -240,20 +246,24 @@ def parse_session(section: str, locator: str) -> SessionParse:
         if selected is None:
             omitted_unpaired += 1
         else:
-            assistant_index, assistant_text, _ = selected
+            assistant_index, assistant_text, _, assistant_start, assistant_end = selected
             exchanges.append(
                 ClaudeExchange(
                     turn_index=pending.turn_index,
                     user_text=pending.user_text,
                     assistant_text=assistant_text,
                     user_locator=pending.user_locator,
-                    assistant_locator=f"{locator}/Assistant:{assistant_index}",
+                    assistant_locator=format_line_locator(
+                        f"{locator}/Assistant:{assistant_index}", assistant_start, assistant_end
+                    ),
                 )
             )
         pending = None
 
     for index, match in enumerate(matches, start=1):
         end = matches[index].start() if index < len(matches) else len(section)
+        block_start_line = start_line + section.count("\n", 0, match.start())
+        block_end_line = start_line + section.count("\n", 0, end) - (1 if end < len(section) else 0)
         raw = section[match.end() : end].strip()
         user_match = USER_HEADING.fullmatch(match.group(0))
         if user_match:
@@ -267,7 +277,9 @@ def parse_session(section: str, locator: str) -> SessionParse:
                 pending = _PendingExchange(
                     turn_index=turn_index,
                     user_text=text,
-                    user_locator=f"{locator}/Turn:{turn_index}/User",
+                    user_locator=format_line_locator(
+                        f"{locator}/Turn:{turn_index}/User", block_start_line, block_end_line
+                    ),
                     assistant_blocks=[],
                 )
             elif classification == "interruption":
@@ -292,7 +304,9 @@ def parse_session(section: str, locator: str) -> SessionParse:
             if text:
                 omitted_process += 1
             continue
-        pending.assistant_blocks.append((assistant_blocks, text, tool_count > 0))
+        pending.assistant_blocks.append(
+            (assistant_blocks, text, tool_count > 0, block_start_line, block_end_line)
+        )
 
     finish_pending()
     if omitted_unpaired:
@@ -338,6 +352,8 @@ def iter_export_units(input_dir: Path, kind: str = "all") -> Iterable[ExportUnit
                 heading_start = text.find("# Session:", match.start(), match.end())
                 section = text[heading_start:end].strip()
                 section = re.sub(r"\n\n---\s*$", "", section).strip()
+                section_start_line = text.count("\n", 0, heading_start) + 1
+                section_end_line = section_start_line + section.count("\n")
                 created = _field(section, "Date")[:10] or "unknown"
                 cwd = _field(section, "Working Directory")
                 claude_version = _field(section, "Claude Code Version")
@@ -346,8 +362,9 @@ def iter_export_units(input_dir: Path, kind: str = "all") -> Iterable[ExportUnit
                 occurrences[raw_title] += 1
                 identity = raw_title if occurrences[raw_title] == 1 else f"{raw_title}#{occurrences[raw_title]}"
                 source_id = _stable_id(relative_path, "session", identity, created, cwd)
-                locator = f"{relative_path}#Session:{index}"
-                parsed = parse_session(section, locator)
+                semantic_locator = f"{relative_path}#Session:{index}"
+                locator = format_line_locator(semantic_locator, section_start_line, section_end_line)
+                parsed = parse_session(section, semantic_locator, section_start_line)
                 title_messages = [
                     {"role": "user", "text": exchange.user_text} for exchange in parsed.exchanges
                 ] or [{"role": "user", "text": raw_title}]
@@ -362,6 +379,8 @@ def iter_export_units(input_dir: Path, kind: str = "all") -> Iterable[ExportUnit
                     locator=locator,
                     content=section,
                     content_hash=hashlib.sha256(section.encode("utf-8")).hexdigest(),
+                    start_line=section_start_line,
+                    end_line=section_end_line,
                     cwd=cwd,
                     claude_version=claude_version,
                     user_turns=user_turns,
@@ -376,6 +395,10 @@ def iter_export_units(input_dir: Path, kind: str = "all") -> Iterable[ExportUnit
             title = heading.group(1).strip() if heading else path.stem
             document_kind = _document_kind(relative_path, text)
             source_id = _stable_id(relative_path, "document", title, "unknown", "")
+            document = text.strip()
+            document_offset = text.find(document)
+            document_start_line = text.count("\n", 0, document_offset) + 1
+            document_end_line = document_start_line + document.count("\n")
             yield ExportUnit(
                 source_id=source_id,
                 kind="document",
@@ -383,9 +406,11 @@ def iter_export_units(input_dir: Path, kind: str = "all") -> Iterable[ExportUnit
                 created="unknown",
                 project=path.parent.name if path.parent != input_dir else path.stem,
                 source_path=path,
-                locator=relative_path,
-                content=text.strip(),
+                locator=format_line_locator(relative_path, document_start_line, document_end_line),
+                content=document,
                 content_hash=sha256_file(path),
+                start_line=document_start_line,
+                end_line=document_end_line,
                 document_kind=document_kind,
             )
 
@@ -427,10 +452,13 @@ def unit_inventory_record(unit: ExportUnit, parse_status: str | None = None, ski
         "derived_session_key": unit.derived_session_key or None,
         "identity_confidence": "derived" if unit.kind == "session" else "path-derived",
         "project": unit.project,
+        "title": unit.title,
         "created": unit.created,
         "raw_source_path": str(unit.source_path.resolve()),
         "raw_source_hash": f"sha256:{unit.content_hash}",
         "raw_source_locator": unit.locator,
+        "raw_source_start_line": unit.start_line,
+        "raw_source_end_line": unit.end_line,
         "source_completeness": "summary" if unit.kind == "session" else "full",
         "event_count_scope": "export-visible" if unit.kind == "session" else "document",
         "assistant_final_detection": (

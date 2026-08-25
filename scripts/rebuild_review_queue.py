@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from wiki_core import MANIFEST_PATH, REPO_ROOT, load_manifest
+from wiki_core import MANIFEST_PATH, REPO_ROOT, load_manifest, parse_line_locator
 
 
 DEFAULT_INVENTORY = REPO_ROOT / "meta" / "source-inventory.json"
@@ -45,7 +45,7 @@ def _review_items(manifest_path: Path, inventory_path: Path) -> list[dict[str, A
                     continue
                 by_id[source_id] = {
                     "source_id": source_id,
-                    "title": source_id,
+                    "title": unit.get("title") or source_id,
                     "provider": provider,
                     "created": unit.get("created", "unknown"),
                     "output_path": None,
@@ -54,6 +54,25 @@ def _review_items(manifest_path: Path, inventory_path: Path) -> list[dict[str, A
                     "reason": unit.get("skip_reason") or "inventory_parse_review",
                 }
     return sorted(by_id.values(), key=lambda item: (str(item.get("created", "")), item["source_id"]))
+
+
+def _raw_location_lines(item: dict[str, Any]) -> list[str]:
+    raw_path = str(item.get("raw_source_path") or "unknown")
+    raw_locator = str(item.get("raw_source_locator") or "unknown")
+    _, start_line, end_line = parse_line_locator(raw_locator)
+    lines = [
+        f"- **Raw path**：`{raw_path}`",
+        f"- **Raw locator**：`{raw_locator}`",
+    ]
+    if raw_path != "unknown" and start_line is not None and end_line is not None:
+        lines.extend(
+            (
+                f"- **Raw lines**：{start_line}–{end_line}",
+                f"- **打开原文**：[{Path(raw_path).name}:{start_line}](<{raw_path}:{start_line}>)",
+                f"- **CLI**：`python3 scripts/read_raw_locator.py '{raw_locator}' --line-numbers`",
+            )
+        )
+    return lines
 
 
 def build_queue(
@@ -77,19 +96,22 @@ def build_queue(
     else:
         for item in items:
             lines.extend(
-                [
+                (
                     f"## {item['title']}",
                     "",
                     f"- [ ] **来源 ID**：`{item['source_id']}`",
                     f"- **Provider**：`{item['provider']}`",
                     f"- **日期**：{item['created']}",
                     f"- **原因**：`{item['reason']}`",
-                    f"- **Raw path**：`{item.get('raw_source_path') or 'unknown'}`",
-                    f"- **Raw locator**：`{item.get('raw_source_locator') or 'unknown'}`",
+                )
+            )
+            lines.extend(_raw_location_lines(item))
+            lines.extend(
+                (
                     f"- **标准化文件**：`{item['output_path']}`" if item.get("output_path") else "- **标准化文件**：未生成",
                     "- **处理结果**：待人工核对后填写",
                     "",
-                ]
+                )
             )
     content = "\n".join(lines).rstrip() + "\n"
     if not dry_run:
