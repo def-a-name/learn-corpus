@@ -14,7 +14,16 @@ from wiki_core import REPO_ROOT
 
 
 ALLOW_MARKER = "secret-scan: allow"
-PLACEHOLDERS = {"[redacted]", "[masked]", "redacted", "masked", "changeme", "example", "placeholder"}
+PLACEHOLDERS = {
+    "[redacted]",
+    "[masked]",
+    "redacted",
+    "masked",
+    "changeme",
+    "example",
+    "placeholder",
+    "\\",
+}
 PATTERNS = (
     ("private_key", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----")),
     ("aws_access_key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),

@@ -166,12 +166,14 @@ def import_sessions(
             continue
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(document, encoding="utf-8")
+        manifest["version"] = max(int(manifest.get("version", 1)), 2)
         manifest["sources"][key] = {
             "origin": "codex",
             "source_path": str(path.resolve()),
             "source_hash": digest,
             "output_path": relative_to_repo(output_path),
-            "status": "pending" if current.get("source_hash") != digest else current.get("status", "pending"),
+            "ingest_status": "ready",
+            "curation_status": current.get("curation_status", "unassessed"),
             "title": title,
             "created": parsed["created"],
             "redaction_count": redactions,

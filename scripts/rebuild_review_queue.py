@@ -1,53 +1,93 @@
 #!/usr/bin/env python3
-"""根据 manifest 重建待整理来源列表。"""
+"""根据 inventory 和 manifest 重建来源导入问题队列。"""
 
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
+from typing import Any
 
 from wiki_core import MANIFEST_PATH, REPO_ROOT, load_manifest
 
 
-DEFAULT_OUTPUT = REPO_ROOT / "meta" / "review-queue.md"
+DEFAULT_INVENTORY = REPO_ROOT / "meta" / "source-inventory.json"
+DEFAULT_OUTPUT = REPO_ROOT / "meta" / "source-review-queue.md"
 
 
-def build_queue(manifest_path: Path, output_path: Path, dry_run: bool = False) -> str:
+def _review_items(manifest_path: Path, inventory_path: Path) -> list[dict[str, Any]]:
     manifest = load_manifest(manifest_path)
-    items = [
-        (source_id, value)
-        for source_id, value in manifest["sources"].items()
-        if value.get("status", "pending") in {"pending", "review", "conflict"}
-    ]
-    items.sort(key=lambda row: (str(row[1].get("created", "")), row[0]))
+    by_id: dict[str, dict[str, Any]] = {}
+    for source_id, value in manifest["sources"].items():
+        legacy_review = value.get("status") in {"review", "conflict"}
+        if value.get("ingest_status") != "review" and not legacy_review:
+            continue
+        by_id[source_id] = {
+            "source_id": source_id,
+            "title": value.get("title") or source_id,
+            "provider": value.get("origin", "unknown"),
+            "created": value.get("created", "unknown"),
+            "output_path": value.get("output_path"),
+            "raw_source_path": value.get("source_path"),
+            "raw_source_locator": value.get("source_locator"),
+            "reason": value.get("ingest_issue") or value.get("status") or "manifest_ingest_review",
+        }
+
+    if inventory_path.is_file():
+        inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+        for source_input in inventory.get("inputs", []):
+            provider = source_input.get("provider", "unknown")
+            for unit in source_input.get("units", []):
+                if unit.get("parse_status") != "review":
+                    continue
+                source_id = str(unit.get("source_id") or "")
+                if not source_id:
+                    continue
+                by_id[source_id] = {
+                    "source_id": source_id,
+                    "title": source_id,
+                    "provider": provider,
+                    "created": unit.get("created", "unknown"),
+                    "output_path": None,
+                    "raw_source_path": unit.get("raw_source_path"),
+                    "raw_source_locator": unit.get("raw_source_locator"),
+                    "reason": unit.get("skip_reason") or "inventory_parse_review",
+                }
+    return sorted(by_id.values(), key=lambda item: (str(item.get("created", "")), item["source_id"]))
+
+
+def build_queue(
+    manifest_path: Path,
+    output_path: Path,
+    inventory_path: Path = DEFAULT_INVENTORY,
+    dry_run: bool = False,
+) -> str:
+    items = _review_items(manifest_path, inventory_path)
     lines = [
-        "# 待整理来源",
+        "# 来源导入审核队列",
         "",
         "<!-- 此文件由 scripts/rebuild_review_queue.py 生成。 -->",
         "",
-        "处理前先按 `AGENTS.md` 搜索现有 Wiki，并在修改后更新来源状态。",
+        "这里只列出会阻塞来源正确性的解析、角色、locator、敏感信息或完整性问题。",
+        "`ready + unassessed` 的普通来源不会进入本队列。",
         "",
     ]
     if not items:
-        lines.append("当前没有待整理来源。")
+        lines.append("当前没有来源导入问题。")
     else:
-        for source_id, item in items:
-            output = str(item.get("output_path", ""))
-            link = f"../{output}" if output else ""
-            title = str(item.get("title") or source_id)
-            status = str(item.get("status", "pending"))
-            origin = str(item.get("origin", "unknown"))
-            created = str(item.get("created", "unknown"))
+        for item in items:
             lines.extend(
                 [
-                    f"## {title}",
+                    f"## {item['title']}",
                     "",
-                    f"- [ ] **来源 ID**：`{source_id}`",
-                    f"- **状态**：`{status}`",
-                    f"- **类型**：`{origin}`",
-                    f"- **日期**：{created}",
-                    f"- **文件**：[{output}]({link})" if output else "- **文件**：缺失",
-                    "- **整理决定**：待填写 `skip/create/update/conflict/review`",
+                    f"- [ ] **来源 ID**：`{item['source_id']}`",
+                    f"- **Provider**：`{item['provider']}`",
+                    f"- **日期**：{item['created']}",
+                    f"- **原因**：`{item['reason']}`",
+                    f"- **Raw path**：`{item.get('raw_source_path') or 'unknown'}`",
+                    f"- **Raw locator**：`{item.get('raw_source_locator') or 'unknown'}`",
+                    f"- **标准化文件**：`{item['output_path']}`" if item.get("output_path") else "- **标准化文件**：未生成",
+                    "- **处理结果**：待人工核对后填写",
                     "",
                 ]
             )
@@ -61,11 +101,12 @@ def build_queue(manifest_path: Path, output_path: Path, dry_run: bool = False) -
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
+    parser.add_argument("--inventory", type=Path, default=DEFAULT_INVENTORY)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
-    content = build_queue(args.manifest, args.output, args.dry_run)
-    print(f"审核队列包含 {content.count('**来源 ID**')} 个来源")
+    content = build_queue(args.manifest, args.output, args.inventory, args.dry_run)
+    print(f"来源导入审核队列包含 {content.count('**来源 ID**')} 个问题")
 
 
 if __name__ == "__main__":

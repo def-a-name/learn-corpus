@@ -12,7 +12,7 @@ from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
 from import_claude import DEFAULT_INPUT as CLAUDE_INPUT
-from import_claude import iter_export_units
+from import_claude import iter_export_units, unit_inventory_record, unit_skip_reason
 from import_codex import DEFAULT_INPUT as CODEX_INPUT
 from import_codex import parse_session
 from wiki_core import MANIFEST_PATH, REPO_ROOT, conversation_skip_reason, discover_jsonl, load_manifest
@@ -47,6 +47,12 @@ def _standardized_counts(manifest_path: Path) -> Counter[str]:
     return Counter(str(item.get("origin", "unknown")) for item in manifest["sources"].values())
 
 
+def _manifest_sources(manifest_path: Path) -> dict[str, Any]:
+    if not manifest_path.is_file():
+        return {}
+    return load_manifest(manifest_path)["sources"]
+
+
 def _missing_input(provider: str, input_path: Path, source_format: str, known_missing: list[str]) -> dict[str, Any]:
     return {
         "provider": provider,
@@ -71,6 +77,7 @@ def build_inventory(
 ) -> dict[str, Any]:
     scanned_at = scanned_at or datetime.now(ZoneInfo("Asia/Hong_Kong")).isoformat(timespec="seconds")
     standardized = _standardized_counts(manifest_path)
+    manifest_sources = _manifest_sources(manifest_path)
     inputs: list[dict[str, Any]] = []
 
     claude_missing = ["其他设备、尚未导出的 Claude Code 及 Claude Web 会话不在本次范围"]
@@ -79,6 +86,28 @@ def build_inventory(
     else:
         claude_units = list(iter_export_units(claude_input))
         unit_counts = Counter(unit.kind for unit in claude_units)
+        thread_counts = Counter(unit.thread_kind for unit in claude_units if unit.kind == "session")
+        document_counts = Counter(unit.document_kind for unit in claude_units if unit.kind == "document")
+        skip_reasons: Counter[str] = Counter()
+        unit_records: list[dict[str, Any]] = []
+        retained = 0
+        for unit in claude_units:
+            reason = unit_skip_reason(unit)
+            if reason:
+                skip_reasons[reason] += 1
+            else:
+                retained += 1
+            if reason in {"no_confirmed_exchange", "document_classification_review"}:
+                status = "review"
+            elif reason:
+                status = "excluded"
+            elif unit.source_id in manifest_sources:
+                status = "imported"
+            elif unit.kind == "document":
+                status = "deferred"
+            else:
+                status = "ready"
+            unit_records.append(unit_inventory_record(unit, status, reason))
         inputs.append(
             {
                 "provider": "claude-export",
@@ -87,11 +116,22 @@ def build_inventory(
                 "available": True,
                 "date_range": _date_range(unit.created for unit in claude_units),
                 "discovered": len(claude_units),
-                "retained": len(claude_units),
-                "skipped": 0,
+                "retained": retained,
+                "skipped": len(claude_units) - retained,
                 "unit_counts": {"session": unit_counts["session"], "document": unit_counts["document"]},
+                "thread_counts": {
+                    "main": thread_counts["main"],
+                    "subagent": thread_counts["subagent"],
+                    "unknown": thread_counts["unknown"],
+                },
+                "document_counts": dict(sorted(document_counts.items())),
+                "skip_reasons": dict(sorted(skip_reasons.items())),
                 "currently_standardized": standardized["claude-export"],
-                "known_missing": claude_missing,
+                "known_missing": [
+                    "生成这批 Markdown 的原始 ~/.claude/projects/**/*.jsonl 已不可得；真实 session ID、完整 tool result、system 和 progress 事件无法恢复",
+                    *claude_missing,
+                ],
+                "units": unit_records,
             }
         )
 
@@ -159,9 +199,12 @@ def build_inventory(
         if item["discovered"] != item["retained"] + item["skipped"]:
             raise ValueError(f"{item['provider']} inventory 计数不成立")
     return {
-        "version": 1,
+        "version": 2,
         "scanned_at": scanned_at,
-        "coverage_boundary": "只覆盖当前机器上可访问的三个已知输入位置，不代表所有历史会话已提供。",
+        "coverage_boundary": (
+            "只覆盖当前机器上可访问的三个已知输入位置，不代表所有历史会话已提供；"
+            "Claude 事件计数只表示现有有损 Markdown 导出中仍可见的内容。"
+        ),
         "known_missing": [
             "ChatGPT 历史尚未提供",
             "Claude Web、其他设备和其他账号的历史尚未提供",
