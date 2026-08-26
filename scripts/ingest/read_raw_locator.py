@@ -8,8 +8,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-from import_claude import DEFAULT_INPUT, iter_export_units
-from wiki_core import parse_line_locator
+from scripts.common.wiki_core import parse_line_locator
+from scripts.ingest.import_claude import DEFAULT_INPUT, iter_export_units
 
 
 class LocatorNotFoundError(ValueError):

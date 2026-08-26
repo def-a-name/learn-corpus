@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-from wiki_core import (
+from scripts.common.wiki_core import (
     CODEX_ASSISTANT_FINAL_DETECTION,
     CODEX_IMPORTER_VERSION,
     MANIFEST_PATH,

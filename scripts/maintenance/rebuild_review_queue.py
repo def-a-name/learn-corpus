@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from wiki_core import MANIFEST_PATH, REPO_ROOT, load_manifest, parse_line_locator
+from scripts.common.wiki_core import MANIFEST_PATH, REPO_ROOT, load_manifest, parse_line_locator
 
 
 DEFAULT_INVENTORY = REPO_ROOT / "meta" / "source-inventory.json"
@@ -69,7 +69,7 @@ def _raw_location_lines(item: dict[str, Any]) -> list[str]:
             (
                 f"- **Raw lines**：{start_line}–{end_line}",
                 f"- **打开原文**：[{Path(raw_path).name}:{start_line}](<{raw_path}:{start_line}>)",
-                f"- **CLI**：`python3 scripts/read_raw_locator.py '{raw_locator}' --line-numbers`",
+                f"- **CLI**：`python3 -m scripts.ingest.read_raw_locator '{raw_locator}' --line-numbers`",
             )
         )
     return lines
@@ -85,7 +85,7 @@ def build_queue(
     lines = [
         "# 来源导入审核队列",
         "",
-        "<!-- 此文件由 scripts/rebuild_review_queue.py 生成。 -->",
+        "<!-- 此文件由 scripts.maintenance.rebuild_review_queue 生成。 -->",
         "",
         "这里只列出会阻塞来源正确性的解析、角色、locator、敏感信息或完整性问题。",
         "`ready + unassessed` 的普通来源不会进入本队列。",

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from wiki_core import (
+from scripts.common.wiki_core import (
     CLAUDE_ASSISTANT_FINAL_DETECTION,
     CLAUDE_IMPORTER_VERSION,
     MANIFEST_PATH,

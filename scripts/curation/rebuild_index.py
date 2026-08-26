@@ -8,7 +8,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from wiki_core import REPO_ROOT, parse_frontmatter
+from scripts.common.wiki_core import REPO_ROOT, parse_frontmatter
 
 
 WIKI_ROOT = REPO_ROOT / "wiki"
@@ -42,7 +42,7 @@ def build_index(wiki_root: Path, output_path: Path, dry_run: bool = False) -> st
         "",
         "# Wiki 索引",
         "",
-        "<!-- 此文件由 scripts/rebuild_index.py 生成，请勿手工编辑列表部分。 -->",
+        "<!-- 此文件由 scripts.curation.rebuild_index 生成，请勿手工编辑列表部分。 -->",
         "",
     ]
     if not groups:
