@@ -19,6 +19,7 @@ from wiki_core import (
     clean_message,
     derive_title,
     format_line_locator,
+    is_exact_meaningless_exchange,
     load_manifest,
     redact_secrets,
     relative_to_repo,
@@ -72,6 +73,7 @@ class SessionParse:
     visible_user_block_count: int
     human_user_count: int
     assistant_final_count: int
+    omitted_trivial_exchange_count: int
     omitted_process_count: int
     omitted_tool_call_count: int
     omitted_tool_result_count: int | None
@@ -309,16 +311,23 @@ def parse_session(section: str, locator: str, start_line: int = 1) -> SessionPar
         )
 
     finish_pending()
+    retained_exchanges = tuple(
+        exchange
+        for exchange in exchanges
+        if not is_exact_meaningless_exchange(exchange.user_text, exchange.assistant_text)
+    )
+    omitted_trivial_exchanges = len(exchanges) - len(retained_exchanges)
     if omitted_unpaired:
         notes.add("存在没有可确认 assistant final 的 human user turn；该 turn 未写入标准化正文。")
     if visible_tool_results:
         notes.add("只计数导出中仍可见的 tool result；上游已省略的结果无法恢复。")
     notes.add("provider session ID 与上游已省略事件不可从 Markdown 导出恢复。")
     return SessionParse(
-        exchanges=tuple(exchanges),
+        exchanges=retained_exchanges,
         visible_user_block_count=visible_users,
         human_user_count=human_users,
-        assistant_final_count=len(exchanges),
+        assistant_final_count=len(retained_exchanges),
+        omitted_trivial_exchange_count=omitted_trivial_exchanges,
         omitted_process_count=omitted_process,
         omitted_tool_call_count=omitted_tools,
         omitted_tool_result_count=visible_tool_results if visible_tool_results else None,
@@ -430,13 +439,9 @@ def unit_skip_reason(unit: ExportUnit) -> str:
     if parsed is None or not parsed.human_user_count:
         return "runtime_only_session" if unit.prefilter_skip_reason == "runtime_only_session" else "no_human_user"
     if not parsed.exchanges:
+        if parsed.omitted_trivial_exchange_count == parsed.human_user_count:
+            return "trivial_session"
         return "no_final_visible"
-    trivial = {"hi", "hello", "hey", "你好", "您好", "test", "测试"}
-    normalized_users = {
-        re.sub(r"[\s.!！?？,，]+", "", exchange.user_text).lower() for exchange in parsed.exchanges
-    }
-    if normalized_users and normalized_users <= trivial:
-        return "trivial_session"
     return ""
 
 
@@ -478,6 +483,7 @@ def unit_inventory_record(unit: ExportUnit, parse_status: str | None = None, ski
                 "human_user_count": parsed.human_user_count if unit.thread_kind == "main" else 0,
                 "assistant_block_count": parsed.assistant_block_count,
                 "assistant_final_count": parsed.assistant_final_count if unit.thread_kind == "main" else 0,
+                "omitted_trivial_exchange_count": parsed.omitted_trivial_exchange_count,
                 "omitted_process_count": parsed.omitted_process_count,
                 "omitted_agent_count": (
                     parsed.visible_user_block_count + parsed.assistant_block_count
@@ -542,6 +548,7 @@ def _render_session(unit: ExportUnit, imported: str) -> tuple[str, int, str]:
         "exchange_count": len(rendered),
         "human_user_count": parsed.human_user_count,
         "assistant_final_count": parsed.assistant_final_count,
+        "omitted_trivial_exchange_count": parsed.omitted_trivial_exchange_count,
         "omitted_process_count": parsed.omitted_process_count,
         "omitted_tool_call_count": parsed.omitted_tool_call_count,
         "omitted_tool_result_count": parsed.omitted_tool_result_count,
@@ -601,6 +608,7 @@ def import_exports(
         "thread_kinds": {},
         "human_user_messages": 0,
         "assistant_finals": 0,
+        "omitted_trivial_exchanges": 0,
         "omitted_process": 0,
         "omitted_agent_messages": 0,
         "omitted_tool_calls": 0,
@@ -640,6 +648,7 @@ def import_exports(
             if unit.thread_kind == "main":
                 stats["human_user_messages"] += parsed.human_user_count
                 stats["assistant_finals"] += parsed.assistant_final_count
+                stats["omitted_trivial_exchanges"] += parsed.omitted_trivial_exchange_count
                 stats["omitted_process"] += parsed.omitted_process_count
                 stats["omitted_tool_calls"] += parsed.omitted_tool_call_count
                 stats["omitted_instructions"] += parsed.omitted_instruction_count
@@ -693,6 +702,7 @@ def import_exports(
             "curation_status": current.get("curation_status", "unassessed"),
             "title": title,
             "created": unit.created,
+            "omitted_trivial_exchange_count": unit.session_parse.omitted_trivial_exchange_count,
             "redaction_count": redactions,
             "imported_at": utc_now(),
             "importer_version": CLAUDE_IMPORTER_VERSION,

@@ -1,89 +1,505 @@
 #!/usr/bin/env python3
-"""把 Codex rollout JSONL 导入为标准化 Markdown 来源。"""
+"""把 Codex rollout JSONL 白名单化为主会话显式问答来源。"""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
+import re
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from wiki_core import (
+    CODEX_ASSISTANT_FINAL_DETECTION,
     CODEX_IMPORTER_VERSION,
     MANIFEST_PATH,
     REPO_ROOT,
-    build_conversation_document,
     clean_message,
-    conversation_skip_reason,
     derive_title,
-    discover_jsonl,
     extract_text,
+    format_line_locator,
+    is_exact_meaningless_exchange,
     is_noise_message,
     load_manifest,
-    relative_to_repo,
     redact_secrets,
+    relative_to_repo,
     save_manifest,
     sha256_file,
     source_needs_redaction,
     utc_now,
+    yaml_document,
 )
 
 
 DEFAULT_INPUT = Path.home() / ".codex" / "sessions"
 DEFAULT_OUTPUT = REPO_ROOT / "sources" / "conversations" / "codex"
+RUNTIME_USER_TAG = re.compile(r"<(?:model_instruction|user_action)(?:>|\s)", re.IGNORECASE)
+REVIEW_SKIP_REASONS = {"invalid_jsonl_review", "thread_kind_review", "turn_boundary_review"}
+DEFERRED_SKIP_REASONS = {
+    "active_session_deferred",
+    "forked_session_deferred",
+    "source_changed_during_import",
+}
 
 
-def parse_session(path: Path) -> dict[str, Any]:
-    from wiki_core import read_jsonl
+@dataclass(frozen=True)
+class CodexExchange:
+    turn_index: int
+    user_text: str
+    assistant_text: str
+    user_locator: str
+    assistant_locator: str
 
-    records, invalid_lines = read_jsonl(path)
-    session_meta: dict[str, Any] = {}
-    timestamp = ""
-    messages: list[dict[str, str]] = []
-    awaiting_protocol_answer = False
 
-    for record in records:
-        timestamp = timestamp or str(record.get("timestamp", ""))
+@dataclass(frozen=True)
+class CodexSession:
+    source_id: str
+    provider_session_id: str
+    identity_confidence: str
+    created: str
+    project: str
+    cwd: str
+    cli_version: str
+    thread_kind: str
+    parent_thread_id: str | None
+    forked_from_id: str | None
+    source_path: Path
+    content_hash: str
+    locator: str
+    line_count: int
+    title: str
+    exchanges: tuple[CodexExchange, ...]
+    visible_user_count: int
+    human_user_count: int
+    visible_assistant_final_count: int
+    assistant_final_count: int
+    omitted_trivial_exchange_count: int
+    omitted_runtime_user_count: int
+    omitted_developer_count: int
+    omitted_commentary_count: int
+    omitted_unphased_assistant_count: int
+    omitted_tool_call_count: int
+    omitted_tool_result_count: int
+    omitted_reasoning_count: int
+    omitted_compaction_count: int
+    omitted_interrupted_count: int
+    omitted_unpaired_user_count: int
+    event_user_message_count: int
+    invalid_line_count: int
+    open_turn_count: int
+    ambiguous_user_turn_count: int
+    ambiguous_final_turn_count: int
+    extra_session_meta_count: int
+    parse_notes: tuple[str, ...]
+
+
+@dataclass
+class _Turn:
+    ordinal: int
+    human_users: list[tuple[int, str]] = field(default_factory=list)
+    assistant_finals: list[tuple[int, str]] = field(default_factory=list)
+
+
+def _classify_user_text(raw: str) -> tuple[str, str]:
+    if is_noise_message(raw) or RUNTIME_USER_TAG.search(raw):
+        return "runtime", ""
+    cleaned = clean_message(raw)
+    if not cleaned:
+        return "runtime", ""
+    if re.fullmatch(r"/[A-Za-z][\w-]*(?:\s+[^\n]*)?", cleaned):
+        return "runtime", ""
+    return "human", cleaned
+
+
+def _thread_kind(metadata: dict[str, Any]) -> str:
+    thread_source = metadata.get("thread_source")
+    source = metadata.get("source")
+    if thread_source == "subagent" or (isinstance(source, dict) and "subagent" in source):
+        return "subagent"
+    if thread_source == "user" or source == "cli":
+        return "main"
+    return "unknown"
+
+
+def _filename_session_id(path: Path) -> str:
+    match = re.search(r"([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$", path.stem)
+    return match.group(1) if match else path.stem.removeprefix("rollout-")
+
+
+def parse_session(path: Path, input_root: Path | None = None) -> CodexSession:
+    raw = path.read_bytes()
+    content_hash = hashlib.sha256(raw).hexdigest()
+    text = raw.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    records: list[tuple[int, dict[str, Any]]] = []
+    invalid_lines = 0
+    for line_number, line in enumerate(lines, 1):
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            invalid_lines += 1
+            continue
+        if isinstance(value, dict):
+            records.append((line_number, value))
+
+    session_metas = [
+        (line_number, record["payload"])
+        for line_number, record in records
+        if record.get("type") == "session_meta" and isinstance(record.get("payload"), dict)
+    ]
+    first_meta = session_metas[0][1] if session_metas else {}
+    provider_session_id = str(first_meta.get("id") or _filename_session_id(path))
+    identity_confidence = "provider" if first_meta.get("id") else "path-derived"
+    created = str(first_meta.get("timestamp") or next((record.get("timestamp") for _, record in records), ""))[:10]
+    cwd = str(first_meta.get("cwd") or "")
+    project = Path(cwd).name if cwd else "global"
+    try:
+        relative_path = path.relative_to(input_root or DEFAULT_INPUT).as_posix()
+    except ValueError:
+        relative_path = path.name
+    semantic_locator = f"{relative_path}#Session:{provider_session_id}"
+    session_locator = format_line_locator(semantic_locator, 1, max(len(lines), 1))
+
+    exchanges: list[CodexExchange] = []
+    current: _Turn | None = None
+    turn_ordinal = 0
+    visible_users = 0
+    human_users = 0
+    visible_finals = 0
+    runtime_users = 0
+    developer_messages = 0
+    commentary_messages = 0
+    unphased_assistant_messages = 0
+    tool_calls = 0
+    tool_results = 0
+    reasoning_items = 0
+    compactions = 0
+    interruptions = 0
+    unpaired_users = 0
+    event_users = 0
+    open_turns = 0
+    ambiguous_users = 0
+    ambiguous_finals = 0
+    orphan_finals = 0
+    notes: set[str] = set()
+
+    def finish_turn(terminal: str) -> None:
+        nonlocal current, open_turns, interruptions, unpaired_users
+        nonlocal ambiguous_users, ambiguous_finals, orphan_finals
+        if current is None:
+            return
+        if terminal == "open":
+            open_turns += 1
+        elif terminal == "aborted":
+            interruptions += 1
+        if len(current.human_users) > 1:
+            ambiguous_users += 1
+        if len(current.assistant_finals) > 1:
+            ambiguous_finals += 1
+        if terminal == "complete" and len(current.human_users) == 1 and len(current.assistant_finals) == 1:
+            user_line, user_text = current.human_users[0]
+            assistant_line, assistant_text = current.assistant_finals[0]
+            exchanges.append(
+                CodexExchange(
+                    turn_index=current.ordinal,
+                    user_text=user_text,
+                    assistant_text=assistant_text,
+                    user_locator=format_line_locator(
+                        f"{semantic_locator}/Turn:{current.ordinal}/User", user_line, user_line
+                    ),
+                    assistant_locator=format_line_locator(
+                        f"{semantic_locator}/Turn:{current.ordinal}/AssistantFinal", assistant_line, assistant_line
+                    ),
+                )
+            )
+        else:
+            if current.human_users:
+                unpaired_users += len(current.human_users)
+            elif current.assistant_finals:
+                orphan_finals += len(current.assistant_finals)
+        current = None
+
+    for line_number, record in records:
+        record_type = record.get("type")
         payload = record.get("payload")
         if not isinstance(payload, dict):
             continue
-        if record.get("type") == "session_meta":
-            session_meta = payload
-            continue
-        if record.get("type") != "response_item" or payload.get("type") != "message":
+        payload_type = payload.get("type")
+
+        if record_type == "event_msg" and payload_type == "task_started":
+            finish_turn("open")
+            turn_ordinal += 1
+            current = _Turn(turn_ordinal)
             continue
 
-        role = payload.get("role")
-        if role == "user":
-            text = extract_text(payload.get("content"), {"input_text"})
-        elif role == "assistant" and payload.get("phase") in ("final_answer", None):
-            text = extract_text(payload.get("content"), {"output_text"})
-        else:
-            continue
-        text = clean_message(text)
-        if role == "user" and is_noise_message(text):
-            awaiting_protocol_answer = True
-            continue
-        if role == "assistant" and awaiting_protocol_answer:
-            awaiting_protocol_answer = False
-            continue
-        if role == "user":
-            awaiting_protocol_answer = False
-        if text and (not messages or messages[-1] != {"role": role, "text": text}):
-            messages.append({"role": role, "text": text})
+        if record_type == "event_msg" and payload_type == "user_message":
+            event_users += 1
+        elif record_type == "response_item" and payload_type == "message":
+            role = payload.get("role")
+            if role == "developer":
+                developer_messages += 1
+                continue
+            if role == "user":
+                visible_users += 1
+                raw_text = extract_text(payload.get("content"), {"input_text"})
+                classification, cleaned = _classify_user_text(raw_text)
+                if classification == "runtime":
+                    runtime_users += 1
+                elif current is None:
+                    notes.add("发现不在 task 生命周期内的 human user message；未写入标准化正文。")
+                else:
+                    human_users += 1
+                    current.human_users.append((line_number, cleaned))
+                continue
+            if role == "assistant":
+                assistant_text = clean_message(extract_text(payload.get("content"), {"output_text"}))
+                phase = payload.get("phase")
+                if phase == "final_answer":
+                    visible_finals += 1
+                    if assistant_text and current is not None:
+                        current.assistant_finals.append((line_number, assistant_text))
+                    elif assistant_text:
+                        orphan_finals += 1
+                elif phase == "commentary":
+                    commentary_messages += 1
+                else:
+                    unphased_assistant_messages += 1
+                continue
+        elif record_type == "response_item" and payload_type in {
+            "custom_tool_call",
+            "function_call",
+            "web_search_call",
+            "tool_search_call",
+        }:
+            tool_calls += 1
+        elif record_type == "response_item" and payload_type in {
+            "custom_tool_call_output",
+            "function_call_output",
+            "tool_search_output",
+        }:
+            tool_results += 1
+        elif record_type == "response_item" and payload_type == "reasoning":
+            reasoning_items += 1
+        elif record_type == "compacted":
+            compactions += 1
 
-    session_id = str(session_meta.get("id") or path.stem.removeprefix("rollout-"))
-    created = str(session_meta.get("timestamp") or timestamp)[:10]
-    cwd = str(session_meta.get("cwd") or "")
-    project = Path(cwd).name if cwd else "global"
+        if record_type == "event_msg" and payload_type in {"task_complete", "turn_aborted"}:
+            finish_turn("complete" if payload_type == "task_complete" else "aborted")
+
+    finish_turn("open")
+    if unpaired_users:
+        notes.add("存在没有显式 assistant final 的 human user turn；该 turn 未写入标准化正文。")
+    if orphan_finals:
+        notes.add("存在无法与 human user 配对的 assistant final；未写入标准化正文。")
+    if open_turns:
+        notes.add("文件包含未结束 task，可能仍在写入；本轮不导入。")
+    if invalid_lines:
+        notes.add("文件包含无法解析的 JSONL 行。")
+    if len(session_metas) > 1:
+        notes.add("文件包含额外 session_meta；身份只取文件首个 metadata。")
+
+    retained_exchanges = tuple(
+        exchange
+        for exchange in exchanges
+        if not is_exact_meaningless_exchange(exchange.user_text, exchange.assistant_text)
+    )
+    omitted_trivial_exchanges = len(exchanges) - len(retained_exchanges)
+    title_messages = [{"role": "user", "text": exchange.user_text} for exchange in retained_exchanges]
+    title = derive_title("codex", title_messages) if title_messages else "Codex 会话：未形成完整问答"
+    return CodexSession(
+        source_id=f"codex-{provider_session_id}",
+        provider_session_id=provider_session_id,
+        identity_confidence=identity_confidence,
+        created=created or "unknown",
+        project=project,
+        cwd=cwd,
+        cli_version=str(first_meta.get("cli_version") or ""),
+        thread_kind=_thread_kind(first_meta),
+        parent_thread_id=str(first_meta.get("parent_thread_id")) if first_meta.get("parent_thread_id") else None,
+        forked_from_id=str(first_meta.get("forked_from_id")) if first_meta.get("forked_from_id") else None,
+        source_path=path,
+        content_hash=content_hash,
+        locator=session_locator,
+        line_count=max(len(lines), 1),
+        title=title,
+        exchanges=retained_exchanges,
+        visible_user_count=visible_users,
+        human_user_count=human_users,
+        visible_assistant_final_count=visible_finals,
+        assistant_final_count=len(retained_exchanges),
+        omitted_trivial_exchange_count=omitted_trivial_exchanges,
+        omitted_runtime_user_count=runtime_users,
+        omitted_developer_count=developer_messages,
+        omitted_commentary_count=commentary_messages,
+        omitted_unphased_assistant_count=unphased_assistant_messages,
+        omitted_tool_call_count=tool_calls,
+        omitted_tool_result_count=tool_results,
+        omitted_reasoning_count=reasoning_items,
+        omitted_compaction_count=compactions,
+        omitted_interrupted_count=interruptions,
+        omitted_unpaired_user_count=unpaired_users,
+        event_user_message_count=event_users,
+        invalid_line_count=invalid_lines,
+        open_turn_count=open_turns,
+        ambiguous_user_turn_count=ambiguous_users,
+        ambiguous_final_turn_count=ambiguous_finals,
+        extra_session_meta_count=max(len(session_metas) - 1, 0),
+        parse_notes=tuple(sorted(notes)),
+    )
+
+
+def iter_session_units(input_dir: Path) -> Iterable[CodexSession]:
+    for path in sorted(input_dir.rglob("*.jsonl")):
+        yield parse_session(path, input_dir)
+
+
+def unit_skip_reason(unit: CodexSession) -> str:
+    if unit.thread_kind == "subagent":
+        return "subagent_excluded"
+    if unit.thread_kind != "main":
+        return "thread_kind_review"
+    if unit.forked_from_id:
+        return "forked_session_deferred"
+    if unit.open_turn_count:
+        return "active_session_deferred"
+    if unit.invalid_line_count:
+        return "invalid_jsonl_review"
+    if unit.ambiguous_user_turn_count or unit.ambiguous_final_turn_count:
+        return "turn_boundary_review"
+    if not unit.human_user_count:
+        return "no_human_user"
+    if not unit.exchanges:
+        if unit.omitted_trivial_exchange_count == unit.human_user_count:
+            return "trivial_session"
+        return "no_final_visible"
+    return ""
+
+
+def unit_inventory_record(
+    unit: CodexSession,
+    parse_status: str | None = None,
+    skip_reason: str | None = None,
+) -> dict[str, Any]:
+    reason = unit_skip_reason(unit) if skip_reason is None else skip_reason
+    status = parse_status or ("excluded" if reason else "ready")
     return {
-        "id": session_id,
-        "created": created,
-        "cwd": cwd,
-        "project": project,
-        "cli_version": session_meta.get("cli_version", ""),
-        "messages": messages,
-        "invalid_lines": invalid_lines,
+        "source_id": unit.source_id,
+        "unit_kind": "session",
+        "provider_session_id": unit.provider_session_id,
+        "derived_session_key": None,
+        "identity_confidence": unit.identity_confidence,
+        "thread_kind": unit.thread_kind,
+        "parent_thread_id": unit.parent_thread_id,
+        "forked_from_id": unit.forked_from_id,
+        "project": unit.project,
+        "title": unit.title,
+        "created": unit.created,
+        "raw_source_path": str(unit.source_path.resolve()),
+        "raw_source_hash": unit.content_hash,
+        "raw_source_locator": unit.locator,
+        "source_format": "codex-rollout-jsonl",
+        "source_completeness": "raw",
+        "event_count_scope": "raw",
+        "assistant_final_detection": CODEX_ASSISTANT_FINAL_DETECTION,
+        "parse_status": status,
+        "skip_reason": reason or None,
+        "visible_user_count": unit.visible_user_count,
+        "human_user_count": unit.human_user_count,
+        "visible_assistant_final_count": unit.visible_assistant_final_count,
+        "assistant_final_count": unit.assistant_final_count,
+        "omitted_trivial_exchange_count": unit.omitted_trivial_exchange_count,
+        "omitted_runtime_user_count": unit.omitted_runtime_user_count,
+        "omitted_developer_count": unit.omitted_developer_count,
+        "omitted_commentary_count": unit.omitted_commentary_count,
+        "omitted_unphased_assistant_count": unit.omitted_unphased_assistant_count,
+        "omitted_tool_call_count": unit.omitted_tool_call_count,
+        "omitted_tool_result_count": unit.omitted_tool_result_count,
+        "omitted_reasoning_count": unit.omitted_reasoning_count,
+        "omitted_compaction_count": unit.omitted_compaction_count,
+        "omitted_interrupted_count": unit.omitted_interrupted_count,
+        "omitted_unpaired_user_count": unit.omitted_unpaired_user_count,
+        "event_user_message_count": unit.event_user_message_count,
+        "invalid_jsonl_lines": unit.invalid_line_count,
+        "open_turn_count": unit.open_turn_count,
+        "ambiguous_user_turn_count": unit.ambiguous_user_turn_count,
+        "ambiguous_final_turn_count": unit.ambiguous_final_turn_count,
+        "extra_session_meta_count": unit.extra_session_meta_count,
+        "parse_notes": list(unit.parse_notes),
     }
+
+
+def _render_session(unit: CodexSession, imported: str) -> tuple[str, int, str]:
+    title, redactions = redact_secrets(unit.title)
+    rendered: list[str] = []
+    for ordinal, exchange in enumerate(unit.exchanges, start=1):
+        user_text, count = redact_secrets(clean_message(exchange.user_text))
+        redactions += count
+        assistant_text, count = redact_secrets(clean_message(exchange.assistant_text))
+        redactions += count
+        if not user_text or not assistant_text:
+            continue
+        rendered.append(
+            f"## Exchange {ordinal}\n\n"
+            f"- **Turn**: {exchange.turn_index}\n"
+            f"- **User locator**: `{exchange.user_locator}`\n"
+            f"- **Assistant locator**: `{exchange.assistant_locator}`\n\n"
+            f"### Human user\n\n{user_text}\n\n"
+            f"### Assistant final\n\n{assistant_text}"
+        )
+    metadata: dict[str, Any] = {
+        "id": unit.source_id,
+        "type": "conversation",
+        "origin": "codex",
+        "source_kind": "session",
+        "provider": "codex",
+        "thread_kind": "main",
+        "provider_session_id": unit.provider_session_id,
+        "derived_session_key": None,
+        "identity_confidence": unit.identity_confidence,
+        "source_format": "codex-rollout-jsonl",
+        "source_completeness": "raw",
+        "event_count_scope": "raw",
+        "assistant_final_detection": CODEX_ASSISTANT_FINAL_DETECTION,
+        "title": title,
+        "created": unit.created,
+        "imported": imported,
+        "project": unit.project,
+        "source_path": str(unit.source_path.resolve()),
+        "source_locator": unit.locator,
+        "source_hash": f"sha256:{unit.content_hash}",
+        "exchange_count": len(rendered),
+        "human_user_count": unit.human_user_count,
+        "assistant_final_count": unit.assistant_final_count,
+        "omitted_trivial_exchange_count": unit.omitted_trivial_exchange_count,
+        "omitted_runtime_user_count": unit.omitted_runtime_user_count,
+        "omitted_developer_count": unit.omitted_developer_count,
+        "omitted_commentary_count": unit.omitted_commentary_count,
+        "omitted_unphased_assistant_count": unit.omitted_unphased_assistant_count,
+        "omitted_tool_call_count": unit.omitted_tool_call_count,
+        "omitted_tool_result_count": unit.omitted_tool_result_count,
+        "omitted_reasoning_count": unit.omitted_reasoning_count,
+        "omitted_compaction_count": unit.omitted_compaction_count,
+        "omitted_interrupted_count": unit.omitted_interrupted_count,
+        "omitted_unpaired_user_count": unit.omitted_unpaired_user_count,
+        "invalid_jsonl_lines": unit.invalid_line_count,
+        "redaction_count": redactions,
+        "importer_version": CODEX_IMPORTER_VERSION,
+    }
+    if unit.cwd:
+        metadata["cwd"] = unit.cwd
+    if unit.cli_version:
+        metadata["codex_version"] = unit.cli_version
+    body = (
+        f"# {title}\n\n"
+        "> 本页从 Codex rollout JSONL 生成，只保留主线程 human user 与显式 `phase=final_answer`。"
+        "developer、commentary、tool、reasoning、compaction 和中断事件只计数，不复制正文。\n\n"
+        + "\n\n".join(rendered)
+    )
+    return yaml_document(metadata, body), redactions, title
 
 
 def import_sessions(
@@ -93,7 +509,10 @@ def import_sessions(
     *,
     limit: int | None = None,
     dry_run: bool = False,
+    session_ids: set[str] | None = None,
 ) -> dict[str, Any]:
+    if not input_dir.is_dir():
+        raise FileNotFoundError(f"Codex session 目录不存在: {input_dir}")
     manifest = load_manifest(manifest_path)
     stats: dict[str, Any] = {
         "discovered": 0,
@@ -101,86 +520,110 @@ def import_sessions(
         "unchanged": 0,
         "skipped": 0,
         "skip_reasons": {},
+        "thread_kinds": {},
+        "human_user_messages": 0,
+        "assistant_finals": 0,
+        "omitted_trivial_exchanges": 0,
+        "omitted_commentary": 0,
+        "omitted_tool_calls": 0,
+        "omitted_tool_results": 0,
+        "omitted_reasoning": 0,
+        "omitted_interruptions": 0,
+        "omitted_unpaired_users": 0,
         "invalid_lines": 0,
+        "redactions": 0,
     }
+    requested = set(session_ids or ())
+    seen_requested: set[str] = set()
+    seen_source_ids: set[str] = set()
 
-    for path in discover_jsonl(input_dir):
-        digest = sha256_file(path)
-        parsed = parse_session(path)
-        source_id = f"codex-{parsed['id']}"
-        key = source_id
-        current = manifest["sources"].get(key, {})
+    for unit in iter_session_units(input_dir):
+        if unit.source_id in seen_source_ids:
+            raise ValueError(f"重复 Codex source ID: {unit.source_id}")
+        seen_source_ids.add(unit.source_id)
+        if requested and unit.provider_session_id not in requested:
+            continue
+        seen_requested.add(unit.provider_session_id)
+        skip_reason = unit_skip_reason(unit)
+        if not skip_reason and sha256_file(unit.source_path) != unit.content_hash:
+            skip_reason = "source_changed_during_import"
+        current = manifest["sources"].get(unit.source_id, {})
         current_output = str(current.get("output_path") or "")
-        current_output_path = Path(REPO_ROOT / current_output) if current_output else Path()
-        if (
-            current.get("source_hash") == digest
+        current_output_path = REPO_ROOT / current_output if current_output else Path()
+        is_unchanged = bool(
+            not skip_reason
+            and current.get("source_hash") == unit.content_hash
             and current.get("importer_version") == CODEX_IMPORTER_VERSION
             and current_output_path.is_file()
             and not source_needs_redaction(current_output_path)
-        ):
-            stats["discovered"] += 1
-            stats["unchanged"] += 1
-            stats["invalid_lines"] += parsed["invalid_lines"]
-            continue
-        messages = parsed["messages"]
-        skip_reason = conversation_skip_reason(messages)
-        if skip_reason:
-            stats["discovered"] += 1
-            stats["skipped"] += 1
-            stats["invalid_lines"] += parsed["invalid_lines"]
-            reasons = stats["skip_reasons"]
-            reasons[skip_reason] = reasons.get(skip_reason, 0) + 1
-            if not dry_run and current:
-                old_output = Path(REPO_ROOT / current.get("output_path", ""))
-                if old_output.is_file() and old_output.parent.resolve() == output_dir.resolve():
-                    old_output.unlink()
-                manifest["sources"].pop(key, None)
-            continue
-        if limit is not None and stats["imported"] >= limit:
+        )
+        if not skip_reason and not is_unchanged and limit is not None and stats["imported"] >= limit:
             break
 
         stats["discovered"] += 1
-        title, title_redactions = redact_secrets(derive_title("codex", messages))
-        date = parsed["created"] if parsed["created"] != "unknown" else "undated"
-        output_path = output_dir / f"{date}-{parsed['id']}.md"
-        document, redactions = build_conversation_document(
-            source_id=source_id,
-            origin="codex",
-            title=title,
-            created=parsed["created"],
-            imported=utc_now()[:10],
-            project=parsed["project"],
-            source_path=path,
-            source_hash=digest,
-            messages=messages,
-            extra_metadata={
-                "cwd": parsed["cwd"],
-                "codex_version": parsed["cli_version"],
-                "invalid_jsonl_lines": parsed["invalid_lines"],
-            },
-            initial_redactions=title_redactions,
-        )
-        stats["invalid_lines"] += parsed["invalid_lines"]
+        thread_kinds = stats["thread_kinds"]
+        thread_kinds[unit.thread_kind] = thread_kinds.get(unit.thread_kind, 0) + 1
+        stats["human_user_messages"] += unit.human_user_count if unit.thread_kind == "main" else 0
+        stats["assistant_finals"] += unit.assistant_final_count if unit.thread_kind == "main" else 0
+        stats["omitted_trivial_exchanges"] += unit.omitted_trivial_exchange_count
+        stats["omitted_commentary"] += unit.omitted_commentary_count
+        stats["omitted_tool_calls"] += unit.omitted_tool_call_count
+        stats["omitted_tool_results"] += unit.omitted_tool_result_count
+        stats["omitted_reasoning"] += unit.omitted_reasoning_count
+        stats["omitted_interruptions"] += unit.omitted_interrupted_count
+        stats["omitted_unpaired_users"] += unit.omitted_unpaired_user_count
+        stats["invalid_lines"] += unit.invalid_line_count
+
+        if skip_reason:
+            stats["skipped"] += 1
+            reasons = stats["skip_reasons"]
+            reasons[skip_reason] = reasons.get(skip_reason, 0) + 1
+            if not dry_run and current and skip_reason not in DEFERRED_SKIP_REASONS | REVIEW_SKIP_REASONS:
+                old_output = REPO_ROOT / str(current.get("output_path", ""))
+                if old_output.is_file() and old_output.parent.resolve() == output_dir.resolve():
+                    old_output.unlink()
+                manifest["sources"].pop(unit.source_id, None)
+            continue
+        if is_unchanged:
+            stats["unchanged"] += 1
+            continue
+
+        document, redactions, title = _render_session(unit, utc_now()[:10])
+        date = unit.created if unit.created != "unknown" else "undated"
+        output_path = output_dir / f"{date}-{unit.provider_session_id}.md"
         stats["imported"] += 1
+        stats["redactions"] += redactions
         if dry_run:
             continue
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(document, encoding="utf-8")
         manifest["version"] = max(int(manifest.get("version", 1)), 2)
-        manifest["sources"][key] = {
+        manifest["sources"][unit.source_id] = {
             "origin": "codex",
-            "source_path": str(path.resolve()),
-            "source_hash": digest,
+            "source_kind": "session",
+            "provider": "codex",
+            "thread_kind": "main",
+            "provider_session_id": unit.provider_session_id,
+            "derived_session_key": None,
+            "identity_confidence": unit.identity_confidence,
+            "assistant_final_detection": CODEX_ASSISTANT_FINAL_DETECTION,
+            "source_path": str(unit.source_path.resolve()),
+            "source_locator": unit.locator,
+            "source_hash": unit.content_hash,
             "output_path": relative_to_repo(output_path),
             "ingest_status": "ready",
             "curation_status": current.get("curation_status", "unassessed"),
             "title": title,
-            "created": parsed["created"],
+            "created": unit.created,
+            "omitted_trivial_exchange_count": unit.omitted_trivial_exchange_count,
             "redaction_count": redactions,
             "imported_at": utc_now(),
             "importer_version": CODEX_IMPORTER_VERSION,
         }
 
+    missing = requested - seen_requested
+    if missing:
+        raise ValueError(f"未找到 Codex session ID: {', '.join(sorted(missing))}")
     if not dry_run:
         save_manifest(manifest, manifest_path)
     return stats
@@ -192,9 +635,17 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
     parser.add_argument("--limit", type=int)
+    parser.add_argument("--session-id", action="append", dest="session_ids")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
-    stats = import_sessions(args.input, args.output, args.manifest, limit=args.limit, dry_run=args.dry_run)
+    stats = import_sessions(
+        args.input,
+        args.output,
+        args.manifest,
+        limit=args.limit,
+        dry_run=args.dry_run,
+        session_ids=set(args.session_ids or ()),
+    )
     print("Codex 导入结果:", ", ".join(f"{key}={value}" for key, value in stats.items()))
 
 

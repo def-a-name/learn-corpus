@@ -14,8 +14,12 @@ from zoneinfo import ZoneInfo
 from import_claude import DEFAULT_INPUT as CLAUDE_INPUT
 from import_claude import iter_export_units, unit_inventory_record, unit_skip_reason
 from import_codex import DEFAULT_INPUT as CODEX_INPUT
-from import_codex import parse_session
-from wiki_core import MANIFEST_PATH, REPO_ROOT, conversation_skip_reason, discover_jsonl, load_manifest
+from import_codex import DEFERRED_SKIP_REASONS as CODEX_DEFERRED_SKIP_REASONS
+from import_codex import REVIEW_SKIP_REASONS as CODEX_REVIEW_SKIP_REASONS
+from import_codex import iter_session_units as iter_codex_units
+from import_codex import unit_inventory_record as codex_unit_inventory_record
+from import_codex import unit_skip_reason as codex_unit_skip_reason
+from wiki_core import MANIFEST_PATH, REPO_ROOT, load_manifest
 
 
 DEFAULT_NOTES_INPUT = REPO_ROOT.parent / "notes"
@@ -139,29 +143,47 @@ def build_inventory(
     if not codex_input.is_dir():
         inputs.append(_missing_input("codex", codex_input, "codex-rollout-jsonl", codex_missing))
     else:
-        codex_paths = list(discover_jsonl(codex_input))
-        codex_dates: list[str] = []
+        codex_units = list(iter_codex_units(codex_input))
+        thread_counts = Counter(unit.thread_kind for unit in codex_units)
         skip_reasons: Counter[str] = Counter()
-        for path in codex_paths:
-            parsed = parse_session(path)
-            codex_dates.append(str(parsed["created"]))
-            reason = conversation_skip_reason(parsed["messages"])
+        unit_records: list[dict[str, Any]] = []
+        retained = 0
+        for unit in codex_units:
+            reason = codex_unit_skip_reason(unit)
             if reason:
                 skip_reasons[reason] += 1
-        retained = len(codex_paths) - sum(skip_reasons.values())
+            else:
+                retained += 1
+            if reason in CODEX_REVIEW_SKIP_REASONS:
+                status = "review"
+            elif reason in CODEX_DEFERRED_SKIP_REASONS:
+                status = "deferred"
+            elif reason:
+                status = "excluded"
+            elif unit.source_id in manifest_sources:
+                status = "imported"
+            else:
+                status = "ready"
+            unit_records.append(codex_unit_inventory_record(unit, status, reason))
         inputs.append(
             {
                 "provider": "codex",
                 "input_path": _display_path(codex_input),
                 "format": "codex-rollout-jsonl",
                 "available": True,
-                "date_range": _date_range(codex_dates),
-                "discovered": len(codex_paths),
+                "date_range": _date_range(unit.created for unit in codex_units),
+                "discovered": len(codex_units),
                 "retained": retained,
-                "skipped": sum(skip_reasons.values()),
+                "skipped": len(codex_units) - retained,
+                "thread_counts": {
+                    "main": thread_counts["main"],
+                    "subagent": thread_counts["subagent"],
+                    "unknown": thread_counts["unknown"],
+                },
                 "skip_reasons": dict(sorted(skip_reasons.items())),
                 "currently_standardized": standardized["codex"],
                 "known_missing": codex_missing,
+                "units": unit_records,
             }
         )
 
