@@ -36,10 +36,20 @@ from wiki_core import (
 DEFAULT_INPUT = Path.home() / ".codex" / "sessions"
 DEFAULT_OUTPUT = REPO_ROOT / "sources" / "conversations" / "codex"
 RUNTIME_USER_TAG = re.compile(r"<(?:model_instruction|user_action)(?:>|\s)", re.IGNORECASE)
-REVIEW_SKIP_REASONS = {"invalid_jsonl_review", "thread_kind_review", "turn_boundary_review"}
+REVIEW_SKIP_REASONS = {
+    "fork_cycle_review",
+    "fork_parent_missing_review",
+    "fork_parent_not_standardized_review",
+    "fork_parent_unusable_review",
+    "fork_prefix_mismatch_review",
+    "invalid_jsonl_review",
+    "thread_kind_review",
+    "turn_boundary_review",
+}
 DEFERRED_SKIP_REASONS = {
     "active_session_deferred",
-    "forked_session_deferred",
+    "fork_parent_deferred",
+    "fork_parent_changed_during_import",
     "source_changed_during_import",
 }
 
@@ -93,6 +103,18 @@ class CodexSession:
     ambiguous_final_turn_count: int
     extra_session_meta_count: int
     parse_notes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CodexResolvedSession:
+    unit: CodexSession
+    exchanges: tuple[CodexExchange, ...]
+    title: str
+    source_scope: str
+    skip_reason: str
+    fork_parent_source_id: str | None = None
+    fork_parent_hash: str | None = None
+    omitted_fork_prefix_exchange_count: int = 0
 
 
 @dataclass
@@ -357,13 +379,11 @@ def iter_session_units(input_dir: Path) -> Iterable[CodexSession]:
         yield parse_session(path, input_dir)
 
 
-def unit_skip_reason(unit: CodexSession) -> str:
+def _intrinsic_skip_reason(unit: CodexSession) -> str:
     if unit.thread_kind == "subagent":
         return "subagent_excluded"
     if unit.thread_kind != "main":
         return "thread_kind_review"
-    if unit.forked_from_id:
-        return "forked_session_deferred"
     if unit.open_turn_count:
         return "active_session_deferred"
     if unit.invalid_line_count:
@@ -379,12 +399,186 @@ def unit_skip_reason(unit: CodexSession) -> str:
     return ""
 
 
+def _common_exchange_prefix(parent: CodexSession, child: CodexSession) -> int:
+    prefix = 0
+    for parent_exchange, child_exchange in zip(parent.exchanges, child.exchanges):
+        if (
+            parent_exchange.user_text != child_exchange.user_text
+            or parent_exchange.assistant_text != child_exchange.assistant_text
+        ):
+            break
+        prefix += 1
+    return prefix
+
+
+def resolve_session_units(units: Iterable[CodexSession]) -> tuple[CodexResolvedSession, ...]:
+    ordered = tuple(units)
+    by_provider_id: dict[str, CodexSession] = {}
+    for unit in ordered:
+        if unit.provider_session_id in by_provider_id:
+            raise ValueError(f"重复 Codex provider session ID: {unit.provider_session_id}")
+        by_provider_id[unit.provider_session_id] = unit
+
+    resolved: dict[str, CodexResolvedSession] = {}
+    resolving: set[str] = set()
+
+    def resolve(unit: CodexSession) -> CodexResolvedSession:
+        cached = resolved.get(unit.provider_session_id)
+        if cached is not None:
+            return cached
+        intrinsic_reason = _intrinsic_skip_reason(unit)
+        if intrinsic_reason:
+            result = CodexResolvedSession(
+                unit=unit,
+                exchanges=unit.exchanges,
+                title=unit.title,
+                source_scope="fork_unresolved" if unit.forked_from_id else "full",
+                skip_reason=intrinsic_reason,
+            )
+            resolved[unit.provider_session_id] = result
+            return result
+        if not unit.forked_from_id:
+            result = CodexResolvedSession(
+                unit=unit,
+                exchanges=unit.exchanges,
+                title=unit.title,
+                source_scope="full",
+                skip_reason="",
+            )
+            resolved[unit.provider_session_id] = result
+            return result
+        if unit.provider_session_id in resolving or unit.forked_from_id in resolving:
+            result = CodexResolvedSession(
+                unit=unit,
+                exchanges=unit.exchanges,
+                title=unit.title,
+                source_scope="fork_unresolved",
+                skip_reason="fork_cycle_review",
+            )
+            resolved[unit.provider_session_id] = result
+            return result
+
+        parent = by_provider_id.get(unit.forked_from_id)
+        if parent is None:
+            result = CodexResolvedSession(
+                unit=unit,
+                exchanges=unit.exchanges,
+                title=unit.title,
+                source_scope="fork_unresolved",
+                skip_reason="fork_parent_missing_review",
+            )
+            resolved[unit.provider_session_id] = result
+            return result
+
+        resolving.add(unit.provider_session_id)
+        parent_result = resolve(parent)
+        resolving.discard(unit.provider_session_id)
+        if parent_result.skip_reason:
+            reason = (
+                "fork_parent_deferred"
+                if parent_result.skip_reason in DEFERRED_SKIP_REASONS
+                else "fork_parent_unusable_review"
+            )
+            result = CodexResolvedSession(
+                unit=unit,
+                exchanges=unit.exchanges,
+                title=unit.title,
+                source_scope="fork_unresolved",
+                skip_reason=reason,
+                fork_parent_source_id=parent.source_id,
+                fork_parent_hash=parent.content_hash,
+            )
+            resolved[unit.provider_session_id] = result
+            return result
+
+        prefix = _common_exchange_prefix(parent, unit)
+        if prefix == 0:
+            result = CodexResolvedSession(
+                unit=unit,
+                exchanges=unit.exchanges,
+                title=unit.title,
+                source_scope="fork_unresolved",
+                skip_reason="fork_prefix_mismatch_review",
+                fork_parent_source_id=parent.source_id,
+                fork_parent_hash=parent.content_hash,
+            )
+            resolved[unit.provider_session_id] = result
+            return result
+
+        selected = unit.exchanges[prefix:]
+        title_messages = [{"role": "user", "text": exchange.user_text} for exchange in selected]
+        title = derive_title("codex", title_messages) if title_messages else unit.title
+        result = CodexResolvedSession(
+            unit=unit,
+            exchanges=selected,
+            title=title,
+            source_scope="fork_delta",
+            skip_reason="" if selected else "fork_no_novel_exchange",
+            fork_parent_source_id=parent.source_id,
+            fork_parent_hash=parent.content_hash,
+            omitted_fork_prefix_exchange_count=prefix,
+        )
+        resolved[unit.provider_session_id] = result
+        return result
+
+    return tuple(resolve(unit) for unit in ordered)
+
+
+def iter_resolved_session_units(input_dir: Path) -> Iterable[CodexResolvedSession]:
+    yield from resolve_session_units(iter_session_units(input_dir))
+
+
+def _dependency_order(
+    units: Iterable[CodexResolvedSession],
+) -> tuple[CodexResolvedSession, ...]:
+    ordered = tuple(units)
+    by_source_id = {item.unit.source_id: item for item in ordered}
+    result: list[CodexResolvedSession] = []
+    visited: set[str] = set()
+    visiting: set[str] = set()
+
+    def visit(item: CodexResolvedSession) -> None:
+        source_id = item.unit.source_id
+        if source_id in visited or source_id in visiting:
+            return
+        visiting.add(source_id)
+        if item.fork_parent_source_id:
+            parent = by_source_id.get(item.fork_parent_source_id)
+            if parent is not None:
+                visit(parent)
+        visiting.discard(source_id)
+        visited.add(source_id)
+        result.append(item)
+
+    for item in ordered:
+        visit(item)
+    return tuple(result)
+
+
+def _manifest_source_is_current(
+    resolved: CodexResolvedSession,
+    manifest: dict[str, Any],
+) -> bool:
+    current = manifest["sources"].get(resolved.unit.source_id, {})
+    output_value = str(current.get("output_path") or "")
+    output_path = REPO_ROOT / output_value if output_value else Path()
+    return bool(
+        not resolved.skip_reason
+        and current.get("source_hash") == resolved.unit.content_hash
+        and current.get("fork_parent_hash") == resolved.fork_parent_hash
+        and current.get("importer_version") == CODEX_IMPORTER_VERSION
+        and output_path.is_file()
+        and not source_needs_redaction(output_path)
+    )
+
+
 def unit_inventory_record(
-    unit: CodexSession,
+    resolved: CodexResolvedSession,
     parse_status: str | None = None,
     skip_reason: str | None = None,
 ) -> dict[str, Any]:
-    reason = unit_skip_reason(unit) if skip_reason is None else skip_reason
+    unit = resolved.unit
+    reason = resolved.skip_reason if skip_reason is None else skip_reason
     status = parse_status or ("excluded" if reason else "ready")
     return {
         "source_id": unit.source_id,
@@ -396,7 +590,7 @@ def unit_inventory_record(
         "parent_thread_id": unit.parent_thread_id,
         "forked_from_id": unit.forked_from_id,
         "project": unit.project,
-        "title": unit.title,
+        "title": resolved.title,
         "created": unit.created,
         "raw_source_path": str(unit.source_path.resolve()),
         "raw_source_hash": unit.content_hash,
@@ -405,6 +599,11 @@ def unit_inventory_record(
         "source_completeness": "raw",
         "event_count_scope": "raw",
         "assistant_final_detection": CODEX_ASSISTANT_FINAL_DETECTION,
+        "source_scope": resolved.source_scope,
+        "fork_parent_source_id": resolved.fork_parent_source_id,
+        "fork_parent_hash": resolved.fork_parent_hash,
+        "selected_exchange_count": len(resolved.exchanges),
+        "omitted_fork_prefix_exchange_count": resolved.omitted_fork_prefix_exchange_count,
         "parse_status": status,
         "skip_reason": reason or None,
         "visible_user_count": unit.visible_user_count,
@@ -432,10 +631,11 @@ def unit_inventory_record(
     }
 
 
-def _render_session(unit: CodexSession, imported: str) -> tuple[str, int, str]:
-    title, redactions = redact_secrets(unit.title)
+def _render_session(resolved: CodexResolvedSession, imported: str) -> tuple[str, int, str]:
+    unit = resolved.unit
+    title, redactions = redact_secrets(resolved.title)
     rendered: list[str] = []
-    for ordinal, exchange in enumerate(unit.exchanges, start=1):
+    for ordinal, exchange in enumerate(resolved.exchanges, start=1):
         user_text, count = redact_secrets(clean_message(exchange.user_text))
         redactions += count
         assistant_text, count = redact_secrets(clean_message(exchange.assistant_text))
@@ -464,6 +664,7 @@ def _render_session(unit: CodexSession, imported: str) -> tuple[str, int, str]:
         "source_completeness": "raw",
         "event_count_scope": "raw",
         "assistant_final_detection": CODEX_ASSISTANT_FINAL_DETECTION,
+        "source_scope": resolved.source_scope,
         "title": title,
         "created": unit.created,
         "imported": imported,
@@ -474,6 +675,7 @@ def _render_session(unit: CodexSession, imported: str) -> tuple[str, int, str]:
         "exchange_count": len(rendered),
         "human_user_count": unit.human_user_count,
         "assistant_final_count": unit.assistant_final_count,
+        "omitted_fork_prefix_exchange_count": resolved.omitted_fork_prefix_exchange_count,
         "omitted_trivial_exchange_count": unit.omitted_trivial_exchange_count,
         "omitted_runtime_user_count": unit.omitted_runtime_user_count,
         "omitted_developer_count": unit.omitted_developer_count,
@@ -493,10 +695,20 @@ def _render_session(unit: CodexSession, imported: str) -> tuple[str, int, str]:
         metadata["cwd"] = unit.cwd
     if unit.cli_version:
         metadata["codex_version"] = unit.cli_version
+    if unit.forked_from_id:
+        metadata["forked_from_id"] = unit.forked_from_id
+        metadata["fork_parent_source_id"] = resolved.fork_parent_source_id
+        metadata["fork_parent_hash"] = f"sha256:{resolved.fork_parent_hash}"
     body = (
         f"# {title}\n\n"
         "> 本页从 Codex rollout JSONL 生成，只保留主线程 human user 与显式 `phase=final_answer`。"
         "developer、commentary、tool、reasoning、compaction 和中断事件只计数，不复制正文。\n\n"
+        + (
+            f"> 该会话从 `{unit.forked_from_id}` fork；已省略与父会话完全相同的"
+            f" {resolved.omitted_fork_prefix_exchange_count} 个 exchange，本页只保留分叉后的新内容。\n\n"
+            if unit.forked_from_id
+            else ""
+        )
         + "\n\n".join(rendered)
     )
     return yaml_document(metadata, body), redactions, title
@@ -524,6 +736,7 @@ def import_sessions(
         "human_user_messages": 0,
         "assistant_finals": 0,
         "omitted_trivial_exchanges": 0,
+        "omitted_fork_prefix_exchanges": 0,
         "omitted_commentary": 0,
         "omitted_tool_calls": 0,
         "omitted_tool_results": 0,
@@ -535,28 +748,36 @@ def import_sessions(
     }
     requested = set(session_ids or ())
     seen_requested: set[str] = set()
-    seen_source_ids: set[str] = set()
-
-    for unit in iter_session_units(input_dir):
-        if unit.source_id in seen_source_ids:
-            raise ValueError(f"重复 Codex source ID: {unit.source_id}")
-        seen_source_ids.add(unit.source_id)
+    resolved_units = _dependency_order(iter_resolved_session_units(input_dir))
+    resolved_by_source_id = {item.unit.source_id: item for item in resolved_units}
+    available_source_ids = {
+        item.unit.source_id for item in resolved_units if _manifest_source_is_current(item, manifest)
+    }
+    for resolved in resolved_units:
+        unit = resolved.unit
         if requested and unit.provider_session_id not in requested:
             continue
         seen_requested.add(unit.provider_session_id)
-        skip_reason = unit_skip_reason(unit)
+        skip_reason = resolved.skip_reason
+        if (
+            not skip_reason
+            and resolved.fork_parent_source_id
+            and resolved.fork_parent_source_id not in available_source_ids
+        ):
+            skip_reason = "fork_parent_not_standardized_review"
         if not skip_reason and sha256_file(unit.source_path) != unit.content_hash:
             skip_reason = "source_changed_during_import"
-        current = manifest["sources"].get(unit.source_id, {})
-        current_output = str(current.get("output_path") or "")
-        current_output_path = REPO_ROOT / current_output if current_output else Path()
-        is_unchanged = bool(
+        if (
             not skip_reason
-            and current.get("source_hash") == unit.content_hash
-            and current.get("importer_version") == CODEX_IMPORTER_VERSION
-            and current_output_path.is_file()
-            and not source_needs_redaction(current_output_path)
-        )
+            and resolved.fork_parent_source_id
+            and resolved.fork_parent_hash
+        ):
+            parent_result = resolved_by_source_id.get(resolved.fork_parent_source_id)
+            parent_source_path = parent_result.unit.source_path if parent_result else None
+            if parent_source_path is None or sha256_file(parent_source_path) != resolved.fork_parent_hash:
+                skip_reason = "fork_parent_changed_during_import"
+        current = manifest["sources"].get(unit.source_id, {})
+        is_unchanged = not skip_reason and _manifest_source_is_current(resolved, manifest)
         if not skip_reason and not is_unchanged and limit is not None and stats["imported"] >= limit:
             break
 
@@ -564,8 +785,9 @@ def import_sessions(
         thread_kinds = stats["thread_kinds"]
         thread_kinds[unit.thread_kind] = thread_kinds.get(unit.thread_kind, 0) + 1
         stats["human_user_messages"] += unit.human_user_count if unit.thread_kind == "main" else 0
-        stats["assistant_finals"] += unit.assistant_final_count if unit.thread_kind == "main" else 0
+        stats["assistant_finals"] += len(resolved.exchanges) if unit.thread_kind == "main" else 0
         stats["omitted_trivial_exchanges"] += unit.omitted_trivial_exchange_count
+        stats["omitted_fork_prefix_exchanges"] += resolved.omitted_fork_prefix_exchange_count
         stats["omitted_commentary"] += unit.omitted_commentary_count
         stats["omitted_tool_calls"] += unit.omitted_tool_call_count
         stats["omitted_tool_results"] += unit.omitted_tool_result_count
@@ -586,14 +808,16 @@ def import_sessions(
             continue
         if is_unchanged:
             stats["unchanged"] += 1
+            available_source_ids.add(unit.source_id)
             continue
 
-        document, redactions, title = _render_session(unit, utc_now()[:10])
+        document, redactions, title = _render_session(resolved, utc_now()[:10])
         date = unit.created if unit.created != "unknown" else "undated"
         output_path = output_dir / f"{date}-{unit.provider_session_id}.md"
         stats["imported"] += 1
         stats["redactions"] += redactions
         if dry_run:
+            available_source_ids.add(unit.source_id)
             continue
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(document, encoding="utf-8")
@@ -607,6 +831,10 @@ def import_sessions(
             "derived_session_key": None,
             "identity_confidence": unit.identity_confidence,
             "assistant_final_detection": CODEX_ASSISTANT_FINAL_DETECTION,
+            "source_scope": resolved.source_scope,
+            "forked_from_id": unit.forked_from_id,
+            "fork_parent_source_id": resolved.fork_parent_source_id,
+            "fork_parent_hash": resolved.fork_parent_hash,
             "source_path": str(unit.source_path.resolve()),
             "source_locator": unit.locator,
             "source_hash": unit.content_hash,
@@ -616,10 +844,12 @@ def import_sessions(
             "title": title,
             "created": unit.created,
             "omitted_trivial_exchange_count": unit.omitted_trivial_exchange_count,
+            "omitted_fork_prefix_exchange_count": resolved.omitted_fork_prefix_exchange_count,
             "redaction_count": redactions,
             "imported_at": utc_now(),
             "importer_version": CODEX_IMPORTER_VERSION,
         }
+        available_source_ids.add(unit.source_id)
 
     missing = requested - seen_requested
     if missing:

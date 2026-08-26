@@ -38,6 +38,13 @@ PATTERNS = (
             r"client[_-]?secret|private[_-]?key)\b[\"']?\s*[:=]\s*[\"']?([^\s\"'`,;}{]+)"
         ),
     ),
+    (
+        "chinese_credential_assignment",
+        re.compile(
+            r"(?i)(?:密码|口令)\s*(?::|：|=|是|为|\s)\s*"
+            r"((?=[^\s\"'`,，。；;}{\]]*\d)[^\s\"'`,，。；;}{\]]+)"
+        ),
+    ),
 )
 
 

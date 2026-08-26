@@ -17,8 +17,8 @@ from import_codex import DEFAULT_INPUT as CODEX_INPUT
 from import_codex import DEFERRED_SKIP_REASONS as CODEX_DEFERRED_SKIP_REASONS
 from import_codex import REVIEW_SKIP_REASONS as CODEX_REVIEW_SKIP_REASONS
 from import_codex import iter_session_units as iter_codex_units
+from import_codex import resolve_session_units as resolve_codex_units
 from import_codex import unit_inventory_record as codex_unit_inventory_record
-from import_codex import unit_skip_reason as codex_unit_skip_reason
 from wiki_core import MANIFEST_PATH, REPO_ROOT, load_manifest
 
 
@@ -144,12 +144,14 @@ def build_inventory(
         inputs.append(_missing_input("codex", codex_input, "codex-rollout-jsonl", codex_missing))
     else:
         codex_units = list(iter_codex_units(codex_input))
+        codex_resolved = resolve_codex_units(codex_units)
         thread_counts = Counter(unit.thread_kind for unit in codex_units)
         skip_reasons: Counter[str] = Counter()
         unit_records: list[dict[str, Any]] = []
         retained = 0
-        for unit in codex_units:
-            reason = codex_unit_skip_reason(unit)
+        for resolved in codex_resolved:
+            unit = resolved.unit
+            reason = resolved.skip_reason
             if reason:
                 skip_reasons[reason] += 1
             else:
@@ -164,7 +166,7 @@ def build_inventory(
                 status = "imported"
             else:
                 status = "ready"
-            unit_records.append(codex_unit_inventory_record(unit, status, reason))
+            unit_records.append(codex_unit_inventory_record(resolved, status, reason))
         inputs.append(
             {
                 "provider": "codex",
