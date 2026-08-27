@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
-from scripts.common.wiki_core import MANIFEST_PATH, REPO_ROOT, load_manifest
+from scripts.common.wiki_core import MANIFEST_PATH, REPO_ROOT, load_manifest, sha256_file
 from scripts.ingest.import_claude import DEFAULT_INPUT as CLAUDE_INPUT
 from scripts.ingest.import_claude import iter_export_units, unit_inventory_record, unit_skip_reason
 from scripts.ingest.import_codex import DEFAULT_INPUT as CODEX_INPUT
@@ -23,6 +23,7 @@ from scripts.ingest.import_codex import unit_inventory_record as codex_unit_inve
 
 
 DEFAULT_NOTES_INPUT = REPO_ROOT.parent / "notes"
+DEFAULT_ARTICLES_INPUT = REPO_ROOT.parent / "articles"
 DEFAULT_OUTPUT = REPO_ROOT / "meta" / "source-inventory.json"
 
 
@@ -48,7 +49,11 @@ def _standardized_counts(manifest_path: Path) -> Counter[str]:
     if not manifest_path.is_file():
         return Counter()
     manifest = load_manifest(manifest_path)
-    return Counter(str(item.get("origin", "unknown")) for item in manifest["sources"].values())
+    return Counter(
+        str(item.get("origin", "unknown"))
+        for item in manifest["sources"].values()
+        if item.get("ingest_status") == "ready" and item.get("output_path")
+    )
 
 
 def _manifest_sources(manifest_path: Path) -> dict[str, Any]:
@@ -71,14 +76,63 @@ def _missing_input(provider: str, input_path: Path, source_format: str, known_mi
     }
 
 
+def _markdown_units(
+    files: list[Path],
+    input_root: Path,
+    manifest_sources: dict[str, Any],
+    layer: str,
+) -> tuple[list[dict[str, Any]], int, Counter[str]]:
+    manifest_by_path = {
+        Path(str(item.get("source_path") or "")).resolve(): (source_id, item)
+        for source_id, item in manifest_sources.items()
+        if item.get("layer") == layer
+    }
+    units: list[dict[str, Any]] = []
+    retained = 0
+    skip_reasons: Counter[str] = Counter()
+    for path in files:
+        manifest_record = manifest_by_path.get(path.resolve())
+        if manifest_record is None:
+            source_id = None
+            status = "ready"
+            reason = None
+        else:
+            source_id, item = manifest_record
+            status = str(item.get("ingest_status") or "ready")
+            reason = item.get("skip_reason") or item.get("ingest_issue")
+        if status == "ready":
+            retained += 1
+        else:
+            skip_reasons[str(reason or status)] += 1
+        raw = path.read_bytes()
+        units.append(
+            {
+                "source_id": source_id,
+                "unit_kind": "document",
+                "document_kind": layer,
+                "title": path.stem,
+                "raw_source_path": str(path.resolve()),
+                "raw_source_hash": f"sha256:{sha256_file(path)}",
+                "raw_source_locator": (
+                    f"{path.relative_to(input_root).as_posix()}@L1-L{max(1, len(raw.splitlines()))}"
+                ),
+                "parse_status": "imported" if status == "ready" and source_id else status,
+                "skip_reason": reason,
+            }
+        )
+    return units, retained, skip_reasons
+
+
 def build_inventory(
     claude_input: Path,
     codex_input: Path,
     notes_input: Path,
     manifest_path: Path = MANIFEST_PATH,
     *,
+    articles_input: Path | None = None,
     scanned_at: str | None = None,
 ) -> dict[str, Any]:
+    articles_input = articles_input or notes_input.parent / "articles"
     scanned_at = scanned_at or datetime.now(ZoneInfo("Asia/Hong_Kong")).isoformat(timespec="seconds")
     standardized = _standardized_counts(manifest_path)
     manifest_sources = _manifest_sources(manifest_path)
@@ -97,11 +151,29 @@ def build_inventory(
         retained = 0
         for unit in claude_units:
             reason = unit_skip_reason(unit)
+            manifest_document = manifest_sources.get(unit.source_id, {})
+            forced_status = ""
+            if manifest_document.get("source_kind") == "document" and manifest_document.get("layer") in {
+                "note",
+                "article",
+            }:
+                ingest_status = str(manifest_document.get("ingest_status") or "")
+                if ingest_status == "ready":
+                    reason = ""
+                    forced_status = "imported"
+                elif ingest_status == "review":
+                    reason = str(manifest_document.get("ingest_issue") or "document_import_review")
+                    forced_status = "review"
+                elif ingest_status == "skipped":
+                    reason = str(manifest_document.get("skip_reason") or "document_import_skipped")
+                    forced_status = "excluded"
             if reason:
                 skip_reasons[reason] += 1
             else:
                 retained += 1
-            if reason == "document_classification_review":
+            if forced_status:
+                status = forced_status
+            elif reason == "document_classification_review":
                 status = "review"
             elif reason:
                 status = "excluded"
@@ -203,6 +275,9 @@ def build_inventory(
             for path in sorted(notes_input.rglob("*"))
             if path.is_file() and path.suffix.lower() != ".md" and not any(part.startswith(".") for part in path.relative_to(notes_input).parts)
         ]
+        note_units, note_retained, note_skips = _markdown_units(
+            note_files, notes_input, manifest_sources, "note"
+        )
         inputs.append(
             {
                 "provider": "notes",
@@ -211,11 +286,42 @@ def build_inventory(
                 "available": True,
                 "date_range": {"from": None, "to": None},
                 "discovered": len(note_files),
-                "retained": len(note_files),
-                "skipped": 0,
+                "retained": note_retained,
+                "skipped": len(note_files) - note_retained,
+                "skip_reasons": dict(sorted(note_skips.items())),
                 "assets_discovered": len(asset_files),
-                "currently_standardized": standardized["notes"],
+                "currently_standardized": standardized["personal-notes"],
                 "known_missing": notes_missing,
+                "units": note_units,
+            }
+        )
+
+    articles_missing = ["远程图片和链接只记录引用，inventory 不下载或联网检查"]
+    if not articles_input.is_dir():
+        inputs.append(_missing_input("articles", articles_input, "markdown", articles_missing))
+    else:
+        article_files = [
+            path
+            for path in sorted(articles_input.rglob("*.md"))
+            if not any(part.startswith(".") for part in path.relative_to(articles_input).parts)
+        ]
+        article_units, retained, article_skips = _markdown_units(
+            article_files, articles_input, manifest_sources, "article"
+        )
+        inputs.append(
+            {
+                "provider": "articles",
+                "input_path": _display_path(articles_input),
+                "format": "markdown",
+                "available": True,
+                "date_range": {"from": None, "to": None},
+                "discovered": len(article_files),
+                "retained": retained,
+                "skipped": len(article_files) - retained,
+                "skip_reasons": dict(sorted(article_skips.items())),
+                "currently_standardized": standardized["external-articles"],
+                "known_missing": articles_missing,
+                "units": article_units,
             }
         )
 
@@ -226,7 +332,7 @@ def build_inventory(
         "version": 2,
         "scanned_at": scanned_at,
         "coverage_boundary": (
-            "只覆盖当前机器上可访问的三个已知输入位置，不代表所有历史会话已提供；"
+            "只覆盖当前机器上可访问的四类已知输入位置，不代表所有历史会话已提供；"
             "Claude 事件计数只表示现有有损 Markdown 导出中仍可见的内容。"
         ),
         "known_missing": [
@@ -249,11 +355,18 @@ def main() -> None:
     parser.add_argument("--claude-input", type=Path, default=CLAUDE_INPUT)
     parser.add_argument("--codex-input", type=Path, default=CODEX_INPUT)
     parser.add_argument("--notes-input", type=Path, default=DEFAULT_NOTES_INPUT)
+    parser.add_argument("--articles-input", type=Path, default=DEFAULT_ARTICLES_INPUT)
     parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
-    inventory = build_inventory(args.claude_input, args.codex_input, args.notes_input, args.manifest)
+    inventory = build_inventory(
+        args.claude_input,
+        args.codex_input,
+        args.notes_input,
+        args.manifest,
+        articles_input=args.articles_input,
+    )
     if not args.dry_run:
         save_inventory(inventory, args.output)
     summary = ", ".join(

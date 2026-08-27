@@ -663,7 +663,7 @@ def import_exports(
             stats["skipped"] += 1
             reasons = stats["skip_reasons"]
             reasons[skip_reason] = reasons.get(skip_reason, 0) + 1
-            if not dry_run and current:
+            if not dry_run and current and current.get("source_kind") != "document":
                 old_output = Path(REPO_ROOT / str(current.get("output_path", "")))
                 if old_output.is_file() and old_output.parent.resolve() == output_dir.resolve():
                     old_output.unlink()
