@@ -36,6 +36,7 @@ from scripts.common.wiki_core import (
 
 DEFAULT_INPUT = Path.home() / ".codex" / "sessions"
 DEFAULT_OUTPUT = REPO_ROOT / "sources" / "conversations" / "codex"
+DEFAULT_REVIEW_RESOLUTIONS = REPO_ROOT / "meta" / "source-review-resolutions.json"
 RUNTIME_USER_TAG = re.compile(r"<(?:model_instruction|user_action)(?:>|\s)", re.IGNORECASE)
 REVIEW_SKIP_REASONS = {
     "fork_cycle_review",
@@ -44,9 +45,12 @@ REVIEW_SKIP_REASONS = {
     "fork_parent_unusable_review",
     "fork_prefix_mismatch_review",
     "invalid_jsonl_review",
+    "review_resolution_mismatch_review",
     "thread_kind_review",
     "turn_boundary_review",
 }
+
+REVIEW_DECISION_OMIT_CORRUPT_TURNS = "omit_invalid_jsonl_and_superseded_turns"
 DEFERRED_SKIP_REASONS = {
     "active_session_deferred",
     "fork_parent_deferred",
@@ -62,6 +66,55 @@ class CodexExchange:
     assistant_text: str
     user_locator: str
     assistant_locator: str
+
+
+@dataclass(frozen=True)
+class InvalidJsonlLine:
+    line_number: int
+    content_hash: str
+    nul_only: bool
+
+
+@dataclass(frozen=True)
+class SupersededIncompleteTurn:
+    start_line: int
+    next_start_line: int
+
+
+@dataclass(frozen=True)
+class CodexReviewResolution:
+    provider_session_id: str
+    decision: str
+    reviewed_at: str
+    reviewed_by: str
+    invalid_lines: tuple[InvalidJsonlLine, ...]
+    superseded_turns: tuple[SupersededIncompleteTurn, ...]
+
+    @property
+    def content_hash(self) -> str:
+        payload = {
+            "provider_session_id": self.provider_session_id,
+            "decision": self.decision,
+            "reviewed_at": self.reviewed_at,
+            "reviewed_by": self.reviewed_by,
+            "invalid_lines": [
+                {
+                    "line": item.line_number,
+                    "sha256": item.content_hash,
+                    "nul_only": item.nul_only,
+                }
+                for item in self.invalid_lines
+            ],
+            "superseded_turns": [
+                {
+                    "start_line": item.start_line,
+                    "next_start_line": item.next_start_line,
+                }
+                for item in self.superseded_turns
+            ],
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -98,12 +151,22 @@ class CodexSession:
     omitted_interrupted_count: int
     omitted_unpaired_user_count: int
     event_user_message_count: int
-    invalid_line_count: int
-    open_turn_count: int
+    invalid_lines: tuple[InvalidJsonlLine, ...]
+    active_open_turn_count: int
+    superseded_incomplete_turns: tuple[SupersededIncompleteTurn, ...]
     ambiguous_user_turn_count: int
     ambiguous_final_turn_count: int
     extra_session_meta_count: int
     parse_notes: tuple[str, ...]
+
+    @property
+    def invalid_line_count(self) -> int:
+        return len(self.invalid_lines)
+
+    @property
+    def open_turn_count(self) -> int:
+        """兼容旧调用；只表示文件末尾仍未结束、可能仍在写入的 turn。"""
+        return self.active_open_turn_count
 
 
 @dataclass(frozen=True)
@@ -116,11 +179,13 @@ class CodexResolvedSession:
     fork_parent_source_id: str | None = None
     fork_parent_hash: str | None = None
     omitted_fork_prefix_exchange_count: int = 0
+    review_resolution: CodexReviewResolution | None = None
 
 
 @dataclass
 class _Turn:
     ordinal: int
+    start_line: int
     human_users: list[tuple[int, str]] = field(default_factory=list)
     assistant_finals: list[tuple[int, str]] = field(default_factory=list)
 
@@ -151,20 +216,108 @@ def _filename_session_id(path: Path) -> str:
     return match.group(1) if match else path.stem.removeprefix("rollout-")
 
 
+def load_review_resolutions(
+    path: Path = DEFAULT_REVIEW_RESOLUTIONS,
+) -> dict[str, CodexReviewResolution]:
+    if not path.is_file():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("version") != 1 or not isinstance(payload.get("codex_sessions"), dict):
+        raise ValueError(f"Codex review resolution 格式无效: {path}")
+    resolutions: dict[str, CodexReviewResolution] = {}
+    for provider_session_id, raw_resolution in payload["codex_sessions"].items():
+        if not isinstance(raw_resolution, dict):
+            raise ValueError(f"Codex review resolution 条目无效: {provider_session_id}")
+        decision = str(raw_resolution.get("decision") or "")
+        reviewed_at = str(raw_resolution.get("reviewed_at") or "")
+        reviewed_by = str(raw_resolution.get("reviewed_by") or "")
+        raw_invalid_lines = raw_resolution.get("invalid_jsonl_lines")
+        raw_superseded_turns = raw_resolution.get("superseded_incomplete_turns")
+        if (
+            decision != REVIEW_DECISION_OMIT_CORRUPT_TURNS
+            or not reviewed_at
+            or not reviewed_by
+            or not isinstance(raw_invalid_lines, list)
+            or not raw_invalid_lines
+            or not isinstance(raw_superseded_turns, list)
+            or not raw_superseded_turns
+        ):
+            raise ValueError(f"Codex review resolution 字段无效: {provider_session_id}")
+        if any(
+            not isinstance(item, dict) or not isinstance(item.get("nul_only"), bool)
+            for item in raw_invalid_lines
+        ):
+            raise ValueError(f"Codex review resolution 无效行字段无效: {provider_session_id}")
+        try:
+            invalid_lines = tuple(
+                InvalidJsonlLine(
+                    line_number=int(item["line"]),
+                    content_hash=str(item["sha256"]),
+                    nul_only=item["nul_only"],
+                )
+                for item in raw_invalid_lines
+            )
+            superseded_turns = tuple(
+                SupersededIncompleteTurn(
+                    start_line=int(item["start_line"]),
+                    next_start_line=int(item["next_start_line"]),
+                )
+                for item in raw_superseded_turns
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"Codex review resolution 定位字段无效: {provider_session_id}") from exc
+        if any(
+            item.line_number < 1 or not re.fullmatch(r"[0-9a-f]{64}", item.content_hash)
+            for item in invalid_lines
+        ) or any(
+            item.start_line < 1 or item.next_start_line <= item.start_line
+            for item in superseded_turns
+        ):
+            raise ValueError(f"Codex review resolution 定位值无效: {provider_session_id}")
+        resolutions[str(provider_session_id)] = CodexReviewResolution(
+            provider_session_id=str(provider_session_id),
+            decision=decision,
+            reviewed_at=reviewed_at,
+            reviewed_by=reviewed_by,
+            invalid_lines=invalid_lines,
+            superseded_turns=superseded_turns,
+        )
+    return resolutions
+
+
+def _review_resolution_matches(
+    unit: CodexSession,
+    resolution: CodexReviewResolution,
+) -> bool:
+    return (
+        resolution.provider_session_id == unit.provider_session_id
+        and resolution.decision == REVIEW_DECISION_OMIT_CORRUPT_TURNS
+        and resolution.invalid_lines == unit.invalid_lines
+        and resolution.superseded_turns == unit.superseded_incomplete_turns
+        and all(item.nul_only for item in unit.invalid_lines)
+    )
+
+
 def parse_session(path: Path, input_root: Path | None = None) -> CodexSession:
     raw = path.read_bytes()
     content_hash = hashlib.sha256(raw).hexdigest()
-    text = raw.decode("utf-8", errors="replace")
-    lines = text.splitlines()
+    raw_lines = raw.splitlines()
+    lines = [line.decode("utf-8", errors="replace") for line in raw_lines]
     records: list[tuple[int, dict[str, Any]]] = []
-    invalid_lines = 0
-    for line_number, line in enumerate(lines, 1):
+    invalid_lines: list[InvalidJsonlLine] = []
+    for line_number, (raw_line, line) in enumerate(zip(raw_lines, lines), 1):
         if not line.strip():
             continue
         try:
             value = json.loads(line)
         except json.JSONDecodeError:
-            invalid_lines += 1
+            invalid_lines.append(
+                InvalidJsonlLine(
+                    line_number=line_number,
+                    content_hash=hashlib.sha256(raw_line).hexdigest(),
+                    nul_only=bool(raw_line) and raw_line.strip(b"\x00") == b"",
+                )
+            )
             continue
         if isinstance(value, dict):
             records.append((line_number, value))
@@ -204,19 +357,29 @@ def parse_session(path: Path, input_root: Path | None = None) -> CodexSession:
     interruptions = 0
     unpaired_users = 0
     event_users = 0
-    open_turns = 0
+    active_open_turns = 0
+    superseded_incomplete_turns: list[SupersededIncompleteTurn] = []
     ambiguous_users = 0
     ambiguous_finals = 0
     orphan_finals = 0
     notes: set[str] = set()
 
-    def finish_turn(terminal: str) -> None:
-        nonlocal current, open_turns, interruptions, unpaired_users
+    def finish_turn(terminal: str, next_start_line: int | None = None) -> None:
+        nonlocal current, active_open_turns, interruptions, unpaired_users
         nonlocal ambiguous_users, ambiguous_finals, orphan_finals
         if current is None:
             return
-        if terminal == "open":
-            open_turns += 1
+        if terminal == "active":
+            active_open_turns += 1
+        elif terminal == "superseded":
+            if next_start_line is None:
+                raise ValueError("superseded turn 缺少后续 task 起始行")
+            superseded_incomplete_turns.append(
+                SupersededIncompleteTurn(
+                    start_line=current.start_line,
+                    next_start_line=next_start_line,
+                )
+            )
         elif terminal == "aborted":
             interruptions += 1
         if len(current.human_users) > 1:
@@ -254,9 +417,9 @@ def parse_session(path: Path, input_root: Path | None = None) -> CodexSession:
         payload_type = payload.get("type")
 
         if record_type == "event_msg" and payload_type == "task_started":
-            finish_turn("open")
+            finish_turn("superseded", line_number)
             turn_ordinal += 1
-            current = _Turn(turn_ordinal)
+            current = _Turn(turn_ordinal, line_number)
             continue
 
         if record_type == "event_msg" and payload_type == "user_message":
@@ -313,13 +476,15 @@ def parse_session(path: Path, input_root: Path | None = None) -> CodexSession:
         if record_type == "event_msg" and payload_type in {"task_complete", "turn_aborted"}:
             finish_turn("complete" if payload_type == "task_complete" else "aborted")
 
-    finish_turn("open")
+    finish_turn("active")
     if unpaired_users:
         notes.add("存在没有显式 assistant final 的 human user turn；该 turn 未写入标准化正文。")
     if orphan_finals:
         notes.add("存在无法与 human user 配对的 assistant final；未写入标准化正文。")
-    if open_turns:
-        notes.add("文件包含未结束 task，可能仍在写入；本轮不导入。")
+    if active_open_turns:
+        notes.add("文件末尾包含未结束 task，可能仍在写入；本轮延后导入。")
+    if superseded_incomplete_turns:
+        notes.add("历史 task 未见终止事件且已被后续 task 取代；该 turn 未写入标准化正文。")
     if invalid_lines:
         notes.add("文件包含无法解析的 JSONL 行。")
     if len(session_metas) > 1:
@@ -366,8 +531,9 @@ def parse_session(path: Path, input_root: Path | None = None) -> CodexSession:
         omitted_interrupted_count=interruptions,
         omitted_unpaired_user_count=unpaired_users,
         event_user_message_count=event_users,
-        invalid_line_count=invalid_lines,
-        open_turn_count=open_turns,
+        invalid_lines=tuple(invalid_lines),
+        active_open_turn_count=active_open_turns,
+        superseded_incomplete_turns=tuple(superseded_incomplete_turns),
         ambiguous_user_turn_count=ambiguous_users,
         ambiguous_final_turn_count=ambiguous_finals,
         extra_session_meta_count=max(len(session_metas) - 1, 0),
@@ -380,15 +546,25 @@ def iter_session_units(input_dir: Path) -> Iterable[CodexSession]:
         yield parse_session(path, input_dir)
 
 
-def _intrinsic_skip_reason(unit: CodexSession) -> str:
+def _intrinsic_skip_reason(
+    unit: CodexSession,
+    review_resolution: CodexReviewResolution | None = None,
+) -> str:
     if unit.thread_kind == "subagent":
         return "subagent_excluded"
     if unit.thread_kind != "main":
         return "thread_kind_review"
-    if unit.open_turn_count:
-        return "active_session_deferred"
-    if unit.invalid_line_count:
+    resolution_matches = bool(
+        review_resolution and _review_resolution_matches(unit, review_resolution)
+    )
+    if review_resolution and not resolution_matches:
+        return "review_resolution_mismatch_review"
+    if unit.invalid_line_count and not resolution_matches:
         return "invalid_jsonl_review"
+    if unit.active_open_turn_count:
+        return "active_session_deferred"
+    if unit.superseded_incomplete_turns and not resolution_matches:
+        return "turn_boundary_review"
     if unit.ambiguous_user_turn_count or unit.ambiguous_final_turn_count:
         return "turn_boundary_review"
     if not unit.human_user_count:
@@ -412,8 +588,12 @@ def _common_exchange_prefix(parent: CodexSession, child: CodexSession) -> int:
     return prefix
 
 
-def resolve_session_units(units: Iterable[CodexSession]) -> tuple[CodexResolvedSession, ...]:
+def resolve_session_units(
+    units: Iterable[CodexSession],
+    review_resolutions: dict[str, CodexReviewResolution] | None = None,
+) -> tuple[CodexResolvedSession, ...]:
     ordered = tuple(units)
+    review_resolutions = review_resolutions or {}
     by_provider_id: dict[str, CodexSession] = {}
     for unit in ordered:
         if unit.provider_session_id in by_provider_id:
@@ -427,7 +607,13 @@ def resolve_session_units(units: Iterable[CodexSession]) -> tuple[CodexResolvedS
         cached = resolved.get(unit.provider_session_id)
         if cached is not None:
             return cached
-        intrinsic_reason = _intrinsic_skip_reason(unit)
+        configured_resolution = review_resolutions.get(unit.provider_session_id)
+        applied_resolution = (
+            configured_resolution
+            if configured_resolution and _review_resolution_matches(unit, configured_resolution)
+            else None
+        )
+        intrinsic_reason = _intrinsic_skip_reason(unit, configured_resolution)
         if intrinsic_reason:
             result = CodexResolvedSession(
                 unit=unit,
@@ -435,6 +621,7 @@ def resolve_session_units(units: Iterable[CodexSession]) -> tuple[CodexResolvedS
                 title=unit.title,
                 source_scope="fork_unresolved" if unit.forked_from_id else "full",
                 skip_reason=intrinsic_reason,
+                review_resolution=applied_resolution,
             )
             resolved[unit.provider_session_id] = result
             return result
@@ -445,6 +632,7 @@ def resolve_session_units(units: Iterable[CodexSession]) -> tuple[CodexResolvedS
                 title=unit.title,
                 source_scope="full",
                 skip_reason="",
+                review_resolution=applied_resolution,
             )
             resolved[unit.provider_session_id] = result
             return result
@@ -455,6 +643,7 @@ def resolve_session_units(units: Iterable[CodexSession]) -> tuple[CodexResolvedS
                 title=unit.title,
                 source_scope="fork_unresolved",
                 skip_reason="fork_cycle_review",
+                review_resolution=applied_resolution,
             )
             resolved[unit.provider_session_id] = result
             return result
@@ -467,6 +656,7 @@ def resolve_session_units(units: Iterable[CodexSession]) -> tuple[CodexResolvedS
                 title=unit.title,
                 source_scope="fork_unresolved",
                 skip_reason="fork_parent_missing_review",
+                review_resolution=applied_resolution,
             )
             resolved[unit.provider_session_id] = result
             return result
@@ -488,6 +678,7 @@ def resolve_session_units(units: Iterable[CodexSession]) -> tuple[CodexResolvedS
                 skip_reason=reason,
                 fork_parent_source_id=parent.source_id,
                 fork_parent_hash=parent.content_hash,
+                review_resolution=applied_resolution,
             )
             resolved[unit.provider_session_id] = result
             return result
@@ -502,6 +693,7 @@ def resolve_session_units(units: Iterable[CodexSession]) -> tuple[CodexResolvedS
                 skip_reason="fork_prefix_mismatch_review",
                 fork_parent_source_id=parent.source_id,
                 fork_parent_hash=parent.content_hash,
+                review_resolution=applied_resolution,
             )
             resolved[unit.provider_session_id] = result
             return result
@@ -518,6 +710,7 @@ def resolve_session_units(units: Iterable[CodexSession]) -> tuple[CodexResolvedS
             fork_parent_source_id=parent.source_id,
             fork_parent_hash=parent.content_hash,
             omitted_fork_prefix_exchange_count=prefix,
+            review_resolution=applied_resolution,
         )
         resolved[unit.provider_session_id] = result
         return result
@@ -525,8 +718,14 @@ def resolve_session_units(units: Iterable[CodexSession]) -> tuple[CodexResolvedS
     return tuple(resolve(unit) for unit in ordered)
 
 
-def iter_resolved_session_units(input_dir: Path) -> Iterable[CodexResolvedSession]:
-    yield from resolve_session_units(iter_session_units(input_dir))
+def iter_resolved_session_units(
+    input_dir: Path,
+    review_resolutions_path: Path = DEFAULT_REVIEW_RESOLUTIONS,
+) -> Iterable[CodexResolvedSession]:
+    yield from resolve_session_units(
+        iter_session_units(input_dir),
+        load_review_resolutions(review_resolutions_path),
+    )
 
 
 def _dependency_order(
@@ -563,10 +762,14 @@ def _manifest_source_is_current(
     current = manifest["sources"].get(resolved.unit.source_id, {})
     output_value = str(current.get("output_path") or "")
     output_path = REPO_ROOT / output_value if output_value else Path()
+    review_resolution_hash = (
+        resolved.review_resolution.content_hash if resolved.review_resolution else None
+    )
     return bool(
         not resolved.skip_reason
         and current.get("source_hash") == resolved.unit.content_hash
         and current.get("fork_parent_hash") == resolved.fork_parent_hash
+        and current.get("review_resolution_hash") == review_resolution_hash
         and current.get("importer_version") == CODEX_IMPORTER_VERSION
         and output_path.is_file()
         and not source_needs_redaction(output_path)
@@ -581,7 +784,7 @@ def unit_inventory_record(
     unit = resolved.unit
     reason = resolved.skip_reason if skip_reason is None else skip_reason
     status = parse_status or ("excluded" if reason else "ready")
-    return {
+    record = {
         "source_id": unit.source_id,
         "unit_kind": "session",
         "provider_session_id": unit.provider_session_id,
@@ -624,12 +827,34 @@ def unit_inventory_record(
         "omitted_unpaired_user_count": unit.omitted_unpaired_user_count,
         "event_user_message_count": unit.event_user_message_count,
         "invalid_jsonl_lines": unit.invalid_line_count,
-        "open_turn_count": unit.open_turn_count,
+        "invalid_jsonl_line_numbers": [item.line_number for item in unit.invalid_lines],
+        "active_open_turn_count": unit.active_open_turn_count,
+        "superseded_incomplete_turn_count": len(unit.superseded_incomplete_turns),
+        "superseded_incomplete_turns": [
+            {
+                "start_line": item.start_line,
+                "next_start_line": item.next_start_line,
+            }
+            for item in unit.superseded_incomplete_turns
+        ],
         "ambiguous_user_turn_count": unit.ambiguous_user_turn_count,
         "ambiguous_final_turn_count": unit.ambiguous_final_turn_count,
         "extra_session_meta_count": unit.extra_session_meta_count,
         "parse_notes": list(unit.parse_notes),
     }
+    if resolved.review_resolution:
+        resolution = resolved.review_resolution
+        record.update(
+            {
+                "review_resolution": resolution.decision,
+                "reviewed_at": resolution.reviewed_at,
+                "reviewed_by": resolution.reviewed_by,
+                "review_resolution_hash": resolution.content_hash,
+                "reviewed_invalid_jsonl_lines": len(resolution.invalid_lines),
+                "reviewed_superseded_incomplete_turn_count": len(resolution.superseded_turns),
+            }
+        )
+    return record
 
 
 def _render_session(resolved: CodexResolvedSession, imported: str) -> tuple[str, int, str]:
@@ -689,9 +914,23 @@ def _render_session(resolved: CodexResolvedSession, imported: str) -> tuple[str,
         "omitted_interrupted_count": unit.omitted_interrupted_count,
         "omitted_unpaired_user_count": unit.omitted_unpaired_user_count,
         "invalid_jsonl_lines": unit.invalid_line_count,
+        "active_open_turn_count": unit.active_open_turn_count,
+        "superseded_incomplete_turn_count": len(unit.superseded_incomplete_turns),
         "redaction_count": redactions,
         "importer_version": CODEX_IMPORTER_VERSION,
     }
+    if resolved.review_resolution:
+        resolution = resolved.review_resolution
+        metadata.update(
+            {
+                "review_resolution": resolution.decision,
+                "reviewed_at": resolution.reviewed_at,
+                "reviewed_by": resolution.reviewed_by,
+                "review_resolution_hash": f"sha256:{resolution.content_hash}",
+                "reviewed_invalid_jsonl_lines": len(resolution.invalid_lines),
+                "reviewed_superseded_incomplete_turn_count": len(resolution.superseded_turns),
+            }
+        )
     if unit.cwd:
         metadata["cwd"] = unit.cwd
     if unit.cli_version:
@@ -710,6 +949,12 @@ def _render_session(resolved: CodexResolvedSession, imported: str) -> tuple[str,
             if unit.forked_from_id
             else ""
         )
+        + (
+            "> 本页包含人工审核后的受控恢复：损坏 JSONL 行及其所在的历史残缺 turn 已省略，"
+            "其余具有明确 human user、assistant final 和 task 边界的 exchange 正常保留。\n\n"
+            if resolved.review_resolution
+            else ""
+        )
         + "\n\n".join(rendered)
     )
     return yaml_document(metadata, body), redactions, title
@@ -723,6 +968,7 @@ def import_sessions(
     limit: int | None = None,
     dry_run: bool = False,
     session_ids: set[str] | None = None,
+    review_resolutions_path: Path = DEFAULT_REVIEW_RESOLUTIONS,
 ) -> dict[str, Any]:
     if not input_dir.is_dir():
         raise FileNotFoundError(f"Codex session 目录不存在: {input_dir}")
@@ -744,13 +990,16 @@ def import_sessions(
         "omitted_tool_results": 0,
         "omitted_reasoning": 0,
         "omitted_interruptions": 0,
+        "omitted_superseded_turns": 0,
         "omitted_unpaired_users": 0,
         "invalid_lines": 0,
         "redactions": 0,
     }
     requested = set(session_ids or ())
     seen_requested: set[str] = set()
-    resolved_units = _dependency_order(iter_resolved_session_units(input_dir))
+    resolved_units = _dependency_order(
+        iter_resolved_session_units(input_dir, review_resolutions_path)
+    )
     resolved_by_source_id = {item.unit.source_id: item for item in resolved_units}
     available_source_ids = {
         item.unit.source_id for item in resolved_units if _manifest_source_is_current(item, manifest)
@@ -795,6 +1044,7 @@ def import_sessions(
         stats["omitted_tool_results"] += unit.omitted_tool_result_count
         stats["omitted_reasoning"] += unit.omitted_reasoning_count
         stats["omitted_interruptions"] += unit.omitted_interrupted_count
+        stats["omitted_superseded_turns"] += len(unit.superseded_incomplete_turns)
         stats["omitted_unpaired_users"] += unit.omitted_unpaired_user_count
         stats["invalid_lines"] += unit.invalid_line_count
 
@@ -849,10 +1099,25 @@ def import_sessions(
             "created": unit.created,
             "omitted_trivial_exchange_count": unit.omitted_trivial_exchange_count,
             "omitted_fork_prefix_exchange_count": resolved.omitted_fork_prefix_exchange_count,
+            "invalid_jsonl_lines": unit.invalid_line_count,
+            "active_open_turn_count": unit.active_open_turn_count,
+            "superseded_incomplete_turn_count": len(unit.superseded_incomplete_turns),
             "redaction_count": redactions,
             "imported_at": utc_now(),
             "importer_version": CODEX_IMPORTER_VERSION,
         }
+        if resolved.review_resolution:
+            resolution = resolved.review_resolution
+            manifest["sources"][unit.source_id].update(
+                {
+                    "review_resolution": resolution.decision,
+                    "reviewed_at": resolution.reviewed_at,
+                    "reviewed_by": resolution.reviewed_by,
+                    "review_resolution_hash": resolution.content_hash,
+                    "reviewed_invalid_jsonl_lines": len(resolution.invalid_lines),
+                    "reviewed_superseded_incomplete_turn_count": len(resolution.superseded_turns),
+                }
+            )
         available_source_ids.add(unit.source_id)
 
     missing = requested - seen_requested
@@ -871,6 +1136,7 @@ def main() -> None:
     parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--session-id", action="append", dest="session_ids")
+    parser.add_argument("--review-resolutions", type=Path, default=DEFAULT_REVIEW_RESOLUTIONS)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     stats = import_sessions(
@@ -880,6 +1146,7 @@ def main() -> None:
         limit=args.limit,
         dry_run=args.dry_run,
         session_ids=set(args.session_ids or ()),
+        review_resolutions_path=args.review_resolutions,
     )
     print("Codex 导入结果:", ", ".join(f"{key}={value}" for key, value in stats.items()))
 

@@ -15,9 +15,11 @@ from scripts.common.wiki_core import MANIFEST_PATH, REPO_ROOT, load_manifest, sh
 from scripts.ingest.import_claude import DEFAULT_INPUT as CLAUDE_INPUT
 from scripts.ingest.import_claude import iter_export_units, unit_inventory_record, unit_skip_reason
 from scripts.ingest.import_codex import DEFAULT_INPUT as CODEX_INPUT
+from scripts.ingest.import_codex import DEFAULT_REVIEW_RESOLUTIONS as CODEX_REVIEW_RESOLUTIONS
 from scripts.ingest.import_codex import DEFERRED_SKIP_REASONS as CODEX_DEFERRED_SKIP_REASONS
 from scripts.ingest.import_codex import REVIEW_SKIP_REASONS as CODEX_REVIEW_SKIP_REASONS
 from scripts.ingest.import_codex import iter_session_units as iter_codex_units
+from scripts.ingest.import_codex import load_review_resolutions as load_codex_review_resolutions
 from scripts.ingest.import_codex import resolve_session_units as resolve_codex_units
 from scripts.ingest.import_codex import unit_inventory_record as codex_unit_inventory_record
 
@@ -130,6 +132,7 @@ def build_inventory(
     manifest_path: Path = MANIFEST_PATH,
     *,
     articles_input: Path | None = None,
+    codex_review_resolutions: Path = CODEX_REVIEW_RESOLUTIONS,
     scanned_at: str | None = None,
 ) -> dict[str, Any]:
     articles_input = articles_input or notes_input.parent / "articles"
@@ -216,7 +219,10 @@ def build_inventory(
         inputs.append(_missing_input("codex", codex_input, "codex-rollout-jsonl", codex_missing))
     else:
         codex_units = list(iter_codex_units(codex_input))
-        codex_resolved = resolve_codex_units(codex_units)
+        codex_resolved = resolve_codex_units(
+            codex_units,
+            load_codex_review_resolutions(codex_review_resolutions),
+        )
         thread_counts = Counter(unit.thread_kind for unit in codex_units)
         skip_reasons: Counter[str] = Counter()
         unit_records: list[dict[str, Any]] = []
@@ -357,6 +363,11 @@ def main() -> None:
     parser.add_argument("--notes-input", type=Path, default=DEFAULT_NOTES_INPUT)
     parser.add_argument("--articles-input", type=Path, default=DEFAULT_ARTICLES_INPUT)
     parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
+    parser.add_argument(
+        "--codex-review-resolutions",
+        type=Path,
+        default=CODEX_REVIEW_RESOLUTIONS,
+    )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -366,6 +377,7 @@ def main() -> None:
         args.notes_input,
         args.manifest,
         articles_input=args.articles_input,
+        codex_review_resolutions=args.codex_review_resolutions,
     )
     if not args.dry_run:
         save_inventory(inventory, args.output)
