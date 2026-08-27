@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
+from scripts.common.ingest_log import SourceChangeTracker
 from scripts.common.wiki_core import (
     CODEX_ASSISTANT_FINAL_DETECTION,
     CODEX_IMPORTER_VERSION,
@@ -726,6 +727,7 @@ def import_sessions(
     if not input_dir.is_dir():
         raise FileNotFoundError(f"Codex session 目录不存在: {input_dir}")
     manifest = load_manifest(manifest_path)
+    change_tracker = SourceChangeTracker.for_output(output_dir)
     stats: dict[str, Any] = {
         "discovered": 0,
         "imported": 0,
@@ -803,6 +805,7 @@ def import_sessions(
             if not dry_run and current and skip_reason not in DEFERRED_SKIP_REASONS | REVIEW_SKIP_REASONS:
                 old_output = REPO_ROOT / str(current.get("output_path", ""))
                 if old_output.is_file() and old_output.parent.resolve() == output_dir.resolve():
+                    change_tracker.observe(old_output)
                     old_output.unlink()
                 manifest["sources"].pop(unit.source_id, None)
             continue
@@ -820,6 +823,7 @@ def import_sessions(
             available_source_ids.add(unit.source_id)
             continue
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        change_tracker.observe(output_path)
         output_path.write_text(document, encoding="utf-8")
         manifest["version"] = max(int(manifest.get("version", 1)), 2)
         manifest["sources"][unit.source_id] = {
@@ -856,6 +860,7 @@ def import_sessions(
         raise ValueError(f"未找到 Codex session ID: {', '.join(sorted(missing))}")
     if not dry_run:
         save_manifest(manifest, manifest_path)
+        change_tracker.append("codex")
     return stats
 
 

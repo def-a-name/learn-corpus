@@ -13,6 +13,7 @@ from urllib.parse import unquote, urlsplit
 
 import yaml
 
+from scripts.common.ingest_log import SourceChangeTracker
 from scripts.common.wiki_core import (
     MANIFEST_PATH,
     MARKDOWN_SOURCE_IMPORTER_VERSION,
@@ -542,6 +543,7 @@ def import_markdown_sources(
 ) -> dict[str, Any]:
     paths = discover_markdown(input_root, includes)
     manifest = load_manifest(manifest_path)
+    change_tracker = SourceChangeTracker.for_output(policy.output_dir)
     stats: dict[str, Any] = {
         "discovered": len(paths),
         "imported": 0,
@@ -654,7 +656,9 @@ def import_markdown_sources(
         if dry_run:
             continue
         for asset in prepared.assets:
+            change_tracker.observe(asset.stored_path)
             _atomic_copy(asset)
+        change_tracker.observe(output_path)
         _atomic_write_text(output_path, _render_document(prepared, policy))
         manifest["sources"][prepared.source_id] = _manifest_record(prepared, policy, output_path, current)
 
@@ -664,6 +668,7 @@ def import_markdown_sources(
     if not dry_run:
         manifest["version"] = max(int(manifest.get("version", 1)), 2)
         save_manifest(manifest, manifest_path)
+        change_tracker.append(f"{policy.layer}s")
     return stats
 
 

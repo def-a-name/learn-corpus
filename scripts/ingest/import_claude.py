@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+from scripts.common.ingest_log import SourceChangeTracker
 from scripts.common.wiki_core import (
     CLAUDE_ASSISTANT_FINAL_DETECTION,
     CLAUDE_IMPORTER_VERSION,
@@ -573,7 +574,12 @@ def _render_session(unit: ExportUnit, imported: str) -> tuple[str, int, str]:
     return yaml_document(metadata, body), redactions, title
 
 
-def _remove_legacy_sources(manifest: dict, output_dir: Path, dry_run: bool) -> int:
+def _remove_legacy_sources(
+    manifest: dict,
+    output_dir: Path,
+    dry_run: bool,
+    change_tracker: SourceChangeTracker,
+) -> int:
     legacy_ids = [source_id for source_id, item in manifest["sources"].items() if item.get("origin") == "claude"]
     if dry_run:
         return len(legacy_ids)
@@ -581,6 +587,7 @@ def _remove_legacy_sources(manifest: dict, output_dir: Path, dry_run: bool) -> i
         item = manifest["sources"].pop(source_id)
         output_path = Path(REPO_ROOT / item.get("output_path", ""))
         if output_path.is_file() and output_path.parent.resolve() == output_dir.resolve():
+            change_tracker.observe(output_path)
             output_path.unlink()
     return len(legacy_ids)
 
@@ -599,6 +606,7 @@ def import_exports(
         raise FileNotFoundError(f"Claude 导出目录不存在: {input_dir}")
 
     manifest = load_manifest(manifest_path)
+    change_tracker = SourceChangeTracker.for_output(output_dir)
     stats: dict[str, Any] = {
         "discovered": 0,
         "imported": 0,
@@ -621,7 +629,7 @@ def import_exports(
         "redactions": 0,
     }
     if replace_legacy:
-        stats["legacy_removed"] = _remove_legacy_sources(manifest, output_dir, dry_run)
+        stats["legacy_removed"] = _remove_legacy_sources(manifest, output_dir, dry_run, change_tracker)
 
     for unit in iter_export_units(input_dir, kind):
         skip_reason = unit_skip_reason(unit)
@@ -666,6 +674,7 @@ def import_exports(
             if not dry_run and current and current.get("source_kind") != "document":
                 old_output = Path(REPO_ROOT / str(current.get("output_path", "")))
                 if old_output.is_file() and old_output.parent.resolve() == output_dir.resolve():
+                    change_tracker.observe(old_output)
                     old_output.unlink()
                 manifest["sources"].pop(unit.source_id, None)
             continue
@@ -683,6 +692,7 @@ def import_exports(
         if dry_run:
             continue
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        change_tracker.observe(output_path)
         output_path.write_text(document, encoding="utf-8")
         manifest["version"] = max(int(manifest.get("version", 1)), 2)
         manifest["sources"][unit.source_id] = {
@@ -710,6 +720,7 @@ def import_exports(
 
     if not dry_run:
         save_manifest(manifest, manifest_path)
+        change_tracker.append("claude")
     return stats
 
 
