@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""盘点当前可访问的 Claude、Codex 和 notes 输入范围。"""
+"""盘点当前可访问的会话、notes 和 articles 输入范围。"""
 
 from __future__ import annotations
 
@@ -22,6 +22,11 @@ from scripts.ingest.import_codex import iter_session_units as iter_codex_units
 from scripts.ingest.import_codex import load_review_resolutions as load_codex_review_resolutions
 from scripts.ingest.import_codex import resolve_session_units as resolve_codex_units
 from scripts.ingest.import_codex import unit_inventory_record as codex_unit_inventory_record
+from scripts.ingest.import_web_chat import DEFAULT_INPUT as WEB_CHAT_INPUT
+from scripts.ingest.import_web_chat import REVIEW_SKIP_REASONS as WEB_CHAT_REVIEW_SKIP_REASONS
+from scripts.ingest.import_web_chat import iter_web_chat_units
+from scripts.ingest.import_web_chat import unit_inventory_record as web_chat_unit_inventory_record
+from scripts.ingest.import_web_chat import unit_skip_reason as web_chat_unit_skip_reason
 
 
 DEFAULT_NOTES_INPUT = REPO_ROOT.parent / "notes"
@@ -132,10 +137,12 @@ def build_inventory(
     manifest_path: Path = MANIFEST_PATH,
     *,
     articles_input: Path | None = None,
+    web_chat_input: Path | None = None,
     codex_review_resolutions: Path = CODEX_REVIEW_RESOLUTIONS,
     scanned_at: str | None = None,
 ) -> dict[str, Any]:
     articles_input = articles_input or notes_input.parent / "articles"
+    web_chat_input = web_chat_input or notes_input.parent / "web-chats"
     scanned_at = scanned_at or datetime.now(ZoneInfo("Asia/Hong_Kong")).isoformat(timespec="seconds")
     standardized = _standardized_counts(manifest_path)
     manifest_sources = _manifest_sources(manifest_path)
@@ -210,6 +217,70 @@ def build_inventory(
                     "生成这批 Markdown 的原始 ~/.claude/projects/**/*.jsonl 已不可得；真实 session ID、完整 tool result、system 和 progress 事件无法恢复",
                     *claude_missing,
                 ],
+                "units": unit_records,
+            }
+        )
+
+    web_chat_missing = [
+        "只盘点当前目录中的 Chrome 插件 Markdown 导出，不代表账号全部网页历史",
+        "插件未导出的模型、分支、message ID、assistant 时间和隐藏事件无法恢复",
+    ]
+    if not web_chat_input.is_dir():
+        inputs.append(
+            _missing_input(
+                "web-chat",
+                web_chat_input,
+                "browser-extension-markdown",
+                web_chat_missing,
+            )
+        )
+    else:
+        web_chat_units = list(iter_web_chat_units(web_chat_input))
+        source_id_counts = Counter(unit.source_id for unit in web_chat_units)
+        provider_counts = Counter(unit.provider for unit in web_chat_units)
+        skip_reasons: Counter[str] = Counter()
+        unit_records: list[dict[str, Any]] = []
+        retained = 0
+        for unit in web_chat_units:
+            reason = (
+                "source_id_collision_review"
+                if source_id_counts[unit.source_id] > 1
+                else web_chat_unit_skip_reason(unit)
+            )
+            if reason:
+                skip_reasons[reason] += 1
+            else:
+                retained += 1
+            if reason in WEB_CHAT_REVIEW_SKIP_REASONS:
+                status = "review"
+            elif reason:
+                status = "excluded"
+            elif unit.source_id in manifest_sources:
+                status = "imported"
+            else:
+                status = "ready"
+            record = web_chat_unit_inventory_record(unit, status, reason)
+            if reason == "source_id_collision_review":
+                record["review_reasons"] = [reason, *record.get("review_reasons", [])]
+                record["review_details"] = [
+                    "多个 Markdown 导出解析为同一 provider 会话身份",
+                    *record.get("review_details", []),
+                ]
+            unit_records.append(record)
+        inputs.append(
+            {
+                "provider": "web-chat",
+                "input_path": _display_path(web_chat_input),
+                "format": "browser-extension-markdown",
+                "available": True,
+                "date_range": _date_range(unit.created for unit in web_chat_units),
+                "discovered": len(web_chat_units),
+                "retained": retained,
+                "skipped": len(web_chat_units) - retained,
+                "provider_counts": dict(sorted(provider_counts.items())),
+                "skip_reasons": dict(sorted(skip_reasons.items())),
+                "currently_standardized": standardized["web-chat-export"],
+                "known_missing": web_chat_missing,
                 "units": unit_records,
             }
         )
@@ -335,14 +406,14 @@ def build_inventory(
         if item["discovered"] != item["retained"] + item["skipped"]:
             raise ValueError(f"{item['provider']} inventory 计数不成立")
     return {
-        "version": 2,
+        "version": 3,
         "scanned_at": scanned_at,
         "coverage_boundary": (
-            "只覆盖当前机器上可访问的四类已知输入位置，不代表所有历史会话已提供；"
-            "Claude 事件计数只表示现有有损 Markdown 导出中仍可见的内容。"
+            "只覆盖当前机器上可访问的五类已知输入位置，不代表所有历史会话已提供；"
+            "Claude 和 web-chat 事件计数只表示现有有损 Markdown 导出中仍可见的内容。"
         ),
         "known_missing": [
-            "ChatGPT 历史尚未提供",
+            "未导出到 web-chats/ 的 ChatGPT/DeepSeek 历史尚未提供",
             "Claude Web、其他设备和其他账号的历史尚未提供",
         ],
         "inputs": inputs,
@@ -362,6 +433,7 @@ def main() -> None:
     parser.add_argument("--codex-input", type=Path, default=CODEX_INPUT)
     parser.add_argument("--notes-input", type=Path, default=DEFAULT_NOTES_INPUT)
     parser.add_argument("--articles-input", type=Path, default=DEFAULT_ARTICLES_INPUT)
+    parser.add_argument("--web-chat-input", type=Path, default=WEB_CHAT_INPUT)
     parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
     parser.add_argument(
         "--codex-review-resolutions",
@@ -377,6 +449,7 @@ def main() -> None:
         args.notes_input,
         args.manifest,
         articles_input=args.articles_input,
+        web_chat_input=args.web_chat_input,
         codex_review_resolutions=args.codex_review_resolutions,
     )
     if not args.dry_run:

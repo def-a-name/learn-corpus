@@ -81,6 +81,33 @@ def resolve_locator(input_dir: Path, locator: str) -> dict[str, Any]:
     }
 
 
+def resolve_raw_path(raw_path: Path, locator: str) -> dict[str, Any]:
+    """按 inventory 已冻结的原始路径和行号读取任意 provider 原文。"""
+    if not raw_path.is_file():
+        raise FileNotFoundError(f"原始来源不存在: {raw_path}")
+    semantic_locator, start_line, end_line = parse_line_locator(locator)
+    if start_line is None or end_line is None:
+        raise LocatorNotFoundError(f"locator 缺少行范围: {locator}")
+    raw_lines = raw_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if start_line < 1 or end_line < start_line or end_line > len(raw_lines):
+        raise LocatorNotFoundError(
+            f"locator 行范围超出文件: {locator}，文件共 {len(raw_lines)} 行"
+        )
+    return {
+        "requested_locator": locator,
+        "locator": locator,
+        "semantic_locator": semantic_locator,
+        "kind": "raw_unit",
+        "source_id": None,
+        "title": raw_path.stem,
+        "path": str(raw_path.resolve()),
+        "start_line": start_line,
+        "end_line": end_line,
+        "requested_range_matches": True,
+        "content": "\n".join(raw_lines[start_line - 1 : end_line]),
+    }
+
+
 def render_text(result: dict[str, Any], line_numbers: bool = False) -> str:
     lines = [
         f"Path: {result['path']}",
@@ -107,11 +134,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("locator", help="例如 17-vida.md#Session:12@L19566-L19584")
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
+    parser.add_argument("--raw-path", type=Path, help="直接指定 inventory 中的原始文件，适用于非 Claude provider")
     parser.add_argument("--format", choices=("text", "json"), default="text")
     parser.add_argument("--line-numbers", action="store_true")
     args = parser.parse_args()
     try:
-        result = resolve_locator(args.input, args.locator)
+        result = (
+            resolve_raw_path(args.raw_path, args.locator)
+            if args.raw_path is not None
+            else resolve_locator(args.input, args.locator)
+        )
     except (FileNotFoundError, LocatorNotFoundError) as exc:
         raise SystemExit(str(exc)) from exc
     if args.format == "json":

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 from pathlib import Path
 from typing import Any
 
@@ -36,7 +37,7 @@ def _review_items(manifest_path: Path, inventory_path: Path) -> list[dict[str, A
     if inventory_path.is_file():
         inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
         for source_input in inventory.get("inputs", []):
-            provider = source_input.get("provider", "unknown")
+            input_provider = source_input.get("provider", "unknown")
             for unit in source_input.get("units", []):
                 if unit.get("parse_status") != "review":
                     continue
@@ -46,12 +47,13 @@ def _review_items(manifest_path: Path, inventory_path: Path) -> list[dict[str, A
                 by_id[source_id] = {
                     "source_id": source_id,
                     "title": unit.get("title") or source_id,
-                    "provider": provider,
+                    "provider": unit.get("provider") or input_provider,
                     "created": unit.get("created", "unknown"),
                     "output_path": None,
                     "raw_source_path": unit.get("raw_source_path"),
                     "raw_source_locator": unit.get("raw_source_locator"),
                     "reason": unit.get("skip_reason") or "inventory_parse_review",
+                    "review_details": unit.get("review_details") or [],
                 }
     return sorted(by_id.values(), key=lambda item: (str(item.get("created", "")), item["source_id"]))
 
@@ -65,11 +67,14 @@ def _raw_location_lines(item: dict[str, Any]) -> list[str]:
         f"- **Raw locator**：`{raw_locator}`",
     ]
     if raw_path != "unknown" and start_line is not None and end_line is not None:
+        quoted_path = shlex.quote(raw_path)
+        quoted_locator = shlex.quote(raw_locator)
         lines.extend(
             (
                 f"- **Raw lines**：{start_line}–{end_line}",
                 f"- **打开原文**：[{Path(raw_path).name}:{start_line}](<{raw_path}:{start_line}>)",
-                f"- **CLI**：`python3 -m scripts.ingest.read_raw_locator '{raw_locator}' --line-numbers`",
+                "- **CLI**：`python3 -m scripts.ingest.read_raw_locator "
+                f"{quoted_locator} --raw-path {quoted_path} --line-numbers`",
             )
         )
     return lines
@@ -106,6 +111,10 @@ def build_queue(
                 )
             )
             lines.extend(_raw_location_lines(item))
+            details = item.get("review_details") or []
+            if details:
+                lines.append("- **审核线索**：")
+                lines.extend(f"  - {detail}" for detail in details)
             lines.extend(
                 (
                     f"- **标准化文件**：`{item['output_path']}`" if item.get("output_path") else "- **标准化文件**：未生成",
