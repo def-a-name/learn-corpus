@@ -23,8 +23,10 @@ from scripts.ingest.import_codex import load_review_resolutions as load_codex_re
 from scripts.ingest.import_codex import resolve_session_units as resolve_codex_units
 from scripts.ingest.import_codex import unit_inventory_record as codex_unit_inventory_record
 from scripts.ingest.import_web_chat import DEFAULT_INPUT as WEB_CHAT_INPUT
+from scripts.ingest.import_web_chat import DEFAULT_REVIEW_RESOLUTIONS as WEB_CHAT_REVIEW_RESOLUTIONS
 from scripts.ingest.import_web_chat import REVIEW_SKIP_REASONS as WEB_CHAT_REVIEW_SKIP_REASONS
 from scripts.ingest.import_web_chat import iter_web_chat_units
+from scripts.ingest.import_web_chat import load_review_resolutions as load_web_chat_review_resolutions
 from scripts.ingest.import_web_chat import unit_inventory_record as web_chat_unit_inventory_record
 from scripts.ingest.import_web_chat import unit_skip_reason as web_chat_unit_skip_reason
 
@@ -139,6 +141,7 @@ def build_inventory(
     articles_input: Path | None = None,
     web_chat_input: Path | None = None,
     codex_review_resolutions: Path = CODEX_REVIEW_RESOLUTIONS,
+    web_chat_review_resolutions: Path = WEB_CHAT_REVIEW_RESOLUTIONS,
     scanned_at: str | None = None,
 ) -> dict[str, Any]:
     articles_input = articles_input or notes_input.parent / "articles"
@@ -236,16 +239,18 @@ def build_inventory(
         )
     else:
         web_chat_units = list(iter_web_chat_units(web_chat_input))
+        web_chat_resolutions = load_web_chat_review_resolutions(web_chat_review_resolutions)
         source_id_counts = Counter(unit.source_id for unit in web_chat_units)
         provider_counts = Counter(unit.provider for unit in web_chat_units)
         skip_reasons: Counter[str] = Counter()
         unit_records: list[dict[str, Any]] = []
         retained = 0
         for unit in web_chat_units:
+            review_resolution = web_chat_resolutions.get(unit.source_id)
             reason = (
                 "source_id_collision_review"
                 if source_id_counts[unit.source_id] > 1
-                else web_chat_unit_skip_reason(unit)
+                else web_chat_unit_skip_reason(unit, review_resolution)
             )
             if reason:
                 skip_reasons[reason] += 1
@@ -259,7 +264,9 @@ def build_inventory(
                 status = "imported"
             else:
                 status = "ready"
-            record = web_chat_unit_inventory_record(unit, status, reason)
+            record = web_chat_unit_inventory_record(
+                unit, status, reason, review_resolution
+            )
             if reason == "source_id_collision_review":
                 record["review_reasons"] = [reason, *record.get("review_reasons", [])]
                 record["review_details"] = [
@@ -440,6 +447,11 @@ def main() -> None:
         type=Path,
         default=CODEX_REVIEW_RESOLUTIONS,
     )
+    parser.add_argument(
+        "--web-chat-review-resolutions",
+        type=Path,
+        default=WEB_CHAT_REVIEW_RESOLUTIONS,
+    )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -451,6 +463,7 @@ def main() -> None:
         articles_input=args.articles_input,
         web_chat_input=args.web_chat_input,
         codex_review_resolutions=args.codex_review_resolutions,
+        web_chat_review_resolutions=args.web_chat_review_resolutions,
     )
     if not args.dry_run:
         save_inventory(inventory, args.output)

@@ -145,7 +145,13 @@ def _parse_events(data: bytes, label: str) -> tuple[list[dict[str, Any]], list[s
             datetime.fromisoformat(str(event.get("timestamp")).replace("Z", "+00:00"))
         except ValueError:
             errors.append(f"{label}:{line_number}: timestamp 无效")
-        if event.get("importer") not in {"claude", "codex", "notes", "articles"}:
+        if event.get("importer") not in {
+            "claude",
+            "codex",
+            "web-chat",
+            "notes",
+            "articles",
+        }:
             errors.append(f"{label}:{line_number}: importer 未知")
         changes = event.get("changes")
         if not isinstance(changes, list) or not changes:

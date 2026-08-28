@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import re
 from collections import Counter
 from dataclasses import dataclass
@@ -37,8 +38,10 @@ from scripts.ingest.markdown_sources import MarkdownImportError, scan_markdown
 DEFAULT_INPUT = REPO_ROOT.parent / "web-chats"
 DEFAULT_OUTPUT = REPO_ROOT / "sources" / "conversations"
 DEFAULT_ASSETS = REPO_ROOT / "sources" / "assets"
+DEFAULT_REVIEW_RESOLUTIONS = REPO_ROOT / "meta" / "source-review-resolutions.json"
 ORIGIN = "web-chat-export"
 SOURCE_FORMAT = "browser-extension-markdown"
+REVIEW_DECISION_OMIT_UNRESOLVED_CITATIONS = "omit_unresolved_citation_markers"
 REVIEW_SKIP_REASONS = frozenset(
     {
         "web_chat_parse_review",
@@ -52,6 +55,7 @@ REVIEW_SKIP_REASONS = frozenset(
         "asset_type_unsupported_review",
         "sandbox_asset_missing_review",
         "citation_targets_missing_review",
+        "review_resolution_mismatch_review",
         "source_id_collision_review",
     }
 )
@@ -147,6 +151,35 @@ class WebChatUnit:
 
 
 @dataclass(frozen=True)
+class WebChatReviewResolution:
+    source_id: str
+    decision: str
+    reviewed_at: str
+    reviewed_by: str
+    source_hash: str
+    source_locator: str
+    citation_marker_count: int
+    citation_label_count: int
+
+    @property
+    def content_hash(self) -> str:
+        payload = {
+            "source_id": self.source_id,
+            "decision": self.decision,
+            "reviewed_at": self.reviewed_at,
+            "reviewed_by": self.reviewed_by,
+            "source_hash": self.source_hash,
+            "source_locator": self.source_locator,
+            "citation_marker_count": self.citation_marker_count,
+            "citation_label_count": self.citation_label_count,
+        }
+        encoded = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+
+@dataclass(frozen=True)
 class _RoleMarker:
     role: str
     provider: str
@@ -195,6 +228,62 @@ def _source_identity(
         "\0".join((provider, source_url, relative_path)).encode("utf-8")
     ).hexdigest()[:20]
     return f"web-chat-{provider}-{digest}", digest
+
+
+def load_review_resolutions(
+    path: Path = DEFAULT_REVIEW_RESOLUTIONS,
+) -> dict[str, WebChatReviewResolution]:
+    if not path.is_file():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    raw_resolutions = payload.get("web_chat_sessions", {})
+    if payload.get("version") != 1 or not isinstance(raw_resolutions, dict):
+        raise ValueError(f"Web chat review resolution 格式无效: {path}")
+    resolutions: dict[str, WebChatReviewResolution] = {}
+    for source_id, raw_resolution in raw_resolutions.items():
+        if not isinstance(raw_resolution, dict):
+            raise ValueError(f"Web chat review resolution 条目无效: {source_id}")
+        try:
+            resolution = WebChatReviewResolution(
+                source_id=str(source_id),
+                decision=str(raw_resolution["decision"]),
+                reviewed_at=str(raw_resolution["reviewed_at"]),
+                reviewed_by=str(raw_resolution["reviewed_by"]),
+                source_hash=str(raw_resolution["source_hash"]).removeprefix("sha256:"),
+                source_locator=str(raw_resolution["source_locator"]),
+                citation_marker_count=int(raw_resolution["citation_marker_count"]),
+                citation_label_count=int(raw_resolution["citation_label_count"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Web chat review resolution 字段无效: {source_id}"
+            ) from exc
+        if (
+            resolution.decision != REVIEW_DECISION_OMIT_UNRESOLVED_CITATIONS
+            or not resolution.reviewed_at
+            or not resolution.reviewed_by
+            or not re.fullmatch(r"[0-9a-f]{64}", resolution.source_hash)
+            or not resolution.source_locator
+            or resolution.citation_marker_count < 1
+            or resolution.citation_label_count < 1
+        ):
+            raise ValueError(f"Web chat review resolution 定位值无效: {source_id}")
+        resolutions[resolution.source_id] = resolution
+    return resolutions
+
+
+def review_resolution_matches(
+    unit: WebChatUnit,
+    resolution: WebChatReviewResolution,
+) -> bool:
+    return (
+        resolution.source_id == unit.source_id
+        and resolution.decision == REVIEW_DECISION_OMIT_UNRESOLVED_CITATIONS
+        and resolution.source_hash == unit.content_hash
+        and resolution.source_locator == unit.locator
+        and resolution.citation_marker_count == unit.citation_marker_count
+        and resolution.citation_label_count == unit.citation_label_count
+    )
 
 
 def _role_markers(text: str) -> tuple[_RoleMarker, ...]:
@@ -506,9 +595,17 @@ def iter_web_chat_units(input_dir: Path) -> Iterable[WebChatUnit]:
         yield _build_unit(path, input_dir)
 
 
-def unit_review_reasons(unit: WebChatUnit) -> tuple[str, ...]:
+def unit_review_reasons(
+    unit: WebChatUnit,
+    review_resolution: WebChatReviewResolution | None = None,
+) -> tuple[str, ...]:
     reasons: list[str] = []
     parsed = unit.parse
+    resolution_matches = bool(
+        review_resolution and review_resolution_matches(unit, review_resolution)
+    )
+    if review_resolution and not resolution_matches:
+        reasons.append("review_resolution_mismatch_review")
     if unit.parse_error:
         reasons.append("web_chat_parse_review")
     if unit.provider == "unknown":
@@ -529,13 +626,16 @@ def unit_review_reasons(unit: WebChatUnit) -> tuple[str, ...]:
         reasons.append("asset_type_unsupported_review")
     if unit.missing_sandbox_asset_count:
         reasons.append("sandbox_asset_missing_review")
-    if unit.citation_marker_count:
+    if unit.citation_marker_count and not resolution_matches:
         reasons.append("citation_targets_missing_review")
     return tuple(reasons)
 
 
-def unit_skip_reason(unit: WebChatUnit) -> str:
-    review_reasons = unit_review_reasons(unit)
+def unit_skip_reason(
+    unit: WebChatUnit,
+    review_resolution: WebChatReviewResolution | None = None,
+) -> str:
+    review_reasons = unit_review_reasons(unit, review_resolution)
     if review_reasons:
         return review_reasons[0]
     parsed = unit.parse
@@ -548,9 +648,17 @@ def unit_skip_reason(unit: WebChatUnit) -> str:
     return ""
 
 
-def _review_details(unit: WebChatUnit) -> list[str]:
+def _review_details(
+    unit: WebChatUnit,
+    review_resolution: WebChatReviewResolution | None = None,
+) -> list[str]:
     details: list[str] = []
-    if unit.citation_marker_count:
+    resolution_matches = bool(
+        review_resolution and review_resolution_matches(unit, review_resolution)
+    )
+    if review_resolution and not resolution_matches:
+        details.append("已记录的人工处置与当前原文 hash、locator 或 citation 计数不再匹配")
+    if unit.citation_marker_count and not resolution_matches:
         details.append(
             f"引用占位符 {unit.citation_marker_count} 个（{unit.citation_label_count} 个编号），无目标 URL 映射"
         )
@@ -571,11 +679,14 @@ def unit_inventory_record(
     unit: WebChatUnit,
     parse_status: str | None = None,
     skip_reason: str | None = None,
+    review_resolution: WebChatReviewResolution | None = None,
 ) -> dict[str, Any]:
-    reason = unit_skip_reason(unit) if skip_reason is None else skip_reason
+    reason = (
+        unit_skip_reason(unit, review_resolution) if skip_reason is None else skip_reason
+    )
     status = parse_status or ("review" if reason in REVIEW_SKIP_REASONS else "excluded" if reason else "ready")
     parsed = unit.parse
-    return {
+    record = {
         "source_id": unit.source_id,
         "unit_kind": "session",
         "thread_kind": "main",
@@ -599,8 +710,8 @@ def unit_inventory_record(
         "assistant_final_detection": WEB_CHAT_ASSISTANT_FINAL_DETECTION,
         "parse_status": status,
         "skip_reason": reason or None,
-        "review_reasons": list(unit_review_reasons(unit)),
-        "review_details": _review_details(unit),
+        "review_reasons": list(unit_review_reasons(unit, review_resolution)),
+        "review_details": _review_details(unit, review_resolution),
         "visible_user_block_count": parsed.visible_user_block_count if parsed else 0,
         "human_user_count": parsed.visible_user_block_count if parsed else 0,
         "assistant_block_count": parsed.assistant_block_count if parsed else 0,
@@ -614,6 +725,17 @@ def unit_inventory_record(
         "citation_marker_count": unit.citation_marker_count,
         "citation_label_count": unit.citation_label_count,
     }
+    if review_resolution and review_resolution_matches(unit, review_resolution):
+        record.update(
+            {
+                "review_resolution": review_resolution.decision,
+                "reviewed_at": review_resolution.reviewed_at,
+                "reviewed_by": review_resolution.reviewed_by,
+                "review_resolution_hash": review_resolution.content_hash,
+                "omitted_unresolved_citation_marker_count": unit.citation_marker_count,
+            }
+        )
+    return record
 
 
 def _stored_assets(unit: WebChatUnit, asset_root: Path) -> tuple[StoredAsset, ...]:
@@ -651,6 +773,18 @@ def _rewrite_targets(text: str, assets: tuple[StoredAsset, ...]) -> str:
     return rendered
 
 
+def _apply_review_resolution(
+    text: str,
+    review_resolution: WebChatReviewResolution | None,
+) -> str:
+    if (
+        review_resolution
+        and review_resolution.decision == REVIEW_DECISION_OMIT_UNRESOLVED_CITATIONS
+    ):
+        return _CITATION.sub("", text)
+    return text
+
+
 def _asset_records(assets: tuple[StoredAsset, ...]) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for asset in assets:
@@ -671,15 +805,24 @@ def _render_session(
     unit: WebChatUnit,
     assets: tuple[StoredAsset, ...],
     imported: str,
+    review_resolution: WebChatReviewResolution | None = None,
 ) -> tuple[str, int, str]:
     if unit.parse is None:
         raise ValueError(f"Web chat 会话缺少解析结果: {unit.locator}")
     title, redactions = redact_secrets(unit.title)
     rendered: list[str] = []
     for ordinal, exchange in enumerate(unit.parse.exchanges, start=1):
-        user_text, count = redact_secrets(_rewrite_targets(exchange.user_text, assets))
+        user_text, count = redact_secrets(
+            _apply_review_resolution(
+                _rewrite_targets(exchange.user_text, assets), review_resolution
+            )
+        )
         redactions += count
-        assistant_text, count = redact_secrets(_rewrite_targets(exchange.assistant_text, assets))
+        assistant_text, count = redact_secrets(
+            _apply_review_resolution(
+                _rewrite_targets(exchange.assistant_text, assets), review_resolution
+            )
+        )
         redactions += count
         if not user_text or not assistant_text:
             continue
@@ -728,6 +871,16 @@ def _render_session(
         "redaction_count": redactions,
         "importer_version": WEB_CHAT_IMPORTER_VERSION,
     }
+    if review_resolution:
+        metadata.update(
+            {
+                "review_resolution": review_resolution.decision,
+                "reviewed_at": review_resolution.reviewed_at,
+                "reviewed_by": review_resolution.reviewed_by,
+                "review_resolution_hash": f"sha256:{review_resolution.content_hash}",
+                "omitted_unresolved_citation_marker_count": unit.citation_marker_count,
+            }
+        )
     if asset_records:
         metadata["assets"] = asset_records
     body = (
@@ -771,9 +924,11 @@ def import_web_chats(
     manifest_path: Path,
     *,
     asset_root: Path = DEFAULT_ASSETS,
+    review_resolutions_path: Path = DEFAULT_REVIEW_RESOLUTIONS,
     dry_run: bool = False,
 ) -> dict[str, Any]:
     units = list(iter_web_chat_units(input_dir))
+    review_resolutions = load_review_resolutions(review_resolutions_path)
     source_id_counts = Counter(unit.source_id for unit in units)
     manifest = load_manifest(manifest_path)
     change_tracker = SourceChangeTracker.for_output(output_root)
@@ -805,10 +960,17 @@ def import_web_chats(
         stats["citations_missing"] += unit.citation_marker_count
         stats["assets"] += len(unit.raw_assets)
 
+        configured_resolution = review_resolutions.get(unit.source_id)
+        applied_resolution = (
+            configured_resolution
+            if configured_resolution
+            and review_resolution_matches(unit, configured_resolution)
+            else None
+        )
         skip_reason = (
             "source_id_collision_review"
             if source_id_counts[unit.source_id] > 1
-            else unit_skip_reason(unit)
+            else unit_skip_reason(unit, configured_resolution)
         )
         current = manifest["sources"].get(unit.source_id, {})
         assets = _stored_assets(unit, asset_root)
@@ -816,6 +978,8 @@ def import_web_chats(
         is_unchanged = bool(
             not skip_reason
             and current.get("source_hash") == unit.content_hash
+            and current.get("review_resolution_hash")
+            == (applied_resolution.content_hash if applied_resolution else None)
             and current.get("importer_version") == WEB_CHAT_IMPORTER_VERSION
             and Path(REPO_ROOT / str(current.get("output_path") or "")).is_file()
             and _assets_are_current(current.get("assets", []))
@@ -830,7 +994,9 @@ def import_web_chats(
             stats["unchanged"] += 1
             continue
 
-        document, redactions, title = _render_session(unit, assets, utc_now()[:10])
+        document, redactions, title = _render_session(
+            unit, assets, utc_now()[:10], applied_resolution
+        )
         stats["imported"] += 1
         stats["redactions"] += redactions
         if dry_run:
@@ -841,7 +1007,7 @@ def import_web_chats(
             _atomic_copy(asset.raw.source_path, asset.stored_path)
         _atomic_write(output_path, document)
         manifest["version"] = max(int(manifest.get("version", 1)), 2)
-        manifest["sources"][unit.source_id] = {
+        record = {
             "origin": ORIGIN,
             "source_kind": "session",
             "provider": unit.provider,
@@ -867,6 +1033,17 @@ def import_web_chats(
             "imported_at": utc_now(),
             "importer_version": WEB_CHAT_IMPORTER_VERSION,
         }
+        if applied_resolution:
+            record.update(
+                {
+                    "review_resolution": applied_resolution.decision,
+                    "reviewed_at": applied_resolution.reviewed_at,
+                    "reviewed_by": applied_resolution.reviewed_by,
+                    "review_resolution_hash": applied_resolution.content_hash,
+                    "omitted_unresolved_citation_marker_count": unit.citation_marker_count,
+                }
+            )
+        manifest["sources"][unit.source_id] = record
         changed = True
 
     if not dry_run and changed:
@@ -881,6 +1058,9 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--assets", type=Path, default=DEFAULT_ASSETS)
     parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
+    parser.add_argument(
+        "--review-resolutions", type=Path, default=DEFAULT_REVIEW_RESOLUTIONS
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     stats = import_web_chats(
@@ -888,6 +1068,7 @@ def main() -> None:
         args.output,
         args.manifest,
         asset_root=args.assets,
+        review_resolutions_path=args.review_resolutions,
         dry_run=args.dry_run,
     )
     print("Web chat 导入结果:", ", ".join(f"{key}={value}" for key, value in stats.items()))
