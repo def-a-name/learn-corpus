@@ -38,6 +38,12 @@ DEFAULT_INPUT = Path.home() / ".codex" / "sessions"
 DEFAULT_OUTPUT = REPO_ROOT / "sources" / "conversations" / "codex"
 DEFAULT_REVIEW_RESOLUTIONS = REPO_ROOT / "meta" / "source-review-resolutions.json"
 RUNTIME_USER_TAG = re.compile(r"<(?:model_instruction|user_action)(?:>|\s)", re.IGNORECASE)
+AGENTS_RUNTIME_USER_ENVELOPE = re.compile(
+    r"\A# AGENTS\.md instructions for [^\r\n]+\r?\n\r?\n"
+    r"<INSTRUCTIONS>.*?</INSTRUCTIONS>"
+    r"(?:\s*<environment_context>.*?</environment_context>)?\s*\Z",
+    re.DOTALL,
+)
 REVIEW_SKIP_REASONS = {
     "fork_cycle_review",
     "fork_parent_missing_review",
@@ -188,9 +194,16 @@ class _Turn:
     start_line: int
     human_users: list[tuple[int, str]] = field(default_factory=list)
     assistant_finals: list[tuple[int, str]] = field(default_factory=list)
+    turn_context_seen: bool = False
 
 
-def _classify_user_text(raw: str) -> tuple[str, str]:
+def _classify_user_text(
+    raw: str,
+    *,
+    before_turn_context: bool = False,
+) -> tuple[str, str]:
+    if before_turn_context and AGENTS_RUNTIME_USER_ENVELOPE.fullmatch(raw):
+        return "runtime", ""
     if is_noise_message(raw) or RUNTIME_USER_TAG.search(raw):
         return "runtime", ""
     cleaned = clean_message(raw)
@@ -422,6 +435,11 @@ def parse_session(path: Path, input_root: Path | None = None) -> CodexSession:
             current = _Turn(turn_ordinal, line_number)
             continue
 
+        if record_type == "turn_context":
+            if current is not None:
+                current.turn_context_seen = True
+            continue
+
         if record_type == "event_msg" and payload_type == "user_message":
             event_users += 1
         elif record_type == "response_item" and payload_type == "message":
@@ -432,7 +450,10 @@ def parse_session(path: Path, input_root: Path | None = None) -> CodexSession:
             if role == "user":
                 visible_users += 1
                 raw_text = extract_text(payload.get("content"), {"input_text"})
-                classification, cleaned = _classify_user_text(raw_text)
+                classification, cleaned = _classify_user_text(
+                    raw_text,
+                    before_turn_context=bool(current and not current.turn_context_seen),
+                )
                 if classification == "runtime":
                     runtime_users += 1
                 elif current is None:
