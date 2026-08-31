@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from scripts.common.ingest_log import SourceChangeTracker
-from scripts.common.wiki_core import (
+from scripts.common.corpus_core import (
     CLAUDE_ASSISTANT_FINAL_DETECTION,
     CLAUDE_IMPORTER_VERSION,
     MANIFEST_PATH,

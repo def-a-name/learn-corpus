@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from scripts.common.wiki_core import parse_line_locator
+from scripts.common.corpus_core import parse_line_locator
 from scripts.ingest.import_claude import DEFAULT_INPUT, iter_export_units
 
 

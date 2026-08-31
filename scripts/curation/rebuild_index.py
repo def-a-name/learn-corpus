@@ -8,7 +8,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from scripts.common.wiki_core import REPO_ROOT, parse_frontmatter
+from scripts.common.corpus_core import REPO_ROOT, parse_frontmatter
 
 
 WIKI_ROOT = REPO_ROOT / "wiki"

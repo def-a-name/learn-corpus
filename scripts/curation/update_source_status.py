@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from scripts.common.wiki_core import (
+from scripts.common.corpus_core import (
     ALLOWED_CURATION_STATUSES,
     ALLOWED_INGEST_STATUSES,
     MANIFEST_PATH,

@@ -15,7 +15,7 @@ from typing import Any, Iterable
 from urllib.parse import unquote, urlsplit
 
 from scripts.common.ingest_log import SourceChangeTracker
-from scripts.common.wiki_core import (
+from scripts.common.corpus_core import (
     MANIFEST_PATH,
     REPO_ROOT,
     WEB_CHAT_ASSISTANT_FINAL_DETECTION,

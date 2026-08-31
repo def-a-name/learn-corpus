@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from scripts.common.wiki_core import MANIFEST_PATH, REPO_ROOT
+from scripts.common.corpus_core import MANIFEST_PATH, REPO_ROOT
 from scripts.ingest.markdown_sources import MarkdownPolicy, import_markdown_sources, print_stats
 
 

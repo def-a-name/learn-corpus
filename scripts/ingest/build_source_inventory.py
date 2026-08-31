@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
-from scripts.common.wiki_core import MANIFEST_PATH, REPO_ROOT, load_manifest, sha256_file
+from scripts.common.corpus_core import MANIFEST_PATH, REPO_ROOT, load_manifest, sha256_file
 from scripts.ingest.import_claude import DEFAULT_INPUT as CLAUDE_INPUT
 from scripts.ingest.import_claude import iter_export_units, unit_inventory_record, unit_skip_reason
 from scripts.ingest.import_codex import DEFAULT_INPUT as CODEX_INPUT

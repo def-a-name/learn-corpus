@@ -14,7 +14,7 @@ from urllib.parse import unquote, urlsplit
 import yaml
 
 from scripts.common.ingest_log import SourceChangeTracker
-from scripts.common.wiki_core import (
+from scripts.common.corpus_core import (
     MANIFEST_PATH,
     MARKDOWN_SOURCE_IMPORTER_VERSION,
     REPO_ROOT,

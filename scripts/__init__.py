@@ -1,1 +1,1 @@
-"""Personal Wiki 命令与共享模块。"""
+"""Learn Corpus 命令与共享模块。"""
