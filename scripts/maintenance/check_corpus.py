@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""检查来源、派生状态与 Wiki 结构完整性。"""
+"""检查来源与派生状态完整性。"""
 
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ from scripts.common.ingest_log import check_ingest_log
 from scripts.common.corpus_core import (
     ALLOWED_CURATION_STATUSES,
     ALLOWED_INGEST_STATUSES,
-    ALLOWED_KNOWLEDGE_STATUSES,
     CLAUDE_ASSISTANT_FINAL_DETECTION,
     CODEX_ASSISTANT_FINAL_DETECTION,
     MANIFEST_PATH,
@@ -26,26 +25,12 @@ from scripts.common.corpus_core import (
 )
 
 
-WIKI_ROOT = REPO_ROOT / "wiki"
-SPECIAL_TYPES = {"overview", "index", "questions"}
-REQUIRED_FIELDS = {"id", "title", "description", "type", "status", "sources"}
-
-
 def markdown_files(root: Path) -> list[Path]:
     return [
         path
         for path in sorted(root.rglob("*.md"))
         if not any(part.startswith(".") for part in path.relative_to(root).parts)
     ]
-
-
-def collect_source_ids() -> set[str]:
-    ids: set[str] = set()
-    for path in markdown_files(REPO_ROOT / "sources"):
-        metadata, _ = parse_frontmatter(path)
-        if metadata.get("id"):
-            ids.add(str(metadata["id"]))
-    return ids
 
 
 def _normalized_hash(value: Any) -> str:
@@ -412,7 +397,6 @@ def check_source_consistency(
 
 
 def check(
-    wiki_root: Path = WIKI_ROOT,
     manifest_path: Path = MANIFEST_PATH,
     sources_root: Path = REPO_ROOT / "sources",
 ) -> tuple[list[str], list[str]]:
@@ -420,55 +404,6 @@ def check(
     ingest_errors, ingest_warnings = check_ingest_log(REPO_ROOT)
     errors.extend(ingest_errors)
     warnings.extend(ingest_warnings)
-    pages: list[tuple[Path, dict[str, Any], str]] = []
-    source_ids = collect_source_ids()
-
-    for path in markdown_files(wiki_root):
-        try:
-            metadata, body = parse_frontmatter(path)
-        except (ValueError, OSError) as exc:
-            errors.append(str(exc))
-            continue
-        pages.append((path, metadata, body))
-        page_type = str(metadata.get("type", ""))
-        if page_type in SPECIAL_TYPES:
-            for field in ("title", "type", "status"):
-                if not metadata.get(field):
-                    errors.append(f"{path}: 缺少 {field}")
-            continue
-        missing = sorted(field for field in REQUIRED_FIELDS if not metadata.get(field))
-        if missing:
-            errors.append(f"{path}: 缺少字段 {', '.join(missing)}")
-        status = str(metadata.get("status", ""))
-        if status and status not in ALLOWED_KNOWLEDGE_STATUSES:
-            errors.append(f"{path}: 未知 status={status}")
-        sources = metadata.get("sources") or []
-        if isinstance(sources, list):
-            for source_id in sources:
-                if str(source_id) not in source_ids:
-                    errors.append(f"{path}: 来源不存在 {source_id}")
-        elif sources:
-            errors.append(f"{path}: sources 必须是列表")
-
-    ids = [str(metadata.get("id")) for _, metadata, _ in pages if metadata.get("id")]
-    for page_id, count in Counter(ids).items():
-        if count > 1:
-            errors.append(f"重复 Wiki ID: {page_id}")
-
-    all_markdown = [
-        path
-        for path in REPO_ROOT.rglob("*.md")
-        if not any(part.startswith(".") for part in path.relative_to(REPO_ROOT).parts)
-    ]
-    known_paths = {path.relative_to(REPO_ROOT).with_suffix("").as_posix() for path in all_markdown}
-    known_names = {path.stem for path in all_markdown}
-    known_titles = {str(metadata.get("title")) for _, metadata, _ in pages if metadata.get("title")}
-    for path, _, body in pages:
-        for target in re.findall(r"\[\[([^\]|#]+)", body):
-            target = target.strip().removesuffix(".md")
-            if target not in known_paths and Path(target).name not in known_names and target not in known_titles:
-                errors.append(f"{path}: 断开的 Wiki 链接 [[{target}]]")
-
     for vault_config in REPO_ROOT.rglob(".obsidian"):
         if vault_config != REPO_ROOT / ".obsidian":
             warnings.append(f"发现嵌套 Obsidian Vault 配置: {vault_config.relative_to(REPO_ROOT)}")
@@ -477,11 +412,10 @@ def check(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--wiki", type=Path, default=WIKI_ROOT)
     parser.add_argument("--sources", type=Path, default=REPO_ROOT / "sources")
     parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
     args = parser.parse_args()
-    errors, warnings = check(args.wiki, args.manifest, args.sources)
+    errors, warnings = check(args.manifest, args.sources)
     for warning in warnings:
         print(f"WARNING: {warning}")
     for error in errors:

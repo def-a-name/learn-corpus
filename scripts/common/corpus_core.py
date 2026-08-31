@@ -27,7 +27,6 @@ ALLOWED_CURATION_STATUSES = {
 }
 # 兼容首次基线中的旧 CLI 名称；新代码应使用上面两个独立状态集合。
 ALLOWED_SOURCE_STATUSES = ALLOWED_CURATION_STATUSES
-ALLOWED_KNOWLEDGE_STATUSES = {"draft", "experienced", "verified", "superseded"}
 CLAUDE_IMPORTER_VERSION = 9
 CLAUDE_ASSISTANT_FINAL_DETECTION = "heuristic"
 # 兼容尚未迁移的外部调用；Claude importer 使用专用版本常量。
@@ -384,7 +383,7 @@ def build_conversation_document(
 
     body = (
         f"# {title}\n\n"
-        "> 本页由导入器生成，是原始会话的标准化副本。知识结论应整合到 `wiki/`。\n\n"
+        "> 本页由导入器生成，是原始会话的标准化副本；形成事实主张时应核对对应 locator 的原始证据。\n\n"
         + "\n\n".join(rendered_messages)
     )
     return yaml_document(metadata, body), redactions
