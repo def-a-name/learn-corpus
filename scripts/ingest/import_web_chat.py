@@ -201,8 +201,11 @@ def _provider_identity(source_url: str) -> tuple[str, str, str, str]:
     parsed = urlsplit(source_url)
     host = parsed.netloc.lower().split(":", 1)[0]
     parts = [part for part in parsed.path.split("/") if part]
-    if host == "chatgpt.com" and len(parts) >= 2 and parts[0] == "c":
-        return "chatgpt", parts[1], "", "provider"
+    if host == "chatgpt.com":
+        if len(parts) >= 2 and parts[0] == "c":
+            return "chatgpt", parts[1], "", "provider"
+        if len(parts) >= 4 and parts[0] == "g" and parts[2] == "c":
+            return "chatgpt", parts[3], "", "provider"
     if host == "chat.deepseek.com" and len(parts) >= 4 and parts[:3] == ["a", "chat", "s"]:
         return "deepseek", "", parts[3], "provider-link"
     return "unknown", "", "", "path-derived"
