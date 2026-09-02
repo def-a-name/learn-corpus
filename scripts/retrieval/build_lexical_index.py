@@ -294,10 +294,12 @@ def _write_database(path: Path, items: Sequence[Item]) -> None:
         connection.close()
 
 
-def open_immutable_database(path: Path) -> sqlite3.Connection:
+def open_immutable_database(
+    path: Path, *, check_same_thread: bool = True
+) -> sqlite3.Connection:
     resolved = path.resolve(strict=True)
     uri = f"{resolved.as_uri()}?mode=ro&immutable=1"
-    connection = sqlite3.connect(uri, uri=True)
+    connection = sqlite3.connect(uri, uri=True, check_same_thread=check_same_thread)
     connection.execute("PRAGMA query_only=ON")
     return connection
 
@@ -458,6 +460,16 @@ def _validate_generation_artifact(
     if _database_scope_counts(database_path) != item_counts:
         raise LexicalBuildError("generation database scope counts mismatch")
     return manifest
+
+
+def validate_generation_artifact(
+    generation_path: Path, *, expected_generation: str | None = None
+) -> dict[str, Any]:
+    """Validate one closed generation before an immutable runtime opens it."""
+
+    return _validate_generation_artifact(
+        generation_path, expected_generation=expected_generation
+    )
 
 
 def _result_from_existing(
