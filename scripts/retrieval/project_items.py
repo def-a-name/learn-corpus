@@ -20,7 +20,7 @@ from scripts.common.corpus_core import MANIFEST_PATH, REPO_ROOT, parse_frontmatt
 
 
 PROJECTION_SCHEMA_VERSION = "item-projection-v1"
-CHUNK_POLICY_VERSION = "evidence-chunk-v1"
+CHUNK_POLICY_VERSION = "evidence-chunk-v2"
 LEXICAL_SCHEMA_VERSION = "lexical-schema-v1"
 QUERY_POLICY_VERSION = "qmd-style-v1"
 RANKING_POLICY_VERSION = "bm25-rrf-v1"
@@ -38,6 +38,8 @@ _ALLOWED_ROOTS = {
 _ATX_HEADING = re.compile(r"^ {0,3}(?P<level>#{1,6})[ \t]+(?P<title>.*?)[ \t]*#*[ \t]*$")
 _FENCE_START = re.compile(r"^ {0,3}(?P<marker>`{3,}|~{3,})")
 _LIST_START = re.compile(r"^\s*(?:[-+*]|\d+[.)])[ \t]+")
+_LIST_ITEM_START = re.compile(r"^(?P<indent>[ \t]*)(?:[-+*]|\d+[.)])[ \t]+")
+_BLANK_BLOCKQUOTE_LINE = re.compile(r"^[ \t]*(?:>[ \t]*)+$")
 _TABLE_DELIMITER = re.compile(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$")
 _EXCHANGE = re.compile(r"^## Exchange (?P<number>[1-9]\d*)$")
 _TURN = re.compile(r"^- \*\*Turn\*\*: (?P<number>[1-9]\d*)$")
@@ -219,6 +221,34 @@ def _split_lines(text: str) -> list[str]:
     return [piece for piece in pieces if piece]
 
 
+def _split_protected_lines(text: str) -> list[str]:
+    """Pack at the target while preserving every complete line up to hard_max."""
+
+    pieces: list[str] = []
+    current: list[str] = []
+    for line in text.splitlines(keepends=True):
+        candidate = "".join((*current, line))
+        if current and estimate_evidence_tokens(candidate) > TARGET_MAX_TOKENS:
+            pieces.append("".join(current).rstrip("\r\n"))
+            current = []
+        line_tokens = estimate_evidence_tokens(line)
+        if line_tokens > HARD_MAX_TOKENS:
+            if current:
+                pieces.append("".join(current).rstrip("\r\n"))
+                current = []
+            pieces.extend(_split_scalar(line.rstrip("\r\n")))
+        elif line_tokens > TARGET_MAX_TOKENS:
+            if current:
+                pieces.append("".join(current).rstrip("\r\n"))
+                current = []
+            pieces.append(line.rstrip("\r\n"))
+        else:
+            current.append(line)
+    if current:
+        pieces.append("".join(current).rstrip("\r\n"))
+    return [piece for piece in pieces if piece]
+
+
 def _split_sentences(text: str) -> list[str]:
     sentences = [value for value in re.findall(r".*?(?:[。！？.!?]+(?:\s+|$)|$)", text, re.DOTALL) if value]
     pieces: list[str] = []
@@ -234,6 +264,151 @@ def _split_sentences(text: str) -> list[str]:
             current += sentence
     if current.strip():
         pieces.append(current.rstrip())
+    return pieces
+
+
+_PROTECTED_MARKDOWN_KINDS = frozenset({"code", "table", "blockquote", "list"})
+
+
+def _pack_markdown_units(units: Sequence[str], separator: str = "\n") -> list[str]:
+    """Pack already-safe syntax units without forcing 600-token units apart."""
+
+    chunks: list[str] = []
+    current: list[str] = []
+    for unit in (value for value in units if value):
+        unit_tokens = estimate_evidence_tokens(unit)
+        if unit_tokens > HARD_MAX_TOKENS:
+            raise ProjectionError("markdown syntax unit exceeds hard_max")
+        if unit_tokens > TARGET_MAX_TOKENS:
+            if current:
+                chunks.append(separator.join(current))
+                current = []
+            chunks.append(unit)
+            continue
+        candidate = separator.join((*current, unit))
+        if current and estimate_evidence_tokens(candidate) > TARGET_MAX_TOKENS:
+            chunks.append(separator.join(current))
+            current = []
+        current.append(unit)
+    if current:
+        chunks.append(separator.join(current))
+    return chunks
+
+
+def _split_structural_units(units: Sequence[str], separator: str = "\n") -> list[str]:
+    expanded: list[str] = []
+    for unit in units:
+        if estimate_evidence_tokens(unit) <= HARD_MAX_TOKENS:
+            expanded.append(unit)
+        else:
+            expanded.extend(_split_lines(unit))
+    return _pack_markdown_units(expanded, separator)
+
+
+def _matching_fence_close(line: str, marker: str) -> bool:
+    closing = _FENCE_START.match(line)
+    return bool(
+        closing
+        and closing.group("marker")[0] == marker[0]
+        and len(closing.group("marker")) >= len(marker)
+        and not line[closing.end() :].strip()
+    )
+
+
+def _split_fenced_code(block: str) -> list[str]:
+    lines = block.splitlines()
+    opening = _FENCE_START.match(lines[0]) if lines else None
+    if opening is None or len(lines) < 2:
+        return _split_lines(block)
+    marker = opening.group("marker")
+    closed = _matching_fence_close(lines[-1], marker)
+    content_lines = lines[1:-1] if closed else lines[1:]
+    if not content_lines:
+        return _split_lines(block)
+    pieces = _split_protected_lines("\n".join(content_lines))
+    if not pieces:
+        return _split_lines(block)
+    pieces[0] = f"{lines[0]}\n{pieces[0]}"
+    if closed:
+        pieces[-1] = f"{pieces[-1]}\n{lines[-1]}"
+    if any(estimate_evidence_tokens(piece) > HARD_MAX_TOKENS for piece in pieces):
+        return _split_lines(block)
+    return pieces
+
+
+def _split_table(block: str) -> list[str]:
+    lines = block.splitlines()
+    if len(lines) < 3 or not _TABLE_DELIMITER.match(lines[1]):
+        return _split_lines(block)
+    header = "\n".join(lines[:2])
+    rows = lines[2:]
+    units: list[str]
+    first = f"{header}\n{rows[0]}"
+    if estimate_evidence_tokens(first) <= HARD_MAX_TOKENS:
+        units = [first, *rows[1:]]
+    else:
+        units = [header, *rows]
+    return _split_structural_units(units)
+
+
+def _indent_width(value: str) -> int:
+    return len(value.expandtabs(4))
+
+
+def _split_list(block: str) -> list[str]:
+    lines = block.splitlines()
+    first = _LIST_ITEM_START.match(lines[0]) if lines else None
+    if first is None:
+        return _split_lines(block)
+    base_indent = _indent_width(first.group("indent"))
+    items: list[str] = []
+    current: list[str] = []
+    for line in lines:
+        marker = _LIST_ITEM_START.match(line)
+        if (
+            current
+            and marker is not None
+            and _indent_width(marker.group("indent")) == base_indent
+        ):
+            items.append("\n".join(current))
+            current = []
+        current.append(line)
+    if current:
+        items.append("\n".join(current))
+    return _split_structural_units(items)
+
+
+def _split_blockquote(block: str) -> list[str]:
+    paragraphs: list[str] = []
+    current: list[str] = []
+    for line in block.splitlines():
+        current.append(line)
+        if _BLANK_BLOCKQUOTE_LINE.match(line):
+            paragraphs.append("\n".join(current))
+            current = []
+    if current:
+        paragraphs.append("\n".join(current))
+    return _split_structural_units(paragraphs)
+
+
+def _split_markdown_block(kind: str, block: str) -> list[str]:
+    tokens = estimate_evidence_tokens(block)
+    if tokens <= TARGET_MAX_TOKENS:
+        return [block]
+    if kind in _PROTECTED_MARKDOWN_KINDS and tokens <= HARD_MAX_TOKENS:
+        return [block]
+    if kind == "code":
+        pieces = _split_fenced_code(block)
+    elif kind == "table":
+        pieces = _split_table(block)
+    elif kind == "list":
+        pieces = _split_list(block)
+    elif kind == "blockquote":
+        pieces = _split_blockquote(block)
+    else:
+        pieces = _split_sentences(block)
+    if not pieces or any(estimate_evidence_tokens(piece) > HARD_MAX_TOKENS for piece in pieces):
+        raise ProjectionError(f"{kind} splitter exceeded hard_max")
     return pieces
 
 
@@ -305,12 +480,7 @@ def chunk_markdown(text: str) -> tuple[str, ...]:
 
     atomic: list[str] = []
     for kind, block in _markdown_blocks(body):
-        if estimate_evidence_tokens(block) <= TARGET_MAX_TOKENS:
-            atomic.append(block)
-        elif kind == "code":
-            atomic.extend(_split_lines(block))
-        else:
-            atomic.extend(_split_sentences(block))
+        atomic.extend(_split_markdown_block(kind, block))
 
     chunks: list[str] = []
     current: list[str] = []
