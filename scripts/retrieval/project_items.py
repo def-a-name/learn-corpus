@@ -23,6 +23,7 @@ PROJECTION_SCHEMA_VERSION = "item-projection-v1"
 CHUNK_POLICY_VERSION = "evidence-chunk-v1"
 LEXICAL_SCHEMA_VERSION = "lexical-schema-v1"
 QUERY_POLICY_VERSION = "qmd-style-v1"
+RANKING_POLICY_VERSION = "bm25-rrf-v1"
 ESTIMATOR_VERSION = "evidence-estimator-v1"
 
 TARGET_MIN_TOKENS = 400
@@ -792,6 +793,7 @@ def _source_digest(sources: Sequence[SourceSnapshot]) -> str:
             CHUNK_POLICY_VERSION,
             LEXICAL_SCHEMA_VERSION,
             QUERY_POLICY_VERSION,
+            RANKING_POLICY_VERSION,
         )
         for source in sorted(sources, key=lambda value: value.source_path)
     ]
@@ -891,6 +893,7 @@ def main() -> None:
                 "projection_schema_version": PROJECTION_SCHEMA_VERSION,
                 "chunk_policy_version": CHUNK_POLICY_VERSION,
                 "estimator_version": ESTIMATOR_VERSION,
+                "ranking_policy_version": RANKING_POLICY_VERSION,
             },
             ensure_ascii=False,
             sort_keys=True,
