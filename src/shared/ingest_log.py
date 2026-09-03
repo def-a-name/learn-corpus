@@ -151,6 +151,7 @@ def _parse_events(data: bytes, label: str) -> tuple[list[dict[str, Any]], list[s
             "web-chat",
             "notes",
             "articles",
+            "remove-source",
         }:
             errors.append(f"{label}:{line_number}: unknown importer")
         changes = event.get("changes")

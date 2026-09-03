@@ -5,6 +5,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
@@ -12,6 +14,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from src.ingestion.build_source_inventory import build_inventory  # noqa: E402
 from src.operations.check_corpus import check_source_consistency  # noqa: E402
 from src.operations.rebuild_review_queue import build_queue  # noqa: E402
+from src.operations.remove_source import SourceRemovalError, remove_source  # noqa: E402
 from src.operations.scan_secrets import scan_paths  # noqa: E402
 from src.shared.corpus_core import sha256_file, yaml_document  # noqa: E402
 
@@ -23,6 +26,195 @@ def write_jsonl(path: Path, records: list[dict]) -> None:
 
 
 class TestOperations:
+    def test_remove_source_supports_all_markdown_scopes_and_registered_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            raw_root = root / "raw"
+            raw_root.mkdir()
+            manifest_path = root / "meta" / "manifest.json"
+            manifest_path.parent.mkdir()
+            sources: dict[str, dict] = {}
+            expected_paths: list[Path] = []
+            raw_paths: list[Path] = []
+            cases = (
+                ("conversation", Path("sources/conversations/synthetic/session.md")),
+                ("note", Path("sources/notes/synthetic-note.md")),
+                ("article", Path("sources/articles/synthetic-article.md")),
+            )
+            for index, (scope, relative_output) in enumerate(cases, start=1):
+                source_id = f"synthetic-{scope}"
+                raw_path = raw_root / f"input-{index}.md"
+                raw_path.write_text(f"# Synthetic raw {index}\n", encoding="utf-8")
+                output_path = root / relative_output
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                metadata = {
+                    "id": source_id,
+                    "type": scope,
+                    "origin": "synthetic",
+                    "source_path": str(raw_path),
+                    "source_hash": "sha256:" + "0" * 64,
+                }
+                if scope in {"note", "article"}:
+                    metadata["layer"] = scope
+                output_path.write_text(yaml_document(metadata, f"# Synthetic {scope}"), encoding="utf-8")
+                asset_path = root / "sources" / "assets" / scope / source_id / f"asset-{index}.bin"
+                asset_path.parent.mkdir(parents=True, exist_ok=True)
+                asset_path.write_bytes(f"synthetic-asset-{index}".encode())
+                sources[source_id] = {
+                    "origin": "synthetic",
+                    "source_kind": "session" if scope == "conversation" else "document",
+                    "layer": scope if scope != "conversation" else None,
+                    "source_path": str(raw_path),
+                    "source_hash": "0" * 64,
+                    "output_path": relative_output.as_posix(),
+                    "assets": [
+                        {
+                            "stored_path": asset_path.relative_to(root).as_posix(),
+                            "asset_hash": sha256_file(asset_path),
+                        }
+                    ],
+                    "ingest_status": "ready",
+                    "curation_status": "unassessed",
+                }
+                expected_paths.extend((output_path, asset_path))
+                raw_paths.append(raw_path)
+            manifest_path.write_text(
+                json.dumps({"version": 2, "sources": sources}), encoding="utf-8"
+            )
+
+            results = [
+                remove_source(source_id, repo_root=root)
+                for source_id in ("synthetic-conversation", "synthetic-note", "synthetic-article")
+            ]
+            saved = json.loads(manifest_path.read_text(encoding="utf-8"))
+            events = [
+                json.loads(line)
+                for line in (root / "meta" / "ingest.log").read_text(encoding="utf-8").splitlines()
+            ]
+            consistency_errors, _ = check_source_consistency(
+                manifest_path, root / "sources", root
+            )
+            raw_files_remain = all(path.is_file() for path in raw_paths)
+            generated_files_removed = all(not path.exists() for path in expected_paths)
+
+        assert all(result["removed"] for result in results)
+        assert all(result["assets"] == 1 for result in results)
+        assert generated_files_removed
+        assert raw_files_remain
+        assert saved["sources"] == {}
+        assert len(events) == 3
+        assert all(event["importer"] == "remove-source" for event in events)
+        assert all({change["action"] for change in event["changes"]} == {"deleted"} for event in events)
+        assert consistency_errors == []
+
+    def test_remove_source_dry_run_does_not_change_files_or_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / "sources" / "notes" / "synthetic-note.md"
+            output.parent.mkdir(parents=True)
+            output.write_text(
+                yaml_document(
+                    {"id": "synthetic-note", "type": "note", "layer": "note"},
+                    "# Synthetic",
+                ),
+                encoding="utf-8",
+            )
+            manifest = root / "meta" / "manifest.json"
+            manifest.parent.mkdir()
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "sources": {
+                            "synthetic-note": {
+                                "ingest_status": "ready",
+                                "layer": "note",
+                                "output_path": "sources/notes/synthetic-note.md",
+                                "assets": [],
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            before = manifest.read_bytes()
+
+            result = remove_source("synthetic-note", repo_root=root, dry_run=True)
+
+            assert result["removed"] is False
+            assert output.is_file()
+            assert manifest.read_bytes() == before
+            assert not (root / "meta" / "ingest.log").exists()
+
+    def test_remove_source_rejects_manifest_dependents_and_shared_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            output = root / "sources" / "articles" / "canonical.md"
+            output.parent.mkdir(parents=True)
+            output.write_text(
+                yaml_document(
+                    {"id": "canonical", "type": "article", "layer": "article"},
+                    "# Synthetic",
+                ),
+                encoding="utf-8",
+            )
+            asset = root / "sources" / "assets" / "article" / "canonical" / "shared.bin"
+            asset.parent.mkdir(parents=True)
+            asset.write_bytes(b"synthetic-shared-asset")
+            manifest = root / "meta" / "manifest.json"
+            manifest.parent.mkdir()
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "sources": {
+                            "canonical": {
+                                "ingest_status": "ready",
+                                "layer": "article",
+                                "output_path": "sources/articles/canonical.md",
+                                "assets": [
+                                    {
+                                        "stored_path": "sources/assets/article/canonical/shared.bin",
+                                        "asset_hash": sha256_file(asset),
+                                    }
+                                ],
+                            },
+                            "dependent": {
+                                "ingest_status": "skipped",
+                                "duplicate_of": "canonical",
+                                "assets": [],
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with pytest.raises(SourceRemovalError, match="manifest dependents"):
+                remove_source("canonical", repo_root=root)
+
+            assert output.is_file()
+            assert asset.is_file()
+
+            saved = json.loads(manifest.read_text(encoding="utf-8"))
+            saved["sources"].pop("dependent")
+            saved["sources"]["shared-owner"] = {
+                "ingest_status": "ready",
+                "assets": [
+                    {
+                        "stored_path": "sources/assets/article/canonical/shared.bin",
+                        "asset_hash": sha256_file(asset),
+                    }
+                ],
+            }
+            manifest.write_text(json.dumps(saved), encoding="utf-8")
+
+            with pytest.raises(SourceRemovalError, match="shared assets"):
+                remove_source("canonical", repo_root=root)
+
+            assert output.is_file()
+            assert asset.is_file()
+
     def test_review_queue_includes_clickable_lines_and_locator_cli(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
