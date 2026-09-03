@@ -21,6 +21,7 @@ def import_articles(
     manifest_path: Path = MANIFEST_PATH,
     *,
     asset_root: Path = DEFAULT_ASSETS,
+    includes: list[str] | None = None,
     limit: int | None = None,
     dry_run: bool = False,
 ) -> dict:
@@ -29,6 +30,7 @@ def import_articles(
         input_root,
         policy,
         manifest_path,
+        includes=includes,
         limit=limit,
         dry_run=dry_run,
     )
@@ -40,6 +42,11 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--assets", type=Path, default=DEFAULT_ASSETS)
     parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
+    parser.add_argument(
+        "--include",
+        action="append",
+        help="import only the specified relative path under input; repeatable",
+    )
     parser.add_argument("--limit", type=int)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -48,6 +55,7 @@ def main() -> None:
         args.output,
         args.manifest,
         asset_root=args.assets,
+        includes=args.include,
         limit=args.limit,
         dry_run=args.dry_run,
     )

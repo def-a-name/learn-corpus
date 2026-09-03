@@ -126,6 +126,36 @@ tags: [synthetic]
         assert metadata["remote_image_count"] == 1
         assert ingest_event["importer"] == "articles"
 
+    def test_article_include_imports_only_the_explicit_markdown_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            inputs = root / "articles"
+            output = root / "sources" / "articles"
+            manifest = root / "meta" / "manifest.json"
+            inputs.mkdir()
+            selected = inputs / "selected.md"
+            selected.write_text("# 虚构指定文章\n\n合成正文。\n", encoding="utf-8")
+            (inputs / "not-selected.md").write_text(
+                "# 虚构未指定文章\n\n![](missing.png)\n", encoding="utf-8"
+            )
+
+            stats = import_articles(
+                inputs,
+                output,
+                manifest,
+                asset_root=root / "sources" / "assets",
+                includes=["selected.md"],
+            )
+            saved = json.loads(manifest.read_text(encoding="utf-8"))
+            generated = list(output.glob("*.md"))
+
+        assert stats["discovered"] == 1
+        assert stats["imported"] == 1
+        assert stats["skipped"] == 0
+        assert len(generated) == 1
+        assert len(saved["sources"]) == 1
+        assert next(iter(saved["sources"].values()))["source_path"] == str(selected.resolve())
+
     def test_exact_duplicate_is_skipped_only_within_same_layer(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
