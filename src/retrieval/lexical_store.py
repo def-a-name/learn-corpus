@@ -8,13 +8,16 @@ import re
 import sqlite3
 import threading
 import unicodedata
+from contextlib import contextmanager
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
+from time import monotonic
 from typing import Any, Sequence
 
 from src.retrieval.contracts import (
     GenerationStatus,
+    Item,
     ItemRelations,
     ReadResult,
     SearchResponse,
@@ -552,6 +555,98 @@ class LexicalStore:
             estimator_version=self._manifest["estimator_version"],
         )
 
+    @contextmanager
+    def request_deadline(self, deadline: float):
+        """在同一连接锁内约束等待和 SQL 时间，退出时移除请求级回调。"""
+
+        remaining = deadline - monotonic()
+        if remaining <= 0 or not self._lock.acquire(timeout=remaining):
+            raise BudgetExceededError("request processing deadline exceeded")
+        connection = None
+        try:
+            if monotonic() >= deadline:
+                raise BudgetExceededError("request processing deadline exceeded")
+            connection = self._database()
+            connection.set_progress_handler(lambda: int(monotonic() >= deadline), 100)
+            yield
+            if monotonic() >= deadline:
+                raise BudgetExceededError("request processing deadline exceeded")
+        except IndexUnavailableError as exc:
+            cause = exc.__cause__
+            if (
+                isinstance(cause, sqlite3.Error)
+                and (
+                    getattr(cause, "sqlite_errorcode", None) == getattr(sqlite3, "SQLITE_INTERRUPT", 9)
+                    or str(cause) == "interrupted"
+                )
+                and monotonic() >= deadline
+            ):
+                raise BudgetExceededError("request processing deadline exceeded") from exc
+            raise
+        finally:
+            if connection is not None:
+                connection.set_progress_handler(None, 0)
+            self._lock.release()
+
+    def read_canonical_item(self, item_id: str, generation: str) -> Item:
+        """内部精确读取完整投影字段，供 bundle 校验使用，不截断正文。"""
+
+        self.validate_generation(generation)
+        if not isinstance(item_id, str) or _ITEM_ID.fullmatch(item_id) is None:
+            raise InvalidRequestError("item_id has an invalid format")
+        with self._lock:
+            try:
+                row = self._database().execute(
+                    "SELECT * FROM items WHERE item_id = ?", (item_id,)
+                ).fetchone()
+            except sqlite3.Error as exc:
+                raise IndexUnavailableError("item read failed") from exc
+        if row is None:
+            raise ItemNotFoundError("item was not found in the pinned generation")
+        try:
+            fields = dict(row)
+            fields.pop("rowid")
+            raw_heading = fields.pop("heading_path_json")
+            heading = None if raw_heading is None else json.loads(raw_heading)
+            if heading is not None and (
+                not isinstance(heading, list) or any(not isinstance(v, str) for v in heading)
+            ):
+                raise ValueError("invalid heading path")
+            fields["heading_path"] = None if heading is None else tuple(heading)
+            fields["relations"] = _relations(fields.pop("relations_json"))
+            return Item(**fields)
+        except (TypeError, ValueError, KeyError) as exc:
+            raise IndexUnavailableError("indexed item metadata is unavailable") from exc
+
+    def logical_member_ids(self, seed: Item) -> tuple[str, ...]:
+        """独立枚举逻辑单元成员，用于发现断开的关系链，不提供公开浏览能力。"""
+
+        if seed.scope == "conversation":
+            predicate = "session_id IS ? AND turn_index = ?"
+            parameters = (seed.session_id, seed.turn_index)
+        else:
+            suffix = f"/part:{seed.part}"
+            predicate = "substr(locator, 1, length(locator) - length('/part:' || part)) = ?"
+            parameters = (seed.locator.removesuffix(suffix),)
+        with self._lock:
+            try:
+                rows = self._database().execute(
+                    "SELECT item_id FROM items WHERE source_path = ? AND scope = ? AND "
+                    + predicate + " ORDER BY item_id",
+                    (seed.source_path, seed.scope, *parameters),
+                ).fetchall()
+            except sqlite3.Error as exc:
+                raise IndexUnavailableError("bundle membership query failed") from exc
+        return tuple(row["item_id"] for row in rows)
+
+    def validate_generation(self, generation: str) -> None:
+        """在读取或公开搜索前校验调用方绑定的快照。"""
+
+        if not isinstance(generation, str) or _GENERATION.fullmatch(generation) is None:
+            raise InvalidRequestError("generation has an invalid format")
+        if generation != self.generation:
+            raise GenerationMismatchError("requested generation is not pinned")
+
     def search_lex(
         self,
         queries: Sequence[str],
@@ -674,10 +769,7 @@ class LexicalStore:
         generation: str,
         max_estimated_tokens: int = DEFAULT_READ_MAX_TOKENS,
     ) -> ReadResult:
-        if not isinstance(generation, str) or _GENERATION.fullmatch(generation) is None:
-            raise InvalidRequestError("generation has an invalid format")
-        if generation != self.generation:
-            raise GenerationMismatchError("requested generation is not pinned")
+        self.validate_generation(generation)
         if not isinstance(item_id, str) or _ITEM_ID.fullmatch(item_id) is None:
             raise InvalidRequestError("item_id has an invalid format")
         if (
