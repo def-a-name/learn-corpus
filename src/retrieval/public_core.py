@@ -45,7 +45,7 @@ class RequestLimits:
 
 @dataclass(frozen=True)
 class PublicResponse:
-    """保存已经计费和校验的精确 JSON 字节，避免 adapter 意外修改共享结果。"""
+    """保存已经计量和校验的精确 JSON 字节，避免 adapter 意外修改共享结果。"""
 
     json_bytes: bytes
 
@@ -68,10 +68,6 @@ class _PreparedRequest:
     limit: int = 8
     seed_item_id: str | None = None
     generation: str | None = None
-
-    @property
-    def cost(self) -> int:
-        return len(self.compiled) if self.operation == "search" else (self.max_tokens + 799) // 800
 
 
 def _request(request: object, allowed: set[str], required: set[str]) -> dict[str, Any]:
@@ -289,7 +285,7 @@ class RetrievalCore:
         raise BudgetExceededError("minimum bundle response exceeds the response budget")
 
     def validate_request(self, operation: str, request: object) -> _PreparedRequest:
-        """校验并编译一次；入口计费和后续 core 执行复用不可变结果。"""
+        """校验并编译一次；入口和后续 core 执行复用不可变结果。"""
 
         if isinstance(request, _PreparedRequest):
             if request.owner is not self._request_owner or request.operation != operation:

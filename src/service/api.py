@@ -22,7 +22,7 @@ from src.retrieval.lexical_store import LexicalStore, LexicalStoreError
 from src.retrieval.public_core import RetrievalCore
 from src.service.config import RestConfig, load_credentials, strict_json
 from src.service.security import (
-    Admissions, BearerVerifier, ERRORS, HTTPFailure, TokenBuckets,
+    Admissions, BearerVerifier, ERRORS, HTTPFailure,
 )
 
 
@@ -144,14 +144,7 @@ class RestBoundary:
             await send(message)
 
         try:
-            peer = connection_peer(scope, self.config)
-            try:
-                headers, source = headers_and_source(scope, self.config)
-            except HTTPFailure:
-                # 头部损坏时无法采信转发地址，仍按已确认的连接对端计入入口额度。
-                self.state.ip_buckets.charge(peer, 1)
-                raise
-            self.state.ip_buckets.charge(source, 1)
+            headers, _ = headers_and_source(scope, self.config)
             if headers.get("host") not in self.config.allowed_hosts or (
                 "origin" in headers and headers["origin"] not in self.config.allowed_origins
             ):
@@ -181,9 +174,6 @@ class RestBoundary:
                 values = strict_json(raw, max_keys=self.config.max_json_keys,
                                      max_array_items=self.config.max_json_array_items)
                 values = self.state.core.validate_request(operation, values)
-            if credential:
-                cost = 1 if operation == "status" else values.cost
-                self.state.client_buckets.charge(client_id, cost)
             self.state.admissions.acquire(admission_key)
             admitted = True
             scope["state"]["retrieval_values"] = values
@@ -225,8 +215,6 @@ def create_app(config: RestConfig) -> FastAPI:
             app.state.verifier = BearerVerifier(load_credentials(config.credentials_file))
             store = await anyio.to_thread.run_sync(LexicalStore.open_current, config.retrieval_root)
             app.state.core = RetrievalCore(store, config.response_limits)
-            app.state.ip_buckets = TokenBuckets(config.ip_rate, config.max_ip_buckets)
-            app.state.client_buckets = TokenBuckets(config.client_rate, len(app.state.verifier.client_ids))
             app.state.admissions = Admissions(config.global_concurrency, config.client_concurrency)
             app.state.workers = anyio.CapacityLimiter(config.global_concurrency)
             yield

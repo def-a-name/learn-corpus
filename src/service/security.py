@@ -1,14 +1,12 @@
-"""提供静态凭据验证与单进程入口限流，不维护用户 turn 状态。"""
+"""提供静态凭据验证与单进程并发登记，不维护用户 turn 状态。"""
 
 from __future__ import annotations
 
 import hashlib
 import hmac
-import math
 import re
 import threading
 from dataclasses import dataclass
-from time import monotonic
 
 
 ERRORS = {
@@ -63,7 +61,7 @@ class Credential:
 
 
 class BearerVerifier:
-    """验证 key_id.secret；同客户端的新旧 key 共用限流身份。"""
+    """验证 key_id.secret；同客户端的新旧 key 共用并发身份。"""
 
     def __init__(self, credentials: tuple[Credential, ...]):
         if not credentials or len({value.key_id for value in credentials}) != len(credentials):
@@ -84,51 +82,6 @@ class BearerVerifier:
         if not matched or credential is None:
             raise HTTPFailure("unauthorized")
         return credential
-
-
-@dataclass(frozen=True)
-class RatePolicy:
-    refill_per_second: float
-    capacity: int
-
-    def __post_init__(self):
-        if (
-            type(self.refill_per_second) not in (int, float)
-            or not math.isfinite(self.refill_per_second) or self.refill_per_second <= 0
-            or not positive_integer(self.capacity)
-        ):
-            raise ValueError("rate policy must contain positive finite limits")
-
-
-class TokenBuckets:
-    """只清理已完全恢复的桶，避免通过淘汰有欠额的桶绕过限流。"""
-
-    def __init__(self, policy: RatePolicy, max_keys: int):
-        if not positive_integer(max_keys):
-            raise ValueError("bucket key limit must be positive")
-        self.policy = policy
-        self.max_keys = max_keys
-        self._buckets: dict[str, tuple[float, float]] = {}
-        self._lock = threading.Lock()
-
-    def charge(self, key: str, cost: int, *, now: float | None = None):
-        now = monotonic() if now is None else now
-        with self._lock:
-            if key not in self._buckets and len(self._buckets) >= self.max_keys:
-                self._buckets = {
-                    k: (tokens, updated) for k, (tokens, updated) in self._buckets.items()
-                    if tokens + (now - updated) * self.policy.refill_per_second < self.policy.capacity
-                }
-                if len(self._buckets) >= self.max_keys:
-                    raise HTTPFailure("rate_limited")
-            tokens, updated = self._buckets.get(key, (float(self.policy.capacity), now))
-            tokens = min(self.policy.capacity, tokens + max(0, now - updated) * self.policy.refill_per_second)
-            if tokens < cost:
-                self._buckets[key] = tokens, now
-                retry = max(1, math.ceil((cost - tokens) / self.policy.refill_per_second))
-                headers = {"Retry-After": str(retry)} if cost <= self.policy.capacity else {}
-                raise HTTPFailure("rate_limited", headers=headers)
-            self._buckets[key] = tokens - cost, now
 
 
 class Admissions:

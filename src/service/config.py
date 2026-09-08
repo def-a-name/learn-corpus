@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from src.retrieval.public_core import RequestLimits
-from src.service.security import Credential, HTTPFailure, RatePolicy, positive_integer
+from src.service.security import Credential, HTTPFailure, positive_integer
 
 
 def strict_json(raw: bytes, *, max_keys: int, max_array_items: int) -> object:
@@ -82,11 +82,8 @@ class RestConfig:
     allowed_hosts: tuple[str, ...]
     allowed_origins: tuple[str, ...]
     response_limits: RequestLimits
-    ip_rate: RatePolicy
-    client_rate: RatePolicy
     global_concurrency: int
     client_concurrency: int
-    max_ip_buckets: int
     max_header_bytes: int
     max_headers: int
     max_authorization_bytes: int
@@ -96,7 +93,7 @@ class RestConfig:
 
     def __post_init__(self):
         numbers = (
-            self.global_concurrency, self.client_concurrency, self.max_ip_buckets,
+            self.global_concurrency, self.client_concurrency,
             self.max_header_bytes, self.max_headers, self.max_authorization_bytes,
             self.max_json_keys, self.max_json_array_items, self.body_timeout_ms,
         )
@@ -154,8 +151,6 @@ def load_config(path: Path) -> RestConfig:
                 raise ValueError("allowlist must be an array")
             value[name] = tuple(value[name])
         value["response_limits"] = RequestLimits(**value["response_limits"])
-        value["ip_rate"] = RatePolicy(**value["ip_rate"])
-        value["client_rate"] = RatePolicy(**value["client_rate"])
         return RestConfig(**value)
     except (OSError, TypeError, ValueError, KeyError, HTTPFailure) as exc:
         raise ValueError("cannot load service configuration") from exc

@@ -589,7 +589,7 @@ class LexicalStore:
             self._lock.release()
 
     def _read_guard(self, deadline: float | None):
-        """公开请求沿用绝对时限，内部离线调用保留普通连接锁。"""
+        """传入 deadline 时约束锁等待和 SQL 执行；否则仅使用连接锁。"""
 
         return self._lock if deadline is None else self.request_deadline(deadline)
 

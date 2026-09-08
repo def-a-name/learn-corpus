@@ -15,7 +15,7 @@ from src.retrieval.lexical_store import IndexUnavailableError
 from src.retrieval.public_core import RequestLimits
 from src.service.config import RestConfig, strict_json
 from src.service.api import create_app
-from src.service.security import Admissions, BearerVerifier, Credential, HTTPFailure, RatePolicy, TokenBuckets
+from src.service.security import Admissions, BearerVerifier, Credential, HTTPFailure
 from test_public_core import exchange, open_core  # noqa: F401
 
 
@@ -38,8 +38,7 @@ def config(open_core, tmp_path):
         allowed_peers=("192.0.2.2", "127.0.0.1"), trusted_proxies=("192.0.2.2",),
         allowed_hosts=("service.test",), allowed_origins=("https://client.test",),
         response_limits=RequestLimits(30_000, 5000),
-        ip_rate=RatePolicy(100, 200), client_rate=RatePolicy(100, 200),
-        global_concurrency=2, client_concurrency=1, max_ip_buckets=10,
+        global_concurrency=2, client_concurrency=1,
         max_header_bytes=4096, max_headers=30, max_authorization_bytes=256,
         max_json_keys=20, max_json_array_items=10, body_timeout_ms=100,
     )
@@ -152,34 +151,10 @@ def test_proxy_requires_single_overwritten_ip_and_direct_clients_cannot_spoof(co
             else:
                 headers["X-Forwarded-For"] = value
             assert_error(client.get("/healthz", headers=headers), 400, "invalid_request")
-    restrictive = replace(config, ip_rate=RatePolicy(0.001, 1))
-    with client_for(restrictive, peer="127.0.0.1") as client:
-        assert client.get("/healthz", headers={"X-Forwarded-For": "192.0.2.9"}).status_code == 200
-        limited = client.get("/healthz", headers={"X-Forwarded-For": "192.0.2.8"})
-        assert_error(limited, 429, "rate_limited")
-        assert "retry-after" in limited.headers
+    with client_for(config, peer="127.0.0.1") as client:
+        for value in ("192.0.2.9", "not-an-ip"):
+            assert client.get("/healthz", headers={"X-Forwarded-For": value}).status_code == 200
 
-
-def test_proxy_clients_share_entry_bucket_including_auth_errors(config):
-    with client_for(replace(config, ip_rate=RatePolicy(0.001, 1))) as client:
-        assert_error(client.get("/v1/status", headers={"X-Forwarded-For": "192.0.2.1"}), 401, "unauthorized")
-        assert_error(client.get("/healthz", headers=HEADERS), 429, "rate_limited")
-
-
-def test_invalid_proxy_headers_still_consume_connection_bucket(config):
-    with client_for(replace(config, ip_rate=RatePolicy(0.001, 1))) as client:
-        assert_error(client.get("/healthz"), 400, "invalid_request")
-        assert_error(client.get("/healthz"), 429, "rate_limited")
-
-
-def test_read_cost_uses_requested_budget_and_no_fake_retry_when_capacity_too_small(config):
-    with client_for(replace(config, client_rate=RatePolicy(0.001, 2))) as client:
-        request = {"seed_item_id": exchange()[0].item_id, "generation": "gen_" + "a" * 20}
-        limited = client.post("/v1/read-bundle", json=request, headers=HEADERS)
-        assert_error(limited, 429, "rate_limited")
-        assert "retry-after" not in limited.headers
-        request["max_estimated_tokens"] = 800
-        assert client.post("/v1/read-bundle", json=request, headers=HEADERS).status_code == 200
 
 
 def test_core_errors_and_unexpected_errors_are_sanitized_and_logged(config, monkeypatch, caplog):
@@ -252,18 +227,6 @@ def test_rotation_keys_share_client_and_revocation_uses_new_verifier():
     assert both.authenticate("Bearer old-key." + SECRET).client_id == both.authenticate("Bearer new-key." + new_secret).client_id
     with pytest.raises(HTTPFailure):
         BearerVerifier((new,)).authenticate("Bearer old-key." + SECRET)
-
-
-def test_token_bucket_recovery_and_bounded_identity_storage():
-    buckets = TokenBuckets(RatePolicy(2, 4), 1)
-    buckets.charge("synthetic", 4, now=0)
-    with pytest.raises(HTTPFailure) as error:
-        buckets.charge("synthetic", 1, now=0.1)
-    assert error.value.headers["Retry-After"] == "1"
-    with pytest.raises(HTTPFailure):
-        buckets.charge("new", 1, now=0.2)
-    buckets.charge("synthetic", 1, now=0.5)
-    buckets.charge("new", 1, now=3)
 
 
 def test_global_and_client_admission_limits_are_distinct():
@@ -404,3 +367,44 @@ def test_search_compiles_each_query_once_across_entry_and_core(config, monkeypat
         response = client.post("/v1/search", json={"queries": ["quasar", "clarification"]}, headers=HEADERS)
         assert response.status_code == 200
     assert calls == ["quasar", "clarification"]
+
+
+def test_sequential_requests_have_no_rate_budget(config):
+    with client_for(config) as client:
+        seed = exchange()[0].item_id
+        generation = client.app.state.core.store.generation
+        for _ in range(3):
+            assert_error(client.get("/v1/status", headers={"X-Forwarded-For": "192.0.2.1"}),
+                         401, "unauthorized")
+            assert client.get("/healthz", headers=HEADERS).status_code == 200
+            response = client.post("/v1/read-bundle", headers=HEADERS,
+                                   json={"seed_item_id": seed, "generation": generation})
+            assert response.status_code == 200
+        assert client.app.state.admissions._total == 0
+
+
+@pytest.mark.parametrize("field", ["ip_rate", "client_rate", "max_ip_buckets"])
+def test_removed_rate_configuration_is_rejected(config, tmp_path, field):
+    from dataclasses import asdict
+    from src.service.config import load_config
+
+    values = asdict(config)
+    values["retrieval_root"] = str(config.retrieval_root)
+    values["credentials_file"] = str(config.credentials_file)
+    values[field] = 1 if field == "max_ip_buckets" else {"refill_per_second": 2, "capacity": 10}
+    path = tmp_path / "synthetic-old-config.json"
+    path.write_text(json.dumps(values))
+    with pytest.raises(ValueError, match="cannot load service configuration"):
+        load_config(path)
+
+
+def test_failed_core_call_releases_concurrency(config, monkeypatch):
+    with client_for(config) as client:
+        original = client.app.state.core.status
+        def fail():
+            raise RuntimeError("synthetic failure")
+        monkeypatch.setattr(client.app.state.core, "status", fail)
+        assert_error(client.get("/v1/status", headers=HEADERS), 500, "internal_error")
+        assert client.app.state.admissions._total == 0
+        monkeypatch.setattr(client.app.state.core, "status", original)
+        assert client.get("/v1/status", headers=HEADERS).status_code == 200
