@@ -588,13 +588,18 @@ class LexicalStore:
                 connection.set_progress_handler(None, 0)
             self._lock.release()
 
-    def read_canonical_item(self, item_id: str, generation: str) -> Item:
+    def _read_guard(self, deadline: float | None):
+        """公开请求沿用绝对时限，内部离线调用保留普通连接锁。"""
+
+        return self._lock if deadline is None else self.request_deadline(deadline)
+
+    def read_canonical_item(self, item_id: str, generation: str, *, deadline: float | None = None) -> Item:
         """内部精确读取完整投影字段，供 bundle 校验使用，不截断正文。"""
 
         self.validate_generation(generation)
         if not isinstance(item_id, str) or _ITEM_ID.fullmatch(item_id) is None:
             raise InvalidRequestError("item_id has an invalid format")
-        with self._lock:
+        with self._read_guard(deadline):
             try:
                 row = self._database().execute(
                     "SELECT * FROM items WHERE item_id = ?", (item_id,)
@@ -618,7 +623,7 @@ class LexicalStore:
         except (TypeError, ValueError, KeyError) as exc:
             raise IndexUnavailableError("indexed item metadata is unavailable") from exc
 
-    def logical_member_ids(self, seed: Item) -> tuple[str, ...]:
+    def logical_member_ids(self, seed: Item, *, deadline: float | None = None) -> tuple[str, ...]:
         """独立枚举逻辑单元成员，用于发现断开的关系链，不提供公开浏览能力。"""
 
         if seed.scope == "conversation":
@@ -628,7 +633,7 @@ class LexicalStore:
             suffix = f"/part:{seed.part}"
             predicate = "substr(locator, 1, length(locator) - length('/part:' || part)) = ?"
             parameters = (seed.locator.removesuffix(suffix),)
-        with self._lock:
+        with self._read_guard(deadline):
             try:
                 rows = self._database().execute(
                     "SELECT item_id FROM items WHERE source_path = ? AND scope = ? AND "
@@ -654,6 +659,14 @@ class LexicalStore:
         limit: int = DEFAULT_RESULT_LIMIT,
     ) -> SearchResponse:
         compiled = self._validate_search_request(queries, scopes, limit)
+        return self._search_compiled(compiled, scopes, limit)
+
+    def _search_compiled(
+        self, compiled: tuple[CompiledQuery, ...], scopes: Sequence[str] | None,
+        limit: int, *, deadline: float | None = None,
+    ) -> SearchResponse:
+        """执行内部已编译查询；连接锁仅覆盖 SQL、排名融合与结果读取。"""
+
         allowed_scopes = SUPPORTED_SCOPES if scopes is None else tuple(scopes)
         placeholders = ", ".join("?" for _ in allowed_scopes)
         sql = (
@@ -662,7 +675,7 @@ class LexicalStore:
             f"WHERE items_fts MATCH ? AND i.scope IN ({placeholders}) "
             "ORDER BY bm25_score ASC, i.item_id ASC LIMIT ?"
         )
-        with self._lock:
+        with self._read_guard(deadline):
             connection = self._database()
             try:
                 rankings: list[dict[str, int]] = []
@@ -687,6 +700,8 @@ class LexicalStore:
         results: list[SearchResult] = []
         total_tokens = 0
         for rank, item_id in enumerate(fused_ids, start=1):
+            if deadline is not None and monotonic() >= deadline:
+                raise BudgetExceededError("request processing deadline exceeded")
             query_index = 0 if item_id in rankings[0] else min(
                 (index for index in range(1, len(rankings)) if item_id in rankings[index]),
                 key=lambda index: (rankings[index][item_id], index),

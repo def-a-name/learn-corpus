@@ -18,6 +18,7 @@ from src.retrieval.lexical_store import (
     InvalidRequestError,
     LexicalStore,
 )
+from src.retrieval.lexical_query import CompiledQuery
 from src.retrieval.text import estimate_evidence_tokens
 
 
@@ -53,6 +54,24 @@ class PublicResponse:
         """返回独立副本，MCP 可将其作为结构化结果使用。"""
 
         return json.loads(self.json_bytes)
+
+
+@dataclass(frozen=True)
+class _PreparedRequest:
+    """仅在同一 core 内复用的不可变校验结果，避免跨操作或跨实例误用。"""
+
+    owner: object
+    operation: str
+    max_tokens: int
+    compiled: tuple[CompiledQuery, ...] = ()
+    scopes: tuple[str, ...] | None = None
+    limit: int = 8
+    seed_item_id: str | None = None
+    generation: str | None = None
+
+    @property
+    def cost(self) -> int:
+        return len(self.compiled) if self.operation == "search" else (self.max_tokens + 799) // 800
 
 
 def _request(request: object, allowed: set[str], required: set[str]) -> dict[str, Any]:
@@ -185,6 +204,7 @@ class RetrievalCore:
     def __init__(self, store: LexicalStore, limits: RequestLimits) -> None:
         self.store = store
         self.limits = limits
+        self._request_owner = object()
 
     def _start(self, request_id: str | None) -> tuple[float, str]:
         deadline = monotonic() + self.limits.request_timeout_ms / 1000
@@ -217,81 +237,111 @@ class RetrievalCore:
 
     def search(self, request: object, *, request_id: str | None = None) -> PublicResponse:
         deadline, request_id = self._start(request_id)
-        values = _request(request, {
-            "queries", "scopes", "limit", "generation", "max_estimated_tokens",
-        }, {"queries"})
-        max_tokens = _tokens(values)
-        if type(values["queries"]) is not list or (
-            "scopes" in values and type(values["scopes"]) is not list
-        ):
-            raise InvalidRequestError("queries and scopes must be arrays")
-        if "generation" in values:
-            self.store.validate_generation(values["generation"])
-        with self.store.request_deadline(deadline):
-            result = self.store.search_lex(
-                values["queries"], values.get("scopes"), values.get("limit", 8),
-            )
-            candidates = []
-            for hit in result.results:
-                check_deadline(deadline)
-                item = self.store.read_canonical_item(hit.item_id, result.generation)
-                candidates.append({
-                    **_metadata(item), "bundle_key": bundle_key(item), "rank": hit.rank,
-                    "snippet": hit.snippet, "truncated_before": hit.truncated_before,
-                    "truncated_after": hit.truncated_after,
-                })
-            # 从完整结果向下缩短，始终保留同一排名的完整前缀。
-            for count in range(len(candidates), -1, -1):
-                response = self._encode({
-                    "request_id": request_id, "generation": result.generation,
-                    "is_truncated": count < len(candidates), "results": candidates[:count],
-                }, "search", max_tokens, deadline)
-                if response is not None:
-                    return response
+        values = self.validate_request("search", request)
+        max_tokens = values.max_tokens
+        result = self.store._search_compiled(
+            values.compiled, values.scopes, values.limit, deadline=deadline,
+        )
+        candidates = []
+        for hit in result.results:
+            check_deadline(deadline)
+            item = self.store.read_canonical_item(hit.item_id, result.generation, deadline=deadline)
+            candidates.append({
+                **_metadata(item), "bundle_key": bundle_key(item), "rank": hit.rank,
+                "snippet": hit.snippet, "truncated_before": hit.truncated_before,
+                "truncated_after": hit.truncated_after,
+            })
+        # 从完整结果向下缩短，始终保留同一排名的完整前缀。
+        for count in range(len(candidates), -1, -1):
+            response = self._encode({
+                "request_id": request_id, "generation": result.generation,
+                "is_truncated": count < len(candidates), "results": candidates[:count],
+            }, "search", max_tokens, deadline)
+            if response is not None:
+                return response
         raise BudgetExceededError("minimum search response exceeds the response budget")
 
     def read_bundle(self, request: object, *, request_id: str | None = None) -> PublicResponse:
         deadline, request_id = self._start(request_id)
-        values = _request(request, {
-            "seed_item_id", "generation", "max_estimated_tokens",
-        }, {"seed_item_id", "generation"})
-        max_tokens = _tokens(values)
-        with self.store.request_deadline(deadline):
-            seed = self.store.read_canonical_item(values["seed_item_id"], values["generation"])
-            key = bundle_key(seed)
-            members = read_members(self.store, seed, deadline)
-            items = []
-            for item in members:
-                check_deadline(deadline)
-                items.append({
-                    **_metadata(item), "body": item.body, "is_truncated": False,
-                    "relations": asdict(item.relations),
-                })
-            for count in range(len(items), -1, -1):
-                response = self._encode({
-                    "request_id": request_id, "generation": self.store.generation,
-                    "bundle_key": key,
-                    "bundle_status": "complete" if count == len(items) else "partial_budget",
-                    "membership_complete": True,
-                    "missing_item_ids": [item.item_id for item in members[count:]],
-                    "items": items[:count],
-                }, "bundle", max_tokens, deadline)
-                if response is not None:
-                    return response
+        values = self.validate_request("read_bundle", request)
+        max_tokens = values.max_tokens
+        seed = self.store.read_canonical_item(values.seed_item_id, values.generation, deadline=deadline)
+        key = bundle_key(seed)
+        members = read_members(self.store, seed, deadline)
+        items = []
+        for item in members:
+            check_deadline(deadline)
+            items.append({
+                **_metadata(item), "body": item.body, "is_truncated": False,
+                "relations": asdict(item.relations),
+            })
+        for count in range(len(items), -1, -1):
+            response = self._encode({
+                "request_id": request_id, "generation": self.store.generation,
+                "bundle_key": key,
+                "bundle_status": "complete" if count == len(items) else "partial_budget",
+                "membership_complete": True,
+                "missing_item_ids": [item.item_id for item in members[count:]],
+                "items": items[:count],
+            }, "bundle", max_tokens, deadline)
+            if response is not None:
+                return response
         raise BudgetExceededError("minimum bundle response exceeds the response budget")
+
+    def validate_request(self, operation: str, request: object) -> _PreparedRequest:
+        """校验并编译一次；入口计费和后续 core 执行复用不可变结果。"""
+
+        if isinstance(request, _PreparedRequest):
+            if request.owner is not self._request_owner or request.operation != operation:
+                raise InvalidRequestError("prepared request does not belong to this operation")
+            return request
+
+        if operation == "search":
+            values = _request(request, {
+                "queries", "scopes", "limit", "generation", "max_estimated_tokens",
+            }, {"queries"})
+            max_tokens = _tokens(values)
+            if type(values["queries"]) is not list or (
+                "scopes" in values and type(values["scopes"]) is not list
+            ):
+                raise InvalidRequestError("queries and scopes must be arrays")
+            if "generation" in values:
+                self.store.validate_generation(values["generation"])
+            compiled = self.store._validate_search_request(
+                values["queries"], values.get("scopes"), values.get("limit", 8),
+            )
+            return _PreparedRequest(
+                self._request_owner, operation, max_tokens, compiled,
+                None if "scopes" not in values else tuple(values["scopes"]),
+                values.get("limit", 8), generation=values.get("generation"),
+            )
+        if operation == "read_bundle":
+            values = _request(request, {
+                "seed_item_id", "generation", "max_estimated_tokens",
+            }, {"seed_item_id", "generation"})
+            max_tokens = _tokens(values)
+            self.store.validate_generation(values["generation"])
+            seed = values["seed_item_id"]
+            if not isinstance(seed, str) or _ITEM_ID.fullmatch(seed) is None:
+                raise InvalidRequestError("item_id has an invalid format")
+            return _PreparedRequest(
+                self._request_owner, operation, max_tokens,
+                seed_item_id=seed, generation=values["generation"],
+            )
+        raise InvalidRequestError("operation is invalid")
 
     def status(self) -> PublicResponse:
         deadline, _ = self._start(None)
         with self.store.request_deadline(deadline):
             payload = asdict(self.store.status())
-            payload["capabilities"] = {
-                "read_bundle": True,
-                "max_estimated_tokens": MAX_RESPONSE_TOKENS,
-                "max_response_bytes": self.limits.max_response_bytes,
-                "request_timeout_ms": self.limits.request_timeout_ms,
-            }
-            encoded = _json(payload)
-            if len(encoded) > self.limits.max_response_bytes:
-                raise BudgetExceededError("status response exceeds the response byte limit")
-            check_deadline(deadline)
-            return PublicResponse(encoded)
+        payload["capabilities"] = {
+            "read_bundle": True,
+            "max_estimated_tokens": MAX_RESPONSE_TOKENS,
+            "max_response_bytes": self.limits.max_response_bytes,
+            "request_timeout_ms": self.limits.request_timeout_ms,
+        }
+        encoded = _json(payload)
+        if len(encoded) > self.limits.max_response_bytes:
+            raise BudgetExceededError("status response exceeds the response byte limit")
+        check_deadline(deadline)
+        return PublicResponse(encoded)

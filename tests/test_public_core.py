@@ -220,8 +220,8 @@ def test_corrupt_relations_or_body_fail_without_partial_evidence(open_core, monk
     core = open_core(items)
     original = core.store.read_canonical_item
 
-    def damaged(item_id, generation):
-        item = original(item_id, generation)
+    def damaged(item_id, generation, **kwargs):
+        item = original(item_id, generation, **kwargs)
         if item_id != items[0].item_id:
             return item
         if damage == "cycle":
@@ -313,7 +313,7 @@ def test_sqlite_deadline_interrupts_expensive_query_and_cleans_handler(open_core
         pytest.fail("expensive query was not interrupted")
 
     with monkeypatch.context() as patch:
-        patch.setattr(core.store, "search_lex", expensive)
+        patch.setattr(core.store, "_fuse", expensive)
         with pytest.raises(BudgetExceededError):
             core.search({"queries": ["quasar"]})
     assert core.store.search_lex(["quasar"]).results
@@ -356,3 +356,116 @@ def test_status_advertises_configured_limits_without_filesystem_details(open_cor
 def test_limits_require_explicit_positive_integers(values):
     with pytest.raises(ValueError):
         RequestLimits(*values)
+
+
+@pytest.mark.parametrize("phase", ["snippet", "bundle_validation", "search_encode", "bundle_encode", "status_encode"])
+def test_python_processing_allows_another_database_read(open_core, monkeypatch, phase):
+    from concurrent.futures import ThreadPoolExecutor
+    from src.retrieval import bundle, lexical_store, public_core
+
+    item = parts("note", "A", ("quasar",))[0]
+    core = open_core((item,))
+    entered, release = threading.Event(), threading.Event()
+    target, name = {
+        "snippet": (lexical_store, "_make_snippet"),
+        "bundle_validation": (bundle, "_validate_item"),
+        "search_encode": (core, "_encode"),
+        "bundle_encode": (core, "_encode"),
+        "status_encode": (public_core, "_json"),
+    }[phase]
+    original = getattr(target, name)
+
+    def paused(*args, **kwargs):
+        entered.set()
+        assert release.wait(3)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(target, name, paused)
+    operation = (lambda: read(core, item)) if phase.startswith("bundle") else (
+        core.status if phase == "status_encode" else lambda: core.search({"queries": ["quasar"]})
+    )
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(operation)
+        try:
+            assert entered.wait(1)
+            second = pool.submit(core.store.read_canonical_item, item.item_id, core.store.generation,
+                                 deadline=monotonic() + 0.5)
+            assert second.result(timeout=1).item_id == item.item_id
+        finally:
+            release.set()
+        assert first.result(timeout=1).json_bytes
+
+
+def test_bundle_reads_share_one_absolute_deadline(open_core, monkeypatch):
+    from src.retrieval import bundle, lexical_store, public_core
+
+    items = exchange()
+    core = open_core(items, timeout_ms=100)
+    clock = [100.0]
+    for module in (bundle, lexical_store, public_core):
+        monkeypatch.setattr(module, "monotonic", lambda: clock[0])
+    original = core.store.read_canonical_item
+    deadlines = []
+
+    def advancing(*args, **kwargs):
+        deadlines.append(kwargs["deadline"])
+        result = original(*args, **kwargs)
+        clock[0] += 0.06
+        return result
+
+    monkeypatch.setattr(core.store, "read_canonical_item", advancing)
+    with pytest.raises(BudgetExceededError):
+        read(core, items[0])
+    assert len(deadlines) == 2
+    assert deadlines[0] == deadlines[1] == 100.1
+    assert core.status().payload["generation"] == core.store.generation
+
+
+def test_prepared_requests_copy_inputs_and_reject_other_core_or_operation(open_core):
+    item = parts("note", "A", ("quasar",))[0]
+    core = open_core((item,))
+    request = {"queries": ["quasar"], "scopes": ["note"]}
+    prepared = core.validate_request("search", request)
+    request["queries"][0] = "absentword"
+    request["scopes"].clear()
+    assert core.search(prepared).payload["results"]
+    with pytest.raises(InvalidRequestError):
+        core.read_bundle(prepared)
+    other = RetrievalCore(core.store, core.limits)
+    with pytest.raises(InvalidRequestError):
+        other.search(prepared)
+    with pytest.raises(InvalidRequestError):
+        core.search({"queries": []})
+
+
+def test_close_waits_for_active_database_read(open_core, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    core = open_core(parts("note", "A", ("quasar",)))
+    entered, release, closing, closed = (threading.Event() for _ in range(4))
+    original = core.store._fuse
+
+    def paused(*args):
+        entered.set()
+        assert release.wait(3)
+        return original(*args)
+
+    def close():
+        closing.set()
+        core.store.close()
+        closed.set()
+
+    monkeypatch.setattr(core.store, "_fuse", paused)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        reading = pool.submit(core.store.search_lex, ["quasar"])
+        try:
+            assert entered.wait(1)
+            shutdown = pool.submit(close)
+            assert closing.wait(1)
+            assert not closed.wait(0.03)
+        finally:
+            release.set()
+        assert reading.result(timeout=1).results
+        shutdown.result(timeout=1)
+    with pytest.raises(IndexUnavailableError):
+        core.status()
