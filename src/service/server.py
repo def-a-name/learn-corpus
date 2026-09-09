@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import ipaddress
+import logging
 import sys
 from pathlib import Path
 
@@ -13,10 +14,30 @@ from src.service.config import load_config
 from src.service.api import create_app
 
 
+class UvicornLifecycleFilter(logging.Filter):
+    """只放行 Uvicorn 的常规启动和停止日志，排除异常详情。"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.levelno == logging.INFO and not record.exc_info and not record.stack_info and record.msg in (
+            "Started server process [%d]",
+            "Waiting for application startup.",
+            "Application startup complete.",
+            "Uvicorn running on %s://%s:%d (Press CTRL+C to quit)",
+            "Uvicorn running on %s://[%s]:%d (Press CTRL+C to quit)",
+            "Shutting down",
+            "Waiting for connections to close. (CTRL+C to force quit)",
+            "Waiting for background tasks to complete. (CTRL+C to force quit)",
+            "Waiting for application shutdown.",
+            "Application shutdown complete.",
+            "Finished server process [%d]",
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Serve the read-only retrieval HTTP API")
     parser.add_argument("--config", type=Path, required=True, help="Path to the service JSON configuration")
-    parser.add_argument("--host", required=True, help="Exact LAN or loopback address to bind")
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="Exact LAN or loopback address to bind (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, required=True, help="TCP port to bind")
     arguments = parser.parse_args()
     try:
@@ -26,22 +47,29 @@ def main() -> int:
         if not 1 <= arguments.port <= 65535:
             raise ValueError("port is invalid")
         config = load_config(arguments.config)
-    except ValueError:
-        print("Service configuration is invalid", file=sys.stderr)
+    except ValueError as e:
+        print(f"Service configuration is invalid: {e}", file=sys.stderr)
         return 2
 
-    # 仅输出应用的字段白名单日志，关闭默认 access 和 traceback 日志。
+    # 保留 Uvicorn 正常生命周期日志，关闭默认 access 和异常详情日志。
     log_config = {
         "version": 1, "disable_existing_loggers": False,
-        "formatters": {"safe": {"format": "%(message)s"}},
+        "filters": {"lifecycle": {"()": UvicornLifecycleFilter}},
+        "formatters": {
+            "safe": {"format": "%(message)s"},
+            "uvicorn": {"()": "uvicorn.logging.DefaultFormatter", "fmt": "%(levelprefix)s %(message)s",
+                        "use_colors": False},
+        },
         "handlers": {
             "safe": {"class": "logging.StreamHandler", "formatter": "safe", "stream": "ext://sys.stdout"},
             "discard": {"class": "logging.NullHandler"},
+            "lifecycle": {"class": "logging.StreamHandler", "formatter": "uvicorn",
+                          "filters": ["lifecycle"], "stream": "ext://sys.stderr"},
         },
         "loggers": {
             "learn_corpus.service": {"handlers": ["safe"], "level": "INFO", "propagate": False},
             "uvicorn": {"handlers": ["discard"], "propagate": False},
-            "uvicorn.error": {"handlers": ["discard"], "propagate": False},
+            "uvicorn.error": {"handlers": ["lifecycle"], "level": "INFO", "propagate": False},
             "uvicorn.access": {"handlers": ["discard"], "propagate": False},
         },
     }

@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import hashlib
+import base64
+import binascii
 import hmac
 import re
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 ERRORS = {
@@ -46,39 +47,52 @@ def positive_integer(value: object) -> bool:
 
 @dataclass(frozen=True)
 class Credential:
-    client_id: str
-    key_id: str
-    secret_sha256: str
+    cid: str
+    key: str
+    secret: str = field(repr=False)
 
     def __post_init__(self):
         if (
-            any(not isinstance(v, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", v) is None
-                for v in (self.client_id, self.key_id))
-            or not isinstance(self.secret_sha256, str)
-            or re.fullmatch(r"[0-9a-f]{64}", self.secret_sha256) is None
+            not isinstance(self.cid, str) or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", self.cid) is None
+            or not isinstance(self.key, str)
+            or re.fullmatch(re.escape(self.cid) + r"_key_[0-9]{1,10}", self.key) is None
+            or not isinstance(self.secret, str)
+            or re.fullmatch(r"[A-Za-z0-9_-]{32,64}", self.secret) is None
         ):
             raise ValueError("credential configuration is invalid")
 
 
 class BearerVerifier:
-    """验证 key_id.secret；同客户端的新旧 key 共用并发身份。"""
+    """验证 Base64URL(key.secret)；同一 cid 的多个 key 共用并发身份。"""
 
     def __init__(self, credentials: tuple[Credential, ...]):
-        if not credentials or len({value.key_id for value in credentials}) != len(credentials):
+        if not credentials or len({value.key for value in credentials}) != len(credentials):
             raise ValueError("credentials must contain unique keys")
-        self._keys = {value.key_id: value for value in credentials}
-        self.client_ids = frozenset(value.client_id for value in credentials)
+        self._keys = {value.key: value for value in credentials}
+        self.client_ids = frozenset(value.cid for value in credentials)
 
     def authenticate(self, authorization: str | None) -> Credential:
         match = re.fullmatch(
-            r"(?i:Bearer) ([A-Za-z0-9_-]{1,64})\.([A-Za-z0-9_-]{43})", authorization or ""
+            r"(?i:Bearer) ([A-Za-z0-9_-]{1,192}={0,2})", authorization or ""
         )
         if match is None:
             raise HTTPFailure("unauthorized")
-        credential = self._keys.get(match[1])
-        actual = hashlib.sha256(match[2].encode("ascii")).digest()
-        expected = bytes.fromhex(credential.secret_sha256) if credential else bytes(32)
-        matched = hmac.compare_digest(actual, expected)
+        encoded = match[1]
+        try:
+            raw = base64.b64decode(encoded + "=" * (-len(encoded) % 4), altchars=b"-_", validate=True)
+            canonical = base64.urlsafe_b64encode(raw).decode("ascii")
+            # 接受规范的有填充或无填充编码，拒绝冗余填充与非零尾部位。
+            if encoded not in (canonical, canonical.rstrip("=")):
+                raise ValueError("invalid token encoding")
+            key, secret = raw.decode("ascii").split(".")
+            if (re.fullmatch(r"[A-Za-z0-9_-]{1,64}_key_[0-9]{1,10}", key) is None
+                    or re.fullmatch(r"[A-Za-z0-9_-]{32,64}", secret) is None):
+                raise ValueError("invalid token format")
+        except (ValueError, UnicodeError, binascii.Error):
+            raise HTTPFailure("unauthorized") from None
+        credential = self._keys.get(key)
+        expected = credential.secret if credential else "0" * len(secret)
+        matched = hmac.compare_digest(secret, expected)
         if not matched or credential is None:
             raise HTTPFailure("unauthorized")
         return credential

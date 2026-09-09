@@ -444,11 +444,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Build and optionally publish a lexical index.")
     parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
     parser.add_argument("--manifest", type=Path)
-    parser.add_argument("--retrieval-root", type=Path)
+    parser.add_argument("--retrieval-root", type=Path, help="Index directory (default: <repo-root>/meta/corpus)")
     parser.add_argument("--publish", action="store_true")
     args = parser.parse_args()
     repo_root = args.repo_root.resolve()
-    retrieval_root = args.retrieval_root or (repo_root / "meta" / "retrieval")
+    retrieval_root = args.retrieval_root or (repo_root / "meta" / "corpus")
     projection = project_corpus(repo_root, args.manifest)
     generation = build_generation(projection, retrieval_root)
     publication = publish_generation(retrieval_root, generation.generation) if args.publish else None

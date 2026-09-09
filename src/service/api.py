@@ -21,6 +21,7 @@ from starlette.responses import Response
 from src.retrieval.lexical_store import LexicalStore, LexicalStoreError
 from src.retrieval.public_core import RetrievalCore
 from src.service.config import RestConfig, load_credentials, strict_json
+from src.service.openapi import build_openapi
 from src.service.security import (
     Admissions, BearerVerifier, ERRORS, HTTPFailure,
 )
@@ -32,6 +33,8 @@ _ROUTES = {
     "/v1/status": ("GET", "status"),
     "/v1/search": ("POST", "search"),
     "/v1/read-bundle": ("POST", "read_bundle"),
+    "/docs": ("GET", "docs"),
+    "/openapi.json": ("GET", "openapi"),
 }
 
 
@@ -155,10 +158,12 @@ class RestBoundary:
             method, operation = route
             if scope["method"] != method:
                 raise HTTPFailure("method_not_allowed", headers={"Allow": method})
-            if operation != "health":
+            if operation not in {"health", "docs", "openapi"}:
                 credential = self.state.verifier.authenticate(headers.get("authorization"))
-                client_id = credential.client_id
+                client_id = credential.cid
                 admission_key = "client:" + client_id
+            else:
+                admission_key = operation
             if scope.get("query_string"):
                 raise HTTPFailure("invalid_request")
             if "content-encoding" in headers:
@@ -202,18 +207,18 @@ class RestBoundary:
                 "error_category": code, "duration_ms": round((monotonic() - started) * 1000, 3),
             }
             if credential:
-                event["key_id"] = credential.key_id
+                event["key"] = credential.key
             _LOG.info(json.dumps(event, separators=(",", ":")))
 
 
 def create_app(config: RestConfig) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app):
-        # 启动失败不保留半初始化 store；配置文件中仅保存随机凭据的 verifier。
+        # 启动失败不保留半初始化 store；凭据文件必须限制读取权限。
         store = None
         try:
             app.state.verifier = BearerVerifier(load_credentials(config.credentials_file))
-            store = await anyio.to_thread.run_sync(LexicalStore.open_current, config.retrieval_root)
+            store = await anyio.to_thread.run_sync(LexicalStore.open_current, config.corpus_path)
             app.state.core = RetrievalCore(store, config.response_limits)
             app.state.admissions = Admissions(config.global_concurrency, config.client_concurrency)
             app.state.workers = anyio.CapacityLimiter(config.global_concurrency)
@@ -226,7 +231,10 @@ def create_app(config: RestConfig) -> FastAPI:
             if store is not None:
                 await anyio.to_thread.run_sync(store.close)
 
-    app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None,
+    app = FastAPI(title="Learn Corpus HTTP API", version="1.0.0",
+                  lifespan=lifespan, docs_url="/docs", redoc_url=None, openapi_url="/openapi.json",
+                  swagger_ui_oauth2_redirect_url=None,
+                  swagger_ui_parameters={"validatorUrl": None, "persistAuthorization": False},
                   redirect_slashes=False)
     app.add_middleware(RestBoundary, config=config, state=app.state)
 
@@ -281,4 +289,8 @@ def create_app(config: RestConfig) -> FastAPI:
     async def read_bundle(request: Request):
         return await execute(request, "read_bundle")
 
+    # 显式提供 schema，避免 FastAPI 根据 Request/Response 签名生成空的契约。
+    # 文档元数据不参与运行期校验，成功响应继续使用 core 的原始 JSON 字节。
+    schema = build_openapi()
+    app.openapi = lambda: schema
     return app

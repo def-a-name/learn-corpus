@@ -75,7 +75,7 @@ def strict_json(raw: bytes, *, max_keys: int, max_array_items: int) -> object:
 
 @dataclass(frozen=True)
 class RestConfig:
-    retrieval_root: Path
+    corpus_path: Path
     credentials_file: Path
     allowed_peers: tuple[str, ...]
     trusted_proxies: tuple[str, ...]
@@ -112,7 +112,7 @@ class RestConfig:
 
 
 def load_credentials(path: Path) -> tuple[Credential, ...]:
-    """启动时读取受限 verifier 文件；轮换或撤销通过替换配置并重启生效。"""
+    """启动时读取受限凭据文件；轮换或撤销通过替换配置并重启生效。"""
 
     try:
         with path.open("rb") as stream:
@@ -141,7 +141,7 @@ def load_config(path: Path) -> RestConfig:
         value = strict_json(raw, max_keys=4096, max_array_items=1024)
         if not isinstance(value, dict):
             raise ValueError("configuration must be an object")
-        for name in ("retrieval_root", "credentials_file"):
+        for name in ("corpus_path", "credentials_file"):
             if not isinstance(value[name], str) or not value[name]:
                 raise ValueError("configuration path is invalid")
             candidate = Path(value[name])
