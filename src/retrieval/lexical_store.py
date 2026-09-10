@@ -768,8 +768,8 @@ class LexicalStore:
 
         def key(item_id: str) -> tuple[Fraction, int, int, str]:
             score = sum(
-                Fraction(2 if index == 0 else 1, RRF_K + ranking[item_id])
-                for index, ranking in enumerate(rankings)
+                Fraction(1, RRF_K + ranking[item_id])
+                for ranking in rankings
                 if item_id in ranking
             )
             primary = rankings[0].get(item_id, CANDIDATE_LIMIT + 1)

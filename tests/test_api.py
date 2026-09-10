@@ -607,3 +607,44 @@ def test_failed_core_call_releases_concurrency(config, monkeypatch):
         assert client.app.state.admissions._total == 0
         monkeypatch.setattr(client.app.state.core, "status", original)
         assert client.get("/v1/status", headers=HEADERS).status_code == 200
+
+
+def test_openapi_error_examples_match_runtime_responses():
+    from src.service.api import error_response
+    from src.service.openapi import build_openapi
+    from src.service.security import ERRORS, HTTPFailure
+
+    schema = build_openapi()
+    for methods in schema['paths'].values():
+        for operation in methods.values():
+            for status, response in operation['responses'].items():
+                if status == '200':
+                    continue
+                examples = response['content']['application/json']['examples']
+                expected_codes = {code for code, (value, _) in ERRORS.items() if value == int(status)}
+                if status == '431':
+                    expected_codes = {'request_too_large'}
+                assert set(examples) == expected_codes
+                for code, example in examples.items():
+                    body = example['value']
+                    actual = error_response(HTTPFailure(code, status=int(status)), body['error']['request_id'])
+                    assert actual.status_code == int(status)
+                    assert json.loads(actual.body) == body
+
+
+def test_openapi_search_examples_follow_query_contract(config):
+    from src.service.openapi import build_openapi
+    from src.retrieval.lexical_query import compile_lexical_query
+
+    operation = build_openapi()['paths']['/v1/search']['post']
+    examples = operation['requestBody']['content']['application/json']['examples']
+    combined = examples['multiple_keywords']['value']['queries']
+    independent = examples['multiple_queries']['value']['queries']
+    assert len(combined) == 1
+    assert compile_lexical_query(combined[0]).anchor_count == 2
+    assert ' AND ' in compile_lexical_query(combined[0]).match_expression
+    assert len(independent) == 2
+    with client_for(config) as client:
+        for example in examples.values():
+            response = client.post('/v1/search', json=example['value'], headers=HEADERS)
+            assert response.status_code == 200

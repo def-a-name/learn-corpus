@@ -9,7 +9,7 @@ PROJECTION_SCHEMA_VERSION = "item-projection-v1"
 CHUNK_POLICY_VERSION = "evidence-chunk-v2"
 LEXICAL_SCHEMA_VERSION = "lexical-schema-v1"
 QUERY_POLICY_VERSION = "qmd-style-v1"
-RANKING_POLICY_VERSION = "bm25-rrf-v1"
+RANKING_POLICY_VERSION = "bm25-rrf-v2"
 ESTIMATOR_VERSION = "evidence-estimator-v1"
 
 SUPPORTED_SCOPES = ("conversation", "note", "article")

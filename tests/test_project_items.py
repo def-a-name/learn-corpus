@@ -111,7 +111,7 @@ def conversation_body(provider: str, session: str, human: str, assistant: str) -
 class TestItemProjector:
     def test_estimator_and_stable_id_contract(self) -> None:
         assert CHUNK_POLICY_VERSION == "evidence-chunk-v2"
-        assert RANKING_POLICY_VERSION == "bm25-rrf-v1"
+        assert RANKING_POLICY_VERSION == "bm25-rrf-v2"
         assert estimate_evidence_tokens("abcdef") == 2
         assert estimate_evidence_tokens("中文") == 4
         assert estimate_evidence_tokens("🙂") == 2

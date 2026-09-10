@@ -238,7 +238,7 @@ class TestLexicalIndexBuilder:
         assert second.built_at == "2026-09-02T01:02:03Z"
         assert manifest_before == manifest_after
         assert manifest["chunk_policy_version"] == CHUNK_POLICY_VERSION
-        assert manifest["ranking_policy_version"] == "bm25-rrf-v1"
+        assert manifest["ranking_policy_version"] == "bm25-rrf-v2"
         assert manifest["source_digest"] == projection.source_digest
         assert set(manifest) == \
             {

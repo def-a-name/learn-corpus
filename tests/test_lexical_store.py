@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sys
 import tempfile
 from dataclasses import replace
@@ -100,7 +101,7 @@ class TestLexicalStore:
         assert all(result.source_type == "note" for result in response.results)
         assert response.results[0].snippet in title_hit.body
 
-    def test_weighted_rrf_merges_duplicate_items_and_is_stable(self) -> None:
+    def test_equal_weight_rrf_merges_duplicate_items_and_is_stable(self) -> None:
         first = "itm_" + "a" * 32
         both = "itm_" + "b" * 32
         second = "itm_" + "c" * 32
@@ -108,6 +109,18 @@ class TestLexicalStore:
 
         assert LexicalStore._fuse(rankings, 3) == (both, first, second)
         assert LexicalStore._fuse(rankings, 3) == LexicalStore._fuse(rankings, 3)
+
+    def test_rrf_gives_each_query_equal_weight_and_preserves_primary_tie_break(self) -> None:
+        first = "itm_" + "a" * 32
+        second = "itm_" + "b" * 32
+        # 次查询第 1 名应超过首查询第 2 名；旧的首查询双倍权重会反转结果。
+        rankings = ({first: 2}, {second: 1})
+        assert LexicalStore._fuse(rankings, 2) == (second, first)
+        assert LexicalStore._fuse(tuple(reversed(rankings)), 2) == (second, first)
+        # 等权不改变既有同分规则，仍优先首查询中的排名。
+        tied = ({first: 1}, {second: 1})
+        assert LexicalStore._fuse(tied, 2) == (first, second)
+        assert LexicalStore._fuse(tuple(reversed(tied)), 2) == (second, first)
 
     def test_multi_query_search_returns_each_item_once(self) -> None:
         both = make_item("both", "note", "alpha beta", title="Both")
@@ -251,5 +264,19 @@ class TestLexicalStore:
 
         assert status.generation == "gen_" + "6" * 20
         assert status.item_counts == {"article": 1, "conversation": 0, "note": 0}
+        assert status.ranking_policy_version == "bm25-rrf-v2"
         assert not status.semantic_search
         assert status.supported_scopes == ("conversation", "note", "article")
+
+
+    def test_old_ranking_policy_generation_is_rejected(self, tmp_path) -> None:
+        item = make_item("old-policy", "note", "synthetic ranking policy body")
+        with published_store(tmp_path, "7", item):
+            pass
+        manifest_path = tmp_path / "current" / "generation.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["ranking_policy_version"] = "bm25-rrf-v1"
+        manifest_path.write_text(json.dumps(manifest))
+        with pytest.raises(IndexUnavailableError) as error:
+            LexicalStore.open_current(tmp_path)
+        assert "ranking_policy_version mismatch" in str(error.value.__cause__)
