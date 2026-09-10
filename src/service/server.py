@@ -36,13 +36,13 @@ class UvicornLifecycleFilter(logging.Filter):
 def main() -> int:
     parser = argparse.ArgumentParser(description="Serve the read-only retrieval HTTP API")
     parser.add_argument("--config", type=Path, required=True, help="Path to the service JSON configuration")
-    parser.add_argument("--host", default="127.0.0.1",
-                        help="Exact LAN or loopback address to bind (default: 127.0.0.1)")
-    parser.add_argument("--port", type=int, required=True, help="TCP port to bind")
+    parser.add_argument("--host", default="0.0.0.0",
+                        help="IP address to bind (default: 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=2699, help="TCP port to bind (default: 2699)")
     arguments = parser.parse_args()
     try:
         address = ipaddress.ip_address(arguments.host)
-        if address.is_unspecified or address.is_multicast or not address.is_private:
+        if str(address) != "0.0.0.0" and (address.is_unspecified or address.is_multicast or not address.is_private):
             raise ValueError("bind address is not private")
         if not 1 <= arguments.port <= 65535:
             raise ValueError("port is invalid")

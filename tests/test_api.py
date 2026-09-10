@@ -484,12 +484,15 @@ def test_request_cancellation_keeps_admission_until_worker_finishes(config, monk
     anyio.run(exercise)
 
 
-@pytest.mark.parametrize("host_args, expected_host", [
-    ([], "127.0.0.1"),
-    (["--host", "192.168.123.45"], "192.168.123.45"),
+@pytest.mark.parametrize("bind_args, expected_host, expected_port", [
+    ([], "0.0.0.0", 2699),
+    (["--host", "192.168.123.45"], "192.168.123.45", 2699),
+    (["--port", "8765"], "0.0.0.0", 8765),
+    (["--host", "127.0.0.1", "--port", "8765"], "127.0.0.1", 8765),
+    (["--host", "0.0.0.0"], "0.0.0.0", 2699),
 ])
 def test_config_loader_and_launcher_preserve_trust_boundary(config, tmp_path, monkeypatch,
-                                                           host_args, expected_host):
+                                                           bind_args, expected_host, expected_port):
     from dataclasses import asdict
     from src.service.config import load_config
     from src.service import server
@@ -503,9 +506,10 @@ def test_config_loader_and_launcher_preserve_trust_boundary(config, tmp_path, mo
     assert load_config(path).corpus_path == tmp_path / "synthetic-retrieval"
     calls = []
     monkeypatch.setattr(server.uvicorn, "run", lambda app, **kwargs: calls.append(kwargs))
-    monkeypatch.setattr("sys.argv", ["server", "--config", str(path), "--port", "8765", *host_args])
+    monkeypatch.setattr("sys.argv", ["server", "--config", str(path), *bind_args])
     assert server.main() == 0
     assert calls[0]["host"] == expected_host
+    assert calls[0]["port"] == expected_port
     assert calls[0]["workers"] == 1 and calls[0]["proxy_headers"] is False
     assert calls[0]["access_log"] is False and calls[0]["server_header"] is False
     log_config = calls[0]["log_config"]
