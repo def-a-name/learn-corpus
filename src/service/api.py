@@ -22,6 +22,7 @@ from src.retrieval.lexical_store import LexicalStore, LexicalStoreError
 from src.retrieval.public_core import RetrievalCore
 from src.service.config import RestConfig, load_credentials, strict_json
 from src.service.openapi import build_openapi
+from src.service import mcp
 from src.service.security import (
     Admissions, BearerVerifier, ERRORS, HTTPFailure,
 )
@@ -29,6 +30,7 @@ from src.service.security import (
 
 _LOG = logging.getLogger("learn_corpus.service")
 _ROUTES = {
+    "/mcp": ("POST", "mcp"),
     "/healthz": ("GET", "health"),
     "/v1/status": ("GET", "status"),
     "/v1/search": ("POST", "search"),
@@ -65,7 +67,8 @@ def headers_and_source(scope, config: RestConfig):
         raise HTTPFailure("request_too_large", status=431)
     headers = {}
     singletons = {"host", "origin", "authorization", "content-type", "content-length",
-                  "content-encoding", "transfer-encoding", "x-forwarded-for"}
+                  "content-encoding", "transfer-encoding", "x-forwarded-for",
+                  "accept", "mcp-protocol-version", "mcp-session-id"}
     try:
         for raw_key, raw_value in raw:
             key = raw_key.decode("ascii").lower()
@@ -86,8 +89,7 @@ def headers_and_source(scope, config: RestConfig):
     return headers, source
 
 
-async def receive_body(receive, headers, config: RestConfig) -> bytes:
-    maximum = 16 * 1024
+async def receive_body(receive, headers, config: RestConfig, *, maximum=16 * 1024) -> bytes:
     length = headers.get("content-length")
     if length is not None:
         if not length.isascii() or not length.isdigit() or len(length) > 20:
@@ -170,9 +172,15 @@ class RestBoundary:
                 raise HTTPFailure("unsupported_media_type")
             if method == "POST" and headers.get("content-type", "").lower() != "application/json":
                 raise HTTPFailure("unsupported_media_type")
-            raw = await receive_body(receive, headers, self.config)
+            raw = await receive_body(receive, headers, self.config,
+                                     maximum=32 * 1024 if operation == "mcp" else 16 * 1024)
             values = None
-            if method == "GET":
+            if operation == "mcp":
+                message = mcp.prepare(raw, headers, self.config, self.state.core)
+                scope["state"]["mcp_message"] = message
+                operation = message[2] or message[0]
+                values = message[3]
+            elif method == "GET":
                 if raw:
                     raise HTTPFailure("invalid_request")
             else:
@@ -185,6 +193,11 @@ class RestBoundary:
             code = "ok"
             await self.app(scope, receive, tracked_send)
             code = scope["state"].get("error_code", code)
+        except mcp.RPCFailure as exc:
+            status, code = 400, "invalid_request"
+            if not sent:
+                await mcp.rpc_response(exc.rpc_id, error={"code": exc.code, "message": exc.message},
+                                       status=400)(scope, receive, tracked_send)
         except HTTPFailure as exc:
             status, code = exc.status, exc.code
             if not sent:
@@ -203,7 +216,8 @@ class RestBoundary:
                 self.state.admissions.release(admission_key)
             event = {
                 "timestamp": datetime.now(timezone.utc).isoformat(), "request_id": request_id,
-                "transport": "rest", "operation": operation, "status": status,
+                "transport": "mcp" if scope["path"] == "/mcp" else "rest",
+                "operation": operation, "status": status,
                 "error_category": code, "duration_ms": round((monotonic() - started) * 1000, 3),
             }
             if credential:
@@ -249,7 +263,7 @@ def create_app(config: RestConfig) -> FastAPI:
         request.state.error_code = code
         return error_response(HTTPFailure(code), request.state.request_id)
 
-    async def execute(request, operation):
+    async def run_core(request, operation):
         function = getattr(app.state.core, operation)
         args = () if operation == "status" else (request.state.retrieval_values,)
         kwargs = {} if operation == "status" else {"request_id": request.state.request_id}
@@ -271,7 +285,15 @@ def create_app(config: RestConfig) -> FastAPI:
                 if not worker.cancelled():
                     worker.exception()
             raise
+        return result
+
+    async def execute(request, operation):
+        result = await run_core(request, operation)
         return Response(result.json_bytes, media_type="application/json")
+
+    @app.post("/mcp", include_in_schema=False)
+    async def mcp_endpoint(request: Request):
+        return await mcp.dispatch(request, run_core)
 
     @app.get("/healthz")
     async def health():

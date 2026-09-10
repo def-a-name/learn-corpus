@@ -109,7 +109,7 @@ def test_bad_credentials_share_safe_response(config, header):
         assert_error(client.get("/v1/status", headers=headers), 401, "unauthorized")
 
 
-@pytest.mark.parametrize("path", ["/redoc", "/docs/oauth2-redirect", "/docs/", "/mcp", "/v1/read", "/v1/search/"])
+@pytest.mark.parametrize("path", ["/redoc", "/docs/oauth2-redirect", "/docs/", "/v1/read", "/v1/search/"])
 def test_only_declared_exact_routes_are_exposed(config, path):
     with client_for(config) as client:
         assert_error(client.get(path, headers=HEADERS), 404, "not_found")
@@ -453,7 +453,8 @@ def test_raw_asgi_body_timeout_and_duplicate_headers_return_error_json(config):
     anyio.run(exercise)
 
 
-def test_request_cancellation_keeps_admission_until_worker_finishes(config, monkeypatch):
+@pytest.mark.parametrize("transport", ["rest", "mcp"])
+def test_request_cancellation_keeps_admission_until_worker_finishes(config, monkeypatch, transport):
     async def exercise():
         app = create_app(config)
         async with app.router.lifespan_context(app):
@@ -464,11 +465,20 @@ def test_request_cancellation_keeps_admission_until_worker_finishes(config, monk
                 assert release.wait(2)
                 return original(*args, **kwargs)
             monkeypatch.setattr(app.state.core, "search", block)
+            scope = raw_scope()
+            body = b'{"queries":["quasar"]}'
+            if transport == "mcp":
+                scope = raw_scope("/mcp", extra_headers=(
+                    (b"accept", b"application/json, text/event-stream"),
+                    (b"mcp-protocol-version", b"2025-06-18"),
+                ))
+                body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                                   "params": {"name": "search_sources", "arguments": {"queries": ["quasar"]}}}).encode()
             async def receive():
-                return {"type": "http.request", "body": b'{"queries":["quasar"]}'}
+                return {"type": "http.request", "body": body}
             async def send(_):
                 pass
-            task = asyncio.create_task(app(raw_scope(), receive, send))
+            task = asyncio.create_task(app(scope, receive, send))
             try:
                 with anyio.fail_after(1):
                     while not entered.is_set():
