@@ -28,7 +28,7 @@ from src.ingestion.import_web_chat import iter_web_chat_units
 from src.ingestion.import_web_chat import load_review_resolutions as load_web_chat_review_resolutions
 from src.ingestion.import_web_chat import unit_inventory_record as web_chat_unit_inventory_record
 from src.ingestion.import_web_chat import unit_skip_reason as web_chat_unit_skip_reason
-from src.shared.corpus_core import MANIFEST_PATH, REPO_ROOT, load_manifest, sha256_file
+from src.corpus.core import MANIFEST_PATH, REPO_ROOT, load_manifest, sha256_file
 
 
 DEFAULT_NOTES_INPUT = REPO_ROOT.parent / "notes"

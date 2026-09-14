@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from src.shared.corpus_core import REPO_ROOT
+from src.corpus.core import REPO_ROOT
 
 
 ALLOW_MARKER = "secret-scan: allow"

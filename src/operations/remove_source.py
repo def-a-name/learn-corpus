@@ -7,14 +7,14 @@ import argparse
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from src.shared.corpus_core import (
+from src.corpus.core import (
     REPO_ROOT,
     load_manifest,
     parse_frontmatter,
     save_manifest,
     sha256_file,
 )
-from src.shared.ingest_log import SourceChangeTracker
+from src.corpus.ingest_log import SourceChangeTracker
 
 
 _SOURCE_ROOTS = {

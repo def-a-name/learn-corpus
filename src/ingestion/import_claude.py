@@ -11,8 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from src.shared.ingest_log import SourceChangeTracker
-from src.shared.corpus_core import (
+from src.corpus.ingest_log import SourceChangeTracker
+from src.corpus.core import (
     CLAUDE_ASSISTANT_FINAL_DETECTION,
     CLAUDE_IMPORTER_VERSION,
     MANIFEST_PATH,

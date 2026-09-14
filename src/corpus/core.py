@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Learn Corpus 导入和维护脚本共用工具。"""
+"""标准化 corpus 的基础格式、状态与文件工具。"""
 
 from __future__ import annotations
 

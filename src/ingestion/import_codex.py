@@ -11,8 +11,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-from src.shared.ingest_log import SourceChangeTracker
-from src.shared.corpus_core import (
+from src.corpus.ingest_log import SourceChangeTracker
+from src.corpus.core import (
     CODEX_ASSISTANT_FINAL_DETECTION,
     CODEX_IMPORTER_VERSION,
     MANIFEST_PATH,

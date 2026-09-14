@@ -14,8 +14,8 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import unquote, urlsplit
 
-from src.shared.ingest_log import SourceChangeTracker
-from src.shared.corpus_core import (
+from src.corpus.ingest_log import SourceChangeTracker
+from src.corpus.core import (
     MANIFEST_PATH,
     REPO_ROOT,
     WEB_CHAT_ASSISTANT_FINAL_DETECTION,

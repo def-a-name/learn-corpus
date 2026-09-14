@@ -8,7 +8,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from src.shared.corpus_core import (  # noqa: E402
+from src.corpus.core import (  # noqa: E402
     clean_message,
     derive_title,
     format_line_locator,

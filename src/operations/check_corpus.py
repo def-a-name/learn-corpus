@@ -9,8 +9,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from src.shared.ingest_log import check_ingest_log
-from src.shared.corpus_core import (
+from src.corpus.ingest_log import check_ingest_log
+from src.corpus.core import (
     ALLOWED_CURATION_STATUSES,
     ALLOWED_INGEST_STATUSES,
     CLAUDE_ASSISTANT_FINAL_DETECTION,

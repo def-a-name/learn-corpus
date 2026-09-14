@@ -9,7 +9,7 @@ import shlex
 from pathlib import Path
 from typing import Any
 
-from src.shared.corpus_core import MANIFEST_PATH, REPO_ROOT, load_manifest, parse_line_locator
+from src.corpus.core import MANIFEST_PATH, REPO_ROOT, load_manifest, parse_line_locator
 
 
 DEFAULT_INVENTORY = REPO_ROOT / "meta" / "source-inventory.json"

@@ -28,7 +28,7 @@ from src.retrieval.contracts import (
     SourceSnapshot,
 )
 from src.retrieval.text import estimate_evidence_tokens
-from src.shared.corpus_core import MANIFEST_PATH, REPO_ROOT, parse_frontmatter, parse_line_locator
+from src.corpus.core import MANIFEST_PATH, REPO_ROOT, parse_frontmatter, parse_line_locator
 
 TARGET_MIN_TOKENS = 400
 TARGET_MAX_TOKENS = 600

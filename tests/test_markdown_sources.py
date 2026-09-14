@@ -15,7 +15,7 @@ from src.ingestion.import_articles import import_articles  # noqa: E402
 from src.ingestion.import_notes import import_notes  # noqa: E402
 from src.ingestion.markdown_sources import content_fingerprint  # noqa: E402
 from src.operations.check_corpus import check_source_consistency  # noqa: E402
-from src.shared.corpus_core import parse_frontmatter  # noqa: E402
+from src.corpus.core import parse_frontmatter  # noqa: E402
 
 
 # 本模块只使用 example.test 和虚构观测内容构造来源样例。

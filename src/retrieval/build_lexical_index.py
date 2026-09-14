@@ -38,7 +38,7 @@ from src.retrieval.generation import (
 )
 from src.retrieval.project_items import project_corpus
 from src.retrieval.text import estimate_evidence_tokens, normalize_index_text
-from src.shared.corpus_core import REPO_ROOT
+from src.corpus.core import REPO_ROOT
 
 
 _ITEM_ID = re.compile(r"^itm_[a-z2-7]{32}$")

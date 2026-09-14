@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from src.shared.corpus_core import (
+from src.corpus.core import (
     ALLOWED_CURATION_STATUSES,
     ALLOWED_INGEST_STATUSES,
     MANIFEST_PATH,
