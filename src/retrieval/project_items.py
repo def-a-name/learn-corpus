@@ -28,7 +28,8 @@ from src.retrieval.contracts import (
     SourceSnapshot,
 )
 from src.retrieval.text import estimate_evidence_tokens
-from src.corpus.core import MANIFEST_PATH, REPO_ROOT, parse_frontmatter, parse_line_locator
+from src.corpus.document import parse_frontmatter, parse_line_locator
+from src.corpus.paths import MANIFEST_PATH, REPO_ROOT
 from src.corpus.scopes import SOURCE_ROOTS
 
 TARGET_MIN_TOKENS = 400

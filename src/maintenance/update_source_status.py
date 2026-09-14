@@ -6,14 +6,14 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from src.corpus.core import (
+from src.corpus.manifest import (
     ALLOWED_CURATION_STATUSES,
     ALLOWED_INGEST_STATUSES,
-    MANIFEST_PATH,
     load_manifest,
     save_manifest,
     utc_now,
 )
+from src.corpus.paths import MANIFEST_PATH
 
 
 def main() -> None:

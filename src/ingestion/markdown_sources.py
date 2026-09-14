@@ -14,24 +14,20 @@ from urllib.parse import unquote, urlsplit
 import yaml
 
 from src.corpus.ingest_log import SourceChangeTracker
+from src.corpus.document import yaml_document
+from src.corpus.manifest import load_manifest, save_manifest, utc_now
+from src.corpus.paths import MANIFEST_PATH, REPO_ROOT, relative_to_repo
 from src.corpus.storage import (
     atomic_copy_file,
     atomic_write_text,
     registered_assets_are_current,
-)
-from src.corpus.core import (
-    MANIFEST_PATH,
-    MARKDOWN_SOURCE_IMPORTER_VERSION,
-    REPO_ROOT,
-    load_manifest,
-    redact_secrets,
-    relative_to_repo,
-    save_manifest,
     sha256_file,
     sha256_text,
+)
+from src.ingestion.common import (
+    MARKDOWN_SOURCE_IMPORTER_VERSION,
+    redact_secrets,
     source_needs_redaction,
-    utc_now,
-    yaml_document,
 )
 
 

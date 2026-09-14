@@ -6,7 +6,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from src.corpus.core import MANIFEST_PATH, load_manifest
+from src.corpus.manifest import load_manifest
+from src.corpus.paths import MANIFEST_PATH
 
 
 def main() -> None:

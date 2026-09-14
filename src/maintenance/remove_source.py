@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from src.corpus.core import REPO_ROOT
+from src.corpus.paths import REPO_ROOT
 from src.corpus.removal import SourceRemovalError, remove_source
 
 

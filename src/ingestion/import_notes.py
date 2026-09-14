@@ -7,7 +7,7 @@ import argparse
 from pathlib import Path
 
 from src.ingestion.markdown_sources import MarkdownPolicy, import_markdown_sources, print_stats
-from src.corpus.core import MANIFEST_PATH, REPO_ROOT
+from src.corpus.paths import MANIFEST_PATH, REPO_ROOT
 
 
 DEFAULT_INPUT = REPO_ROOT.parent / "notes"

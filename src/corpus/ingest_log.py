@@ -14,7 +14,9 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from src.corpus.core import REPO_ROOT, sha256_file, utc_now
+from src.corpus.manifest import utc_now
+from src.corpus.paths import REPO_ROOT
+from src.corpus.storage import sha256_file
 
 
 @dataclass(frozen=True)

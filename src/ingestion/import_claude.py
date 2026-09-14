@@ -12,23 +12,18 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from src.corpus.ingest_log import SourceChangeTracker
-from src.corpus.core import (
+from src.corpus.document import format_line_locator, yaml_document
+from src.corpus.manifest import load_manifest, save_manifest, utc_now
+from src.corpus.paths import MANIFEST_PATH, REPO_ROOT, relative_to_repo
+from src.corpus.storage import sha256_file
+from src.ingestion.common import (
     CLAUDE_ASSISTANT_FINAL_DETECTION,
     CLAUDE_IMPORTER_VERSION,
-    MANIFEST_PATH,
-    REPO_ROOT,
     clean_message,
     derive_title,
-    format_line_locator,
     is_exact_meaningless_exchange,
-    load_manifest,
     redact_secrets,
-    relative_to_repo,
-    save_manifest,
-    sha256_file,
     source_needs_redaction,
-    utc_now,
-    yaml_document,
 )
 
 

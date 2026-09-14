@@ -6,15 +6,12 @@ from __future__ import annotations
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from src.corpus.core import (
-    REPO_ROOT,
-    load_manifest,
-    parse_frontmatter,
-    save_manifest,
-    sha256_file,
-)
+from src.corpus.document import parse_frontmatter
 from src.corpus.ingest_log import SourceChangeTracker
+from src.corpus.manifest import load_manifest, save_manifest
+from src.corpus.paths import REPO_ROOT
 from src.corpus.scopes import SOURCE_ASSET_ROOT, SOURCE_DEPENDENCY_FIELDS, SOURCE_ROOTS
+from src.corpus.storage import sha256_file
 
 
 class SourceRemovalError(ValueError):

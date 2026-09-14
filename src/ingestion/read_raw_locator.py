@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from src.ingestion.import_claude import DEFAULT_INPUT, iter_export_units
-from src.corpus.core import parse_line_locator
+from src.corpus.document import parse_line_locator
 
 
 class LocatorNotFoundError(ValueError):
