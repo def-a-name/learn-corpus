@@ -12,10 +12,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from src.ingestion.build_source_inventory import build_inventory  # noqa: E402
-from src.operations.check_corpus import check_source_consistency  # noqa: E402
-from src.operations.rebuild_review_queue import build_queue  # noqa: E402
+from src.maintenance.check_corpus import check_source_consistency  # noqa: E402
+from src.maintenance.rebuild_review_queue import build_queue  # noqa: E402
 from src.corpus.removal import SourceRemovalError, remove_source  # noqa: E402
-from src.operations.scan_secrets import scan_paths  # noqa: E402
+from src.maintenance.scan_secrets import scan_paths  # noqa: E402
 from src.corpus.core import sha256_file, yaml_document  # noqa: E402
 
 
@@ -25,7 +25,7 @@ def write_jsonl(path: Path, records: list[dict]) -> None:
     path.write_text("\n".join(json.dumps(item, ensure_ascii=False) for item in records) + "\n", encoding="utf-8")
 
 
-class TestOperations:
+class TestMaintenance:
     def test_remove_source_supports_all_markdown_scopes_and_registered_assets(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

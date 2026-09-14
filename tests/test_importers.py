@@ -15,7 +15,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from src.ingestion import import_claude, import_codex  # noqa: E402
 from src.ingestion.read_raw_locator import render_text, resolve_locator  # noqa: E402
-from src.operations.check_corpus import check_source_consistency  # noqa: E402
+from src.maintenance.check_corpus import check_source_consistency  # noqa: E402
 
 
 # 所有会话、路径和标识都是为测试构造的虚构数据。

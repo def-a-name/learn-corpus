@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""更新来源的 ingest 或 curation 状态；不会修改来源正文。"""
+"""提供来源 ingest 或 curation 状态更新命令。"""
 
 from __future__ import annotations
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""提供标准化来源受控删除的命令行入口。"""
+"""提供标准化来源受控删除命令。"""
 
 from __future__ import annotations
 

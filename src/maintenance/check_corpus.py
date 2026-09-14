@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""检查来源与派生状态完整性。"""
+"""提供来源与派生状态完整性检查命令。"""
 
 from __future__ import annotations
 
