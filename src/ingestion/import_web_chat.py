@@ -15,6 +15,11 @@ from typing import Any, Iterable
 from urllib.parse import unquote, urlsplit
 
 from src.corpus.ingest_log import SourceChangeTracker
+from src.corpus.storage import (
+    atomic_copy_file,
+    atomic_write_text,
+    registered_assets_are_current,
+)
 from src.corpus.core import (
     MANIFEST_PATH,
     REPO_ROOT,
@@ -895,32 +900,6 @@ def _render_session(
     return yaml_document(metadata, body), redactions, title
 
 
-def _assets_are_current(records: Any) -> bool:
-    if not isinstance(records, list):
-        return not records
-    for item in records:
-        if not isinstance(item, dict):
-            return False
-        path = REPO_ROOT / str(item.get("stored_path") or "")
-        if not path.is_file() or sha256_file(path) != item.get("asset_hash"):
-            return False
-    return True
-
-
-def _atomic_write(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(content, encoding="utf-8")
-    temporary.replace(path)
-
-
-def _atomic_copy(source: Path, target: Path) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_suffix(target.suffix + ".tmp")
-    temporary.write_bytes(source.read_bytes())
-    temporary.replace(target)
-
-
 def import_web_chats(
     input_dir: Path,
     output_root: Path,
@@ -985,7 +964,7 @@ def import_web_chats(
             == (applied_resolution.content_hash if applied_resolution else None)
             and current.get("importer_version") == WEB_CHAT_IMPORTER_VERSION
             and Path(REPO_ROOT / str(current.get("output_path") or "")).is_file()
-            and _assets_are_current(current.get("assets", []))
+            and registered_assets_are_current(current.get("assets", []))
             and not source_needs_redaction(Path(REPO_ROOT / str(current.get("output_path") or "")))
         )
         if skip_reason:
@@ -1007,8 +986,8 @@ def import_web_chats(
         change_tracker.observe(output_path)
         for asset in assets:
             change_tracker.observe(asset.stored_path)
-            _atomic_copy(asset.raw.source_path, asset.stored_path)
-        _atomic_write(output_path, document)
+            atomic_copy_file(asset.raw.source_path, asset.stored_path)
+        atomic_write_text(output_path, document)
         manifest["version"] = max(int(manifest.get("version", 1)), 2)
         record = {
             "origin": ORIGIN,

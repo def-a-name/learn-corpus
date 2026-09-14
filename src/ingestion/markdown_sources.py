@@ -14,6 +14,11 @@ from urllib.parse import unquote, urlsplit
 import yaml
 
 from src.corpus.ingest_log import SourceChangeTracker
+from src.corpus.storage import (
+    atomic_copy_file,
+    atomic_write_text,
+    registered_assets_are_current,
+)
 from src.corpus.core import (
     MANIFEST_PATH,
     MARKDOWN_SOURCE_IMPORTER_VERSION,
@@ -477,32 +482,6 @@ def _render_document(prepared: PreparedSource, policy: MarkdownPolicy) -> str:
     return yaml_document(metadata, prepared.rendered_body)
 
 
-def _atomic_write_text(path: Path, value: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(value, encoding="utf-8")
-    temporary.replace(path)
-
-
-def _atomic_copy(asset: LocalAsset) -> None:
-    asset.stored_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = asset.stored_path.with_suffix(asset.stored_path.suffix + ".tmp")
-    temporary.write_bytes(asset.source_path.read_bytes())
-    temporary.replace(asset.stored_path)
-
-
-def _assets_are_current(records: Any) -> bool:
-    if not isinstance(records, list):
-        return not records
-    for item in records:
-        if not isinstance(item, dict):
-            return False
-        path = REPO_ROOT / str(item.get("stored_path") or "")
-        if not path.is_file() or sha256_file(path) != item.get("asset_hash"):
-            return False
-    return True
-
-
 def _manifest_record(prepared: PreparedSource, policy: MarkdownPolicy, output_path: Path, current: dict[str, Any]) -> dict[str, Any]:
     record: dict[str, Any] = {
         "origin": policy.origin,
@@ -639,7 +618,7 @@ def import_markdown_sources(
             and current.get("importer_version") == MARKDOWN_SOURCE_IMPORTER_VERSION
             and output_path.is_file()
             and not source_needs_redaction(output_path)
-            and _assets_are_current(current.get("assets", []))
+            and registered_assets_are_current(current.get("assets", []))
         )
         if is_unchanged:
             stats["unchanged"] += 1
@@ -657,9 +636,9 @@ def import_markdown_sources(
             continue
         for asset in prepared.assets:
             change_tracker.observe(asset.stored_path)
-            _atomic_copy(asset)
+            atomic_copy_file(asset.source_path, asset.stored_path)
         change_tracker.observe(output_path)
-        _atomic_write_text(output_path, _render_document(prepared, policy))
+        atomic_write_text(output_path, _render_document(prepared, policy))
         manifest["sources"][prepared.source_id] = _manifest_record(prepared, policy, output_path, current)
 
     if stats["discovered"] != stats["imported"] + stats["unchanged"] + stats["skipped"]:

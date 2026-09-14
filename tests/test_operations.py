@@ -14,7 +14,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from src.ingestion.build_source_inventory import build_inventory  # noqa: E402
 from src.operations.check_corpus import check_source_consistency  # noqa: E402
 from src.operations.rebuild_review_queue import build_queue  # noqa: E402
-from src.operations.remove_source import SourceRemovalError, remove_source  # noqa: E402
+from src.corpus.removal import SourceRemovalError, remove_source  # noqa: E402
 from src.operations.scan_secrets import scan_paths  # noqa: E402
 from src.corpus.core import sha256_file, yaml_document  # noqa: E402
 
