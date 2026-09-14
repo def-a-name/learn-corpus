@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from src.service.mcp import PROTOCOL_VERSION, tool_definitions
+from src.service.http.mcp import PROTOCOL_VERSION, tool_definitions
 from src.retrieval.lexical_store import IndexUnavailableError
 from test_api import HEADERS, TOKEN, config, client_for, assert_error  # noqa: F401
 from test_public_core import open_core  # noqa: F401
@@ -160,7 +160,7 @@ def test_errors_logs_and_shared_admission(config, monkeypatch, caplog):
 def test_tools_list_contract_snapshot():
     import hashlib
     encoded = json.dumps(tool_definitions(), sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode()
-    assert hashlib.sha256(encoded).hexdigest() == 'e0ca82a4087143dbeac933d75bf18ce3737a688f1ddb7b2440d34d17ff7d2523'
+    assert hashlib.sha256(encoded).hexdigest() == '6ec1f96a9c9268bfe00b41048c2b1202cc6318db913499584190a23c466546e9'
 
 
 @pytest.mark.parametrize('scope', ['note', 'article'])

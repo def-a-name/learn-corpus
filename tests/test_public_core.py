@@ -16,6 +16,7 @@ from src.retrieval.lexical_store import (
     InvalidRequestError, ItemNotFoundError, LexicalStore,
 )
 from src.retrieval.project_items import stable_item_id
+from src.retrieval import public_core
 from src.retrieval.public_core import RequestLimits, RetrievalCore
 from src.retrieval.text import estimate_evidence_tokens
 
@@ -56,7 +57,7 @@ def exchange():
 def open_core(tmp_path):
     stores = []
 
-    def open_items(items, *, max_bytes=100_000, timeout_ms=10_000):
+    def open_items(items, *, timeout_ms=10_000):
         root = tmp_path / str(len(stores))
         sources = {item.source_path: SourceSnapshot(
             item.source_path, "a" * 64, item.source_id, item.scope, 1,
@@ -66,7 +67,7 @@ def open_core(tmp_path):
         publish_generation(root, generation.generation)
         store = LexicalStore.open_current(root)
         stores.append(store)
-        return RetrievalCore(store, RequestLimits(max_bytes, timeout_ms))
+        return RetrievalCore(store, RequestLimits(timeout_ms))
 
     yield open_items
     for store in stores:
@@ -122,7 +123,7 @@ def test_public_whitelist_and_exact_serialized_usage(open_core):
             estimate_evidence_tokens(item.get("body", item.get("snippet", "")))
             for item in payload.get("items", payload.get("results", []))
         )
-        assert len(response.json_bytes) <= core.limits.max_response_bytes
+        assert len(response.json_bytes) <= public_core.MAX_RESPONSE_BYTES
         for item in payload.get("items", payload.get("results", [])):
             assert not {"provider", "session_id", "part", "source_id", "body_sha256"} & item.keys()
         payload["generation"] = "changed-local-copy"
@@ -130,14 +131,14 @@ def test_public_whitelist_and_exact_serialized_usage(open_core):
 
 
 @pytest.mark.parametrize("constraint", ["tokens", "bytes"])
-def test_bundle_budget_preserves_full_prefix_and_all_missing_ids(open_core, constraint):
+def test_bundle_budget_preserves_full_prefix_and_all_missing_ids(open_core, monkeypatch, constraint):
     items = parts("note", "A", ("# A\n" + "quasar " * 160, "quasar " * 160, "quasar " * 160))
     core = open_core(items)
     full = read(core, items[-1])
     if constraint == "tokens":
         partial = read(core, items[-1], max_estimated_tokens=full.payload["usage"]["estimated_evidence_tokens"] - 300)
     else:
-        core = RetrievalCore(core.store, RequestLimits(len(full.json_bytes) - 900, 10_000))
+        monkeypatch.setattr(public_core, "MAX_RESPONSE_BYTES", len(full.json_bytes) - 900)
         partial = read(core, items[-1])
     payload = partial.payload
     count = len(payload["items"])
@@ -150,14 +151,14 @@ def test_bundle_budget_preserves_full_prefix_and_all_missing_ids(open_core, cons
 
 
 @pytest.mark.parametrize("constraint", ["tokens", "bytes"])
-def test_search_budget_returns_ranked_prefix_and_distinguishes_no_matches(open_core, constraint):
+def test_search_budget_returns_ranked_prefix_and_distinguishes_no_matches(open_core, monkeypatch, constraint):
     core = open_core(exchange())
     request = {"queries": ["quasar"], "limit": 20}
     full = core.search(request, request_id="req_synthetic")
     if constraint == "tokens":
         request["max_estimated_tokens"] = full.payload["usage"]["estimated_evidence_tokens"] - 150
     else:
-        core = RetrievalCore(core.store, RequestLimits(len(full.json_bytes) - 400, 10_000))
+        monkeypatch.setattr(public_core, "MAX_RESPONSE_BYTES", len(full.json_bytes) - 400)
     partial = core.search(request, request_id="req_synthetic").payload
     assert 0 < len(partial["results"]) < 4
     assert partial["is_truncated"] is True
@@ -168,7 +169,7 @@ def test_search_budget_returns_ranked_prefix_and_distinguishes_no_matches(open_c
     assert len(limited["results"]) == 1 and limited["is_truncated"] is False
 
 
-def test_empty_prefix_is_partial_and_impossible_minimum_fails(open_core):
+def test_empty_prefix_is_partial_and_impossible_minimum_fails(open_core, monkeypatch):
     item = parts("note", "A", ("quasar " * 250,))[0]
     core = open_core((item,))
     partial = read(core, item, max_estimated_tokens=250).payload
@@ -178,10 +179,12 @@ def test_empty_prefix_is_partial_and_impossible_minimum_fails(open_core):
     for operation in (
         lambda: read(core, item, max_estimated_tokens=1),
         lambda: core.search({"queries": ["quasar"], "max_estimated_tokens": 1}),
-        lambda: read(RetrievalCore(core.store, RequestLimits(10, 1000)), item),
     ):
         with pytest.raises(BudgetExceededError):
             operation()
+    monkeypatch.setattr(public_core, "MAX_RESPONSE_BYTES", 10)
+    with pytest.raises(BudgetExceededError):
+        read(core, item)
 
 
 @pytest.mark.parametrize("values", [
@@ -284,8 +287,9 @@ def test_known_missing_list_cannot_be_silently_shortened(open_core):
         read(core, items[0], max_estimated_tokens=250)
 
 
-def test_public_budget_does_not_truncate_internal_evaluation_results(open_core):
-    core = open_core(exchange(), max_bytes=500)
+def test_public_budget_does_not_truncate_internal_evaluation_results(open_core, monkeypatch):
+    core = open_core(exchange())
+    monkeypatch.setattr(public_core, "MAX_RESPONSE_BYTES", 500)
     assert len(core.store.search_lex(["quasar"], limit=20).results) == 4
     public = core.search({"queries": ["quasar"], "limit": 20}).payload
     assert public["is_truncated"] is True
@@ -342,20 +346,20 @@ def test_deadline_includes_waiting_for_connection_lock(open_core):
 
 
 def test_status_advertises_configured_limits_without_filesystem_details(open_core):
-    core = open_core(parts("note", "A", ("quasar",)), max_bytes=20_000, timeout_ms=2345)
+    core = open_core(parts("note", "A", ("quasar",)), timeout_ms=2345)
     status = core.status().payload
     assert status["semantic_search"] is False
     assert status["capabilities"] == {
         "read_bundle": True, "max_estimated_tokens": 8000,
-        "max_response_bytes": 20_000, "request_timeout_ms": 2345,
+        "max_response_bytes": 65_536, "corpus_timeout_ms": 2345,
     }
     assert "synthetic-archive" not in json.dumps(status)
 
 
-@pytest.mark.parametrize("values", [(0, 100), (100, 0), (True, 100), (100, 1.5)])
-def test_limits_require_explicit_positive_integers(values):
+@pytest.mark.parametrize("value", [0, True, 1.5])
+def test_limits_require_explicit_positive_integers(value):
     with pytest.raises(ValueError):
-        RequestLimits(*values)
+        RequestLimits(value)
 
 
 @pytest.mark.parametrize("phase", ["snippet", "bundle_validation", "search_encode", "bundle_encode", "status_encode"])

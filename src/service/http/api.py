@@ -19,13 +19,16 @@ from starlette.exceptions import HTTPException
 from starlette.responses import Response
 
 from src.retrieval.lexical_store import LexicalStore, LexicalStoreError
-from src.retrieval.public_core import RetrievalCore
-from src.service.config import RestConfig, load_credentials, strict_json
-from src.service.openapi import build_openapi
-from src.service import mcp
-from src.service.security import (
-    Admissions, BearerVerifier, ERRORS, HTTPFailure,
+from src.retrieval.public_core import RequestLimits, RetrievalCore
+from src.service.http.http_config import (
+    MAX_AUTHORIZATION_BYTES, MAX_HEADER_BYTES, MAX_HEADERS,
+    HttpConfig, load_credentials,
 )
+from src.service.json_boundary import strict_json
+from src.service.http.openapi import build_openapi
+from src.service.http import mcp
+from src.service.errors import ERRORS, HTTPFailure
+from src.service.http.security import Admissions, BearerVerifier
 
 
 _LOG = logging.getLogger("learn_corpus.service")
@@ -47,7 +50,7 @@ def error_response(error: HTTPFailure, request_id: str) -> Response:
     return Response(body, status_code=error.status, media_type="application/json", headers=error.headers)
 
 
-def connection_peer(scope, config: RestConfig) -> str:
+def connection_peer(scope, config: HttpConfig) -> str:
     peer = scope.get("client")
     try:
         source = str(ipaddress.ip_address(peer[0])) if peer else None
@@ -58,21 +61,21 @@ def connection_peer(scope, config: RestConfig) -> str:
     return source
 
 
-def headers_and_source(scope, config: RestConfig):
-    """使用 ASGI 原始连接对端判断代理信任，不接受任意转发链。"""
+def request_headers(scope, config: HttpConfig):
+    """只使用 ASGI 原始连接对端执行来源边界，不解析转发头。"""
 
-    source = connection_peer(scope, config)
+    connection_peer(scope, config)
     raw = scope.get("headers", [])
-    if len(raw) > config.max_headers or sum(len(k) + len(v) + 4 for k, v in raw) > config.max_header_bytes:
+    if len(raw) > MAX_HEADERS or sum(len(k) + len(v) + 4 for k, v in raw) > MAX_HEADER_BYTES:
         raise HTTPFailure("request_too_large", status=431)
     headers = {}
     singletons = {"host", "origin", "authorization", "content-type", "content-length",
-                  "content-encoding", "transfer-encoding", "x-forwarded-for",
+                  "content-encoding", "transfer-encoding",
                   "accept", "mcp-protocol-version", "mcp-session-id"}
     try:
         for raw_key, raw_value in raw:
             key = raw_key.decode("ascii").lower()
-            if key == "authorization" and len(raw_value) > config.max_authorization_bytes:
+            if key == "authorization" and len(raw_value) > MAX_AUTHORIZATION_BYTES:
                 raise HTTPFailure("request_too_large", status=431)
             if key in singletons:
                 if key in headers or any(value < 32 or value == 127 for value in raw_value):
@@ -80,16 +83,10 @@ def headers_and_source(scope, config: RestConfig):
                 headers[key] = raw_value.decode("ascii")
     except UnicodeError as exc:
         raise HTTPFailure("invalid_request") from exc
-    if source in config.trusted_proxies:
-        # Nginx 必须覆盖为一个 IP；缺失或逗号链不降级为客户端可控身份。
-        try:
-            source = str(ipaddress.ip_address(headers.get("x-forwarded-for", "")))
-        except ValueError as exc:
-            raise HTTPFailure("invalid_request") from exc
-    return headers, source
+    return headers
 
 
-async def receive_body(receive, headers, config: RestConfig, *, maximum=16 * 1024) -> bytes:
+async def receive_body(receive, headers, config: HttpConfig, *, maximum=16 * 1024) -> bytes:
     length = headers.get("content-length")
     if length is not None:
         if not length.isascii() or not length.isdigit() or len(length) > 20:
@@ -149,7 +146,7 @@ class RestBoundary:
             await send(message)
 
         try:
-            headers, _ = headers_and_source(scope, self.config)
+            headers = request_headers(scope, self.config)
             if headers.get("host") not in self.config.allowed_hosts or (
                 "origin" in headers and headers["origin"] not in self.config.allowed_origins
             ):
@@ -176,7 +173,7 @@ class RestBoundary:
                                      maximum=32 * 1024 if operation == "mcp" else 16 * 1024)
             values = None
             if operation == "mcp":
-                message = mcp.prepare(raw, headers, self.config, self.state.core)
+                message = mcp.prepare(raw, headers, self.state.core)
                 scope["state"]["mcp_message"] = message
                 operation = message[2] or message[0]
                 values = message[3]
@@ -184,8 +181,7 @@ class RestBoundary:
                 if raw:
                     raise HTTPFailure("invalid_request")
             else:
-                values = strict_json(raw, max_keys=self.config.max_json_keys,
-                                     max_array_items=self.config.max_json_array_items)
+                values = strict_json(raw)
                 values = self.state.core.validate_request(operation, values)
             self.state.admissions.acquire(admission_key)
             admitted = True
@@ -225,7 +221,7 @@ class RestBoundary:
             _LOG.info(json.dumps(event, separators=(",", ":")))
 
 
-def create_app(config: RestConfig) -> FastAPI:
+def create_app(config: HttpConfig) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app):
         # 启动失败不保留半初始化 store；凭据文件必须限制读取权限。
@@ -233,7 +229,7 @@ def create_app(config: RestConfig) -> FastAPI:
         try:
             app.state.verifier = BearerVerifier(load_credentials(config.credentials_file))
             store = await anyio.to_thread.run_sync(LexicalStore.open_current, config.corpus_path)
-            app.state.core = RetrievalCore(store, config.response_limits)
+            app.state.core = RetrievalCore(store, RequestLimits(config.corpus_timeout_ms))
             app.state.admissions = Admissions(config.global_concurrency, config.client_concurrency)
             app.state.workers = anyio.CapacityLimiter(config.global_concurrency)
             yield

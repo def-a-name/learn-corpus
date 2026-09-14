@@ -12,10 +12,11 @@ import pytest
 from starlette.testclient import TestClient
 
 from src.retrieval.lexical_store import IndexUnavailableError
-from src.retrieval.public_core import RequestLimits
-from src.service.config import RestConfig, strict_json
-from src.service.api import create_app
-from src.service.security import Admissions, BearerVerifier, Credential, HTTPFailure
+from src.service.http.api import create_app
+from src.service.http.http_config import HttpConfig
+from src.service.json_boundary import strict_json
+from src.service.errors import HTTPFailure
+from src.service.http.security import Admissions, BearerVerifier, Credential
 from test_public_core import exchange, open_core  # noqa: F401
 
 
@@ -26,7 +27,7 @@ def encode_token(key, secret):
 SECRET = "a" * 43
 KEY = "synthetic-client_key_1"
 TOKEN = encode_token(KEY, SECRET)
-HEADERS = {"Authorization": "Bearer " + TOKEN, "X-Forwarded-For": "192.0.2.1"}
+HEADERS = {"Authorization": "Bearer " + TOKEN}
 
 
 @pytest.fixture
@@ -37,14 +38,13 @@ def config(open_core, tmp_path):
         "cid": "synthetic-client", "key": KEY, "secret": SECRET,
     }]))
     credentials.chmod(0o600)
-    return RestConfig(
+    return HttpConfig(
         corpus_path=core.store._generation_path.parent.parent, credentials_file=credentials,
-        allowed_peers=("192.0.2.2", "127.0.0.1"), trusted_proxies=("192.0.2.2",),
+        allowed_peers=("192.0.2.2", "127.0.0.1"),
         allowed_hosts=("service.test",), allowed_origins=("https://client.test",),
-        response_limits=RequestLimits(30_000, 5000),
+        corpus_timeout_ms=5000,
         global_concurrency=2, client_concurrency=1,
-        max_header_bytes=4096, max_headers=30, max_authorization_bytes=256,
-        max_json_keys=20, max_json_array_items=10, body_timeout_ms=100,
+        body_timeout_ms=100,
     )
 
 
@@ -87,10 +87,10 @@ def test_search_bundle_status_and_core_json_match(config):
 
 def test_health_auth_exemption_still_checks_origin_and_peer(config):
     with client_for(config) as client:
-        assert client.get("/healthz", headers={"X-Forwarded-For": "192.0.2.1"}).content == b'{"ok":true}'
+        assert client.get("/healthz").content == b'{"ok":true}'
         for path in ("/v1/status", "/v1/search", "/v1/read-bundle"):
             response = client.request("GET" if path.endswith("status") else "POST", path,
-                                      headers={"X-Forwarded-For": "192.0.2.1"})
+                                      headers={})
             assert_error(response, 401, "unauthorized")
             assert response.headers["www-authenticate"] == "Bearer"
         assert_error(client.get("/healthz", headers={**HEADERS, "Origin": "https://evil.test"}), 403, "forbidden")
@@ -103,7 +103,7 @@ def test_health_auth_exemption_still_checks_origin_and_peer(config):
                                     "Bearer " + encode_token(KEY, "b" * 43)])
 def test_bad_credentials_share_safe_response(config, header):
     with client_for(config) as client:
-        headers = {"X-Forwarded-For": "192.0.2.1"}
+        headers = {}
         if header is not None:
             headers["Authorization"] = header
         assert_error(client.get("/v1/status", headers=headers), 401, "unauthorized")
@@ -122,7 +122,7 @@ def test_swagger_schema_and_authenticated_browser_flow(config):
     from fastapi.openapi.models import OpenAPI
 
     config = replace(config, allowed_origins=("http://service.test",))
-    browser_headers = {"X-Forwarded-For": "192.0.2.1", "Origin": "http://service.test"}
+    browser_headers = {"Origin": "http://service.test"}
     with client_for(config) as client:
         page = client.get("/docs", headers=browser_headers)
         assert page.status_code == 200
@@ -172,12 +172,11 @@ def test_swagger_schema_and_authenticated_browser_flow(config):
 
 @pytest.mark.parametrize("path", ["/docs", "/openapi.json"])
 def test_documentation_preserves_boundary_and_concurrency(config, path):
-    headers = {"X-Forwarded-For": "192.0.2.1"}
+    headers = {}
     with client_for(config) as client:
         assert client.get(path, headers=headers).status_code == 200
         assert_error(client.get(path, headers={**headers, "Host": "evil.test"}), 403, "forbidden")
         assert_error(client.get(path, headers={**headers, "Origin": "https://evil.test"}), 403, "forbidden")
-        assert_error(client.get(path, headers={}), 400, "invalid_request")
         assert_error(client.get(path + "?token=synthetic", headers=headers), 400, "invalid_request")
         assert_error(client.post(path, headers=headers), 405, "method_not_allowed")
         assert_error(client.request("GET", path, headers=headers, content=b"{}"), 400, "invalid_request")
@@ -219,22 +218,20 @@ def test_http_size_media_and_query_boundaries(config):
         assert_error(client.get("/v1/status?secret=synthetic", headers=HEADERS), 400, "invalid_request")
         assert_error(client.get("/v1/status", headers={**HEADERS, "Authorization": "x" * 257}),
                      431, "request_too_large")
-        assert_error(client.get("/v1/status", headers={**HEADERS, "X-Synthetic": "x" * 4096}),
+        assert_error(client.get("/v1/status", headers={**HEADERS, "X-Synthetic": "x" * 8192}),
                      431, "request_too_large")
 
 
-def test_proxy_requires_single_overwritten_ip_and_direct_clients_cannot_spoof(config):
+def test_forwarded_for_is_ignored_and_connection_peer_controls_access(config):
     with client_for(config) as client:
         for value in (None, "192.0.2.1, 192.0.2.3", "not-an-ip"):
             headers = dict(HEADERS)
-            if value is None:
-                del headers["X-Forwarded-For"]
-            else:
+            if value is not None:
                 headers["X-Forwarded-For"] = value
-            assert_error(client.get("/healthz", headers=headers), 400, "invalid_request")
-    with client_for(config, peer="127.0.0.1") as client:
-        for value in ("192.0.2.9", "not-an-ip"):
-            assert client.get("/healthz", headers={"X-Forwarded-For": value}).status_code == 200
+            assert client.get("/healthz", headers=headers).status_code == 200
+    with client_for(config, peer="192.0.2.99") as client:
+        assert_error(client.get("/healthz", headers={"X-Forwarded-For": "192.0.2.2"}),
+                     403, "forbidden")
 
 
 
@@ -367,7 +364,7 @@ def test_malformed_encoded_tokens_are_rejected(token):
     {"cid": None}, {"key": None}, {"secret": None},
 ])
 def test_credential_file_rejects_invalid_fields(tmp_path, changes):
-    from src.service.config import load_credentials
+    from src.service.http.http_config import load_credentials
 
     path = tmp_path / "synthetic-credentials.json"
     path.write_text(json.dumps([{"cid": "synthetic-client", "key": KEY, "secret": SECRET, **changes}]))
@@ -377,7 +374,7 @@ def test_credential_file_rejects_invalid_fields(tmp_path, changes):
 
 
 def test_old_credential_schema_is_rejected(tmp_path):
-    from src.service.config import load_credentials
+    from src.service.http.http_config import load_credentials
 
     path = tmp_path / "synthetic-old-credentials.json"
     path.write_text(json.dumps([{"client_id": "synthetic-client", "key_id": "synthetic-key",
@@ -400,13 +397,16 @@ def test_global_and_client_admission_limits_are_distinct():
 
 
 def test_parser_limits_total_keys_and_arrays():
-    for raw, keys, arrays in ((b'{"a":{"b":1}}', 1, 5), (b'[1,2,3]', 10, 2)):
+    for raw in (
+        json.dumps({str(index): index for index in range(33)}).encode(),
+        json.dumps(list(range(21))).encode(),
+    ):
         with pytest.raises(HTTPFailure):
-            strict_json(raw, max_keys=keys, max_array_items=arrays)
+            strict_json(raw)
 
 
 def test_slow_body_and_stream_without_content_length(config):
-    from src.service.api import receive_body
+    from src.service.http.api import receive_body
     async def exercise():
         async def slow():
             await anyio.sleep(1)
@@ -427,7 +427,7 @@ def raw_scope(path="/v1/search", *, extra_headers=()):
         "method": "POST", "scheme": "http", "path": path, "raw_path": path.encode(),
         "query_string": b"", "root_path": "", "client": ("192.0.2.2", 4000),
         "server": ("service.test", 80), "headers": [
-            (b"host", b"service.test"), (b"x-forwarded-for", b"192.0.2.1"),
+            (b"host", b"service.test"),
             (b"authorization", ("Bearer " + TOKEN).encode()),
             (b"content-type", b"application/json"), *extra_headers,
         ],
@@ -503,19 +503,30 @@ def test_request_cancellation_keeps_admission_until_worker_finishes(config, monk
 ])
 def test_config_loader_and_launcher_preserve_trust_boundary(config, tmp_path, monkeypatch,
                                                            bind_args, expected_host, expected_port):
-    from dataclasses import asdict
-    from src.service.config import load_config
+    from src.service.config import load_http_config
     from src.service import server
+    from src.service.http import http_server
 
-    values = asdict(config)
-    values["corpus_path"] = "synthetic-retrieval"
-    values["credentials_file"] = config.credentials_file.name
+    values = {
+        "corpus_path": "synthetic-retrieval",
+        "corpus_timeout_ms": config.corpus_timeout_ms,
+        "http": {
+            "credentials_file": config.credentials_file.name,
+            "allowed_peers": list(config.allowed_peers),
+            "allowed_hosts": list(config.allowed_hosts),
+            "allowed_origins": list(config.allowed_origins),
+            "global_concurrency": config.global_concurrency,
+            "client_concurrency": config.client_concurrency,
+            "body_timeout_ms": config.body_timeout_ms,
+        },
+        "mcp": {"transport": "http"},
+    }
     path = tmp_path / "synthetic-service.json"
     path.write_text(json.dumps(values))
-    assert load_config(path).credentials_file == config.credentials_file
-    assert load_config(path).corpus_path == tmp_path / "synthetic-retrieval"
+    assert load_http_config(path).credentials_file == config.credentials_file
+    assert load_http_config(path).corpus_path == tmp_path / "synthetic-retrieval"
     calls = []
-    monkeypatch.setattr(server.uvicorn, "run", lambda app, **kwargs: calls.append(kwargs))
+    monkeypatch.setattr(http_server.uvicorn, "run", lambda app, **kwargs: calls.append(kwargs))
     monkeypatch.setattr("sys.argv", ["server", "--config", str(path), *bind_args])
     assert server.main() == 0
     assert calls[0]["host"] == expected_host
@@ -525,17 +536,17 @@ def test_config_loader_and_launcher_preserve_trust_boundary(config, tmp_path, mo
     log_config = calls[0]["log_config"]
     assert log_config["loggers"]["uvicorn.error"]["handlers"] == ["lifecycle"]
     assert log_config["handlers"]["lifecycle"]["filters"] == ["lifecycle"]
-    assert log_config["filters"]["lifecycle"]["()"] is server.UvicornLifecycleFilter
+    assert log_config["filters"]["lifecycle"]["()"] is http_server.UvicornLifecycleFilter
     assert log_config["handlers"]["discard"]["class"] == "logging.NullHandler"
     values["unknown"] = True
     path.write_text(json.dumps(values))
     with pytest.raises(ValueError, match="cannot load service configuration"):
-        load_config(path)
+        load_http_config(path)
     del values["unknown"]
     values["retrieval_root"] = values.pop("corpus_path")
     path.write_text(json.dumps(values))
     with pytest.raises(ValueError, match="cannot load service configuration"):
-        load_config(path)
+        load_http_config(path)
 
 
 @pytest.mark.parametrize("message, args, level, exc_info, expected", [
@@ -550,7 +561,7 @@ def test_config_loader_and_launcher_preserve_trust_boundary(config, tmp_path, mo
 ])
 def test_uvicorn_lifecycle_filter(message, args, level, exc_info, expected):
     import io
-    from src.service.server import UvicornLifecycleFilter
+    from src.service.http.http_server import UvicornLifecycleFilter
 
     output = io.StringIO()
     handler = logging.StreamHandler(output)
@@ -583,7 +594,7 @@ def test_sequential_requests_have_no_rate_budget(config):
         seed = exchange()[0].item_id
         generation = client.app.state.core.store.generation
         for _ in range(3):
-            assert_error(client.get("/v1/status", headers={"X-Forwarded-For": "192.0.2.1"}),
+            assert_error(client.get("/v1/status"),
                          401, "unauthorized")
             assert client.get("/healthz", headers=HEADERS).status_code == 200
             response = client.post("/v1/read-bundle", headers=HEADERS,
@@ -595,7 +606,7 @@ def test_sequential_requests_have_no_rate_budget(config):
 @pytest.mark.parametrize("field", ["ip_rate", "client_rate", "max_ip_buckets"])
 def test_removed_rate_configuration_is_rejected(config, tmp_path, field):
     from dataclasses import asdict
-    from src.service.config import load_config
+    from src.service.config import load_http_config
 
     values = asdict(config)
     values["corpus_path"] = str(config.corpus_path)
@@ -604,7 +615,7 @@ def test_removed_rate_configuration_is_rejected(config, tmp_path, field):
     path = tmp_path / "synthetic-old-config.json"
     path.write_text(json.dumps(values))
     with pytest.raises(ValueError, match="cannot load service configuration"):
-        load_config(path)
+        load_http_config(path)
 
 
 def test_failed_core_call_releases_concurrency(config, monkeypatch):
@@ -620,9 +631,9 @@ def test_failed_core_call_releases_concurrency(config, monkeypatch):
 
 
 def test_openapi_error_examples_match_runtime_responses():
-    from src.service.api import error_response
-    from src.service.openapi import build_openapi
-    from src.service.security import ERRORS, HTTPFailure
+    from src.service.http.api import error_response
+    from src.service.http.openapi import build_openapi
+    from src.service.errors import ERRORS, HTTPFailure
 
     schema = build_openapi()
     for methods in schema['paths'].values():
@@ -643,7 +654,7 @@ def test_openapi_error_examples_match_runtime_responses():
 
 
 def test_openapi_search_examples_follow_query_contract(config):
-    from src.service.openapi import build_openapi
+    from src.service.http.openapi import build_openapi
     from src.retrieval.lexical_query import compile_lexical_query
 
     operation = build_openapi()['paths']['/v1/search']['post']

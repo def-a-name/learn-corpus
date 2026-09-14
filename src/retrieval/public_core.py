@@ -23,6 +23,7 @@ from src.retrieval.text import estimate_evidence_tokens
 
 
 MAX_RESPONSE_TOKENS = 8000
+MAX_RESPONSE_BYTES = 64 * 1024
 _REQUEST_ID = re.compile(r"req_[A-Za-z0-9_-]{1,64}")
 _ITEM_ID = re.compile(r"itm_[a-z2-7]{32}")
 _METADATA = frozenset({
@@ -32,15 +33,13 @@ _METADATA = frozenset({
 
 @dataclass(frozen=True)
 class RequestLimits:
-    """字节与时限必须由调用方配置，生产值留到部署验收冻结。"""
+    """限制一次 corpus core 操作的总执行时间。"""
 
-    max_response_bytes: int
-    request_timeout_ms: int
+    corpus_timeout_ms: int
 
     def __post_init__(self) -> None:
-        for value in (self.max_response_bytes, self.request_timeout_ms):
-            if type(value) is not int or value < 1:
-                raise ValueError("request limits must be positive integers")
+        if type(self.corpus_timeout_ms) is not int or self.corpus_timeout_ms < 1:
+            raise ValueError("corpus timeout must be a positive integer")
 
 
 @dataclass(frozen=True)
@@ -203,7 +202,7 @@ class RetrievalCore:
         self._request_owner = object()
 
     def _start(self, request_id: str | None) -> tuple[float, str]:
-        deadline = monotonic() + self.limits.request_timeout_ms / 1000
+        deadline = monotonic() + self.limits.corpus_timeout_ms / 1000
         value = "req_" + uuid4().hex if request_id is None else request_id
         if not isinstance(value, str) or _REQUEST_ID.fullmatch(value) is None:
             raise InvalidRequestError("request_id has an invalid format")
@@ -227,7 +226,7 @@ class RetrievalCore:
             if measured == payload["usage"]["estimated_evidence_tokens"]:
                 break
             payload["usage"]["estimated_evidence_tokens"] = measured
-        if measured > max_tokens or len(encoded) > self.limits.max_response_bytes:
+        if measured > max_tokens or len(encoded) > MAX_RESPONSE_BYTES:
             return None
         return PublicResponse(encoded)
 
@@ -333,11 +332,11 @@ class RetrievalCore:
         payload["capabilities"] = {
             "read_bundle": True,
             "max_estimated_tokens": MAX_RESPONSE_TOKENS,
-            "max_response_bytes": self.limits.max_response_bytes,
-            "request_timeout_ms": self.limits.request_timeout_ms,
+            "max_response_bytes": MAX_RESPONSE_BYTES,
+            "corpus_timeout_ms": self.limits.corpus_timeout_ms,
         }
         encoded = _json(payload)
-        if len(encoded) > self.limits.max_response_bytes:
+        if len(encoded) > MAX_RESPONSE_BYTES:
             raise BudgetExceededError("status response exceeds the response byte limit")
         check_deadline(deadline)
         return PublicResponse(encoded)

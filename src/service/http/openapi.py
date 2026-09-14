@@ -1,10 +1,10 @@
-"""描述现有公开契约，仅用于文档，不参与请求校验或响应序列化。"""
+"""描述 HTTP 公开契约，仅用于文档，不参与请求校验或响应序列化。"""
 
 from src.retrieval.contracts import SUPPORTED_SCOPES
 from src.retrieval.lexical_query import MAX_QUERY_SCALARS
 from src.retrieval.lexical_store import MAX_QUERIES, MAX_RESULT_LIMIT
-from src.retrieval.public_core import MAX_RESPONSE_TOKENS
-from src.service.security import ERRORS
+from src.retrieval.public_core import MAX_RESPONSE_BYTES, MAX_RESPONSE_TOKENS
+from src.service.errors import ERRORS
 
 
 def _object(properties, required=None):
@@ -100,8 +100,8 @@ def build_openapi() -> dict:
             "capabilities": _object({
                 "read_bundle": {"type": "boolean", "const": True},
                 "max_estimated_tokens": {"type": "integer", "const": MAX_RESPONSE_TOKENS},
-                "max_response_bytes": {"type": "integer", "minimum": 1},
-                "request_timeout_ms": {"type": "integer", "minimum": 1},
+                "max_response_bytes": {"type": "integer", "const": MAX_RESPONSE_BYTES},
+                "corpus_timeout_ms": {"type": "integer", "minimum": 1},
             }),
         }),
         "HealthResponse": _object({"ok": {"type": "boolean", "const": True}}),

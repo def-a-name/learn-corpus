@@ -1,16 +1,14 @@
-"""实现冻结为 2025-06-18 的无会话 Streamable HTTP 薄适配。"""
+"""提供 HTTP 与 stdio 共用的 MCP 消息校验、工具定义及结果封装。"""
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
 
-from starlette.responses import Response
-
 from src.retrieval.lexical_store import LexicalStoreError
-from src.service.config import strict_json
-from src.service.openapi import build_openapi
-from src.service.security import ERRORS, HTTPFailure
+from src.service.json_boundary import strict_json
+from src.service.http.openapi import build_openapi
+from src.service.errors import ERRORS, HTTPFailure
 
 
 PROTOCOL_VERSION = "2025-06-18"
@@ -59,17 +57,33 @@ class RPCFailure(Exception):
     rpc_id: str | int | None = None
 
 
-def rpc_response(rpc_id, *, result=None, error=None, status=200):
+def rpc_payload(rpc_id, *, result=None, error=None):
     payload = {"jsonrpc": "2.0", "id": rpc_id}
     payload["error" if error is not None else "result"] = error if error is not None else result
-    return Response(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(),
-                    status_code=status, media_type="application/json")
+    return payload
 
 
-def tool_error(rpc_id, code, request_id):
+def tool_error_result(code, request_id):
     payload = {"error": {"code": code, "message": ERRORS[code][1], "request_id": request_id}}
-    return rpc_response(rpc_id, result={"content": [{"type": "text", "text": json.dumps(payload, separators=(",", ":"))}],
-                                       "isError": True})
+    return {"content": [{"type": "text", "text": json.dumps(payload, separators=(",", ":"))}],
+            "isError": True}
+
+
+def tool_success_result(result):
+    return {"structuredContent": result.payload,
+            "content": [{"type": "text", "text": "Use structuredContent for the complete result."}],
+            "isError": False}
+
+
+def control_result(method):
+    if method == "initialize":
+        return {"protocolVersion": PROTOCOL_VERSION, "capabilities": {"tools": {}},
+                "serverInfo": {"name": "learn-corpus", "version": "1.0.0"}}
+    if method == "ping":
+        return {}
+    if method == "tools/list":
+        return {"tools": tool_definitions()}
+    raise ValueError("unsupported control method")
 
 
 def _valid_id(value):
@@ -79,13 +93,10 @@ def _valid_id(value):
             all(32 <= ord(char) < 127 for char in value))
 
 
-def prepare(raw, headers, config, core):
-    """验证协议封装，再让共享核心校验工具参数；不接受 batch 或任意方法。"""
-    accepts = {part.strip().split(";", 1)[0].lower() for part in headers.get("accept", "").split(",")}
-    if not {"application/json", "text/event-stream"} <= accepts:
-        raise HTTPFailure("invalid_request")
+def parse_envelope(raw):
+    """校验封装后再由入口检查 transport 专属字段，保留 HTTP 的检查顺序。"""
     try:
-        value = strict_json(raw, max_keys=config.max_json_keys, max_array_items=config.max_json_array_items)
+        value = strict_json(raw)
     except HTTPFailure:
         raise RPCFailure(-32700, "Parse error") from None
     if type(value) is not dict or value.get("jsonrpc") != "2.0" or value.keys() - {"jsonrpc", "id", "method", "params"}:
@@ -97,11 +108,14 @@ def prepare(raw, headers, config, core):
     params = value.get("params", {})
     if type(method) is not str or type(params) is not dict:
         raise RPCFailure(-32600, "Invalid Request", rpc_id)
-    version = headers.get("mcp-protocol-version")
-    if version != PROTOCOL_VERSION and not (method == "initialize" and version is None):
-        raise HTTPFailure("invalid_request")
-    if "mcp-session-id" in headers:
-        raise HTTPFailure("invalid_request")
+    return value
+
+
+def prepare_message(value, core):
+    """校验已解析消息及工具参数；不接受 batch 或任意方法。"""
+    rpc_id = value.get("id")
+    method = value["method"]
+    params = value.get("params", {})
     if "_meta" in params and type(params["_meta"]) is not dict:
         raise RPCFailure(-32602, "Invalid params", rpc_id)
     params = {key: child for key, child in params.items() if key != "_meta"}
@@ -110,7 +124,7 @@ def prepare(raw, headers, config, core):
             return method, None, None, None
         if (method == "notifications/cancelled" and params.keys() <= {"requestId", "reason"}
                 and _valid_id(params.get("requestId")) and type(params.get("reason", "")) is str):
-            # 无会话、无请求登记；core deadline 仍约束正在执行的同步请求。
+            # 只接受通知，不登记或主动中止请求；core deadline 保持生效。
             return method, None, None, None
         raise HTTPFailure("invalid_request")
     if method == "initialize":
@@ -143,29 +157,3 @@ def prepare(raw, headers, config, core):
     except (LexicalStoreError, HTTPFailure) as exc:
         return method, rpc_id, operation, exc.code
     return method, rpc_id, operation, prepared
-
-
-async def dispatch(request, run_core):
-    method, rpc_id, operation, values = request.state.mcp_message
-    if rpc_id is None:
-        return Response(status_code=202)
-    if method == "initialize":
-        return rpc_response(rpc_id, result={"protocolVersion": PROTOCOL_VERSION, "capabilities": {"tools": {}},
-                                           "serverInfo": {"name": "learn-corpus", "version": "1.0.0"}})
-    if method == "ping":
-        return rpc_response(rpc_id, result={})
-    if method == "tools/list":
-        return rpc_response(rpc_id, result={"tools": tool_definitions()})
-    try:
-        if isinstance(values, str):
-            raise HTTPFailure(values)
-        result = await run_core(request, operation)
-    except (LexicalStoreError, HTTPFailure) as exc:
-        code = exc.code if exc.code in ERRORS else "internal_error"
-        request.state.error_code = code
-        return tool_error(rpc_id, code, request.state.request_id)
-    except Exception:
-        request.state.error_code = "internal_error"
-        return tool_error(rpc_id, "internal_error", request.state.request_id)
-    return rpc_response(rpc_id, result={"structuredContent": result.payload,
-        "content": [{"type": "text", "text": "Use structuredContent for the complete result."}], "isError": False})
