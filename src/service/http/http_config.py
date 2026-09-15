@@ -34,12 +34,15 @@ class HttpConfig:
     body_timeout_ms: int
 
     def __post_init__(self):
-        numbers = (
-            self.corpus_timeout_ms, self.global_concurrency,
-            self.client_concurrency, self.body_timeout_ms,
-        )
-        if not all(positive_integer(value) for value in numbers):
-            raise ValueError("transport limits must be positive integers")
+        numbers = {
+            "corpus_timeout_ms": self.corpus_timeout_ms,
+            "global_concurrency": self.global_concurrency,
+            "client_concurrency": self.client_concurrency,
+            "body_timeout_ms": self.body_timeout_ms,
+        }
+        for name, value in numbers.items():
+            if not positive_integer(value):
+                raise ValueError(f"{name} must be a positive integer")
         if not self.allowed_peers or not self.allowed_hosts:
             raise ValueError("peer and host allowlists must not be empty")
         for value in self.allowed_peers:
@@ -78,12 +81,12 @@ def parse_http_config(value: dict, path: Path) -> HttpConfig:
     value = dict(value)
     for name in ("corpus_path", "credentials_file"):
         if not isinstance(value[name], str) or not value[name]:
-            raise ValueError("configuration path is invalid")
+            raise ValueError(f"{name} must be a non-empty path string")
         candidate = Path(value[name])
         value[name] = candidate if candidate.is_absolute() else path.parent / candidate
     for name in ("allowed_peers", "allowed_hosts", "allowed_origins"):
         if not isinstance(value[name], list):
-            raise ValueError("allowlist must be an array")
+            raise ValueError(f"{name} must be an array")
         value[name] = tuple(value[name])
     return HttpConfig(**value)
 
@@ -92,10 +95,13 @@ def validate_bind(host: object, port: object) -> tuple[str, int]:
     """校验 HTTP 监听地址，拒绝布尔或非整数端口。"""
 
     if not isinstance(host, str):
-        raise ValueError("bind address is invalid")
-    address = ipaddress.ip_address(host)
+        raise ValueError("HTTP host must be an IP address string")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError as exc:
+        raise ValueError("HTTP host must be a valid IP address") from exc
     if str(address) != "0.0.0.0" and (address.is_unspecified or address.is_multicast or not address.is_private):
-        raise ValueError("bind address is not private")
+        raise ValueError("HTTP host must be 0.0.0.0 or a private IP address")
     if not positive_integer(port) or port > 65535:
-        raise ValueError("port is invalid")
+        raise ValueError("HTTP port must be an integer from 1 to 65535")
     return str(address), port

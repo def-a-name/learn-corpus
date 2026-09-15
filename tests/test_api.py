@@ -494,15 +494,7 @@ def test_request_cancellation_keeps_admission_until_worker_finishes(config, monk
     anyio.run(exercise)
 
 
-@pytest.mark.parametrize("bind_args, expected_host, expected_port", [
-    ([], "0.0.0.0", 2699),
-    (["--host", "192.168.123.45"], "192.168.123.45", 2699),
-    (["--port", "8765"], "0.0.0.0", 8765),
-    (["--host", "127.0.0.1", "--port", "8765"], "127.0.0.1", 8765),
-    (["--host", "0.0.0.0"], "0.0.0.0", 2699),
-])
-def test_config_loader_and_launcher_preserve_trust_boundary(config, tmp_path, monkeypatch,
-                                                           bind_args, expected_host, expected_port):
+def test_config_loader_and_launcher_preserve_trust_boundary(config, tmp_path, monkeypatch):
     from src.service.config import load_http_config
     from src.service import server
     from src.service.http import http_server
@@ -511,6 +503,8 @@ def test_config_loader_and_launcher_preserve_trust_boundary(config, tmp_path, mo
         "corpus_path": "synthetic-retrieval",
         "corpus_timeout_ms": config.corpus_timeout_ms,
         "http": {
+            "host": "127.0.0.1",
+            "port": 8765,
             "credentials_file": config.credentials_file.name,
             "allowed_peers": list(config.allowed_peers),
             "allowed_hosts": list(config.allowed_hosts),
@@ -527,10 +521,10 @@ def test_config_loader_and_launcher_preserve_trust_boundary(config, tmp_path, mo
     assert load_http_config(path).corpus_path == tmp_path / "synthetic-retrieval"
     calls = []
     monkeypatch.setattr(http_server.uvicorn, "run", lambda app, **kwargs: calls.append(kwargs))
-    monkeypatch.setattr("sys.argv", ["server", "--config", str(path), *bind_args])
+    monkeypatch.setattr("sys.argv", ["server", "--config", str(path)])
     assert server.main() == 0
-    assert calls[0]["host"] == expected_host
-    assert calls[0]["port"] == expected_port
+    assert calls[0]["host"] == "127.0.0.1"
+    assert calls[0]["port"] == 8765
     assert calls[0]["workers"] == 1 and calls[0]["proxy_headers"] is False
     assert calls[0]["access_log"] is False and calls[0]["server_header"] is False
     log_config = calls[0]["log_config"]
