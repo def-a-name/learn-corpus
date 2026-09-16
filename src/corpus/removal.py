@@ -1,29 +1,17 @@
 #!/usr/bin/env python3
-"""一次性删除标准化 Markdown source 及 manifest 登记的附件。"""
+"""规划并执行标准化来源及其登记附件的受控删除。"""
 
 from __future__ import annotations
 
-import argparse
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from src.shared.corpus_core import (
-    REPO_ROOT,
-    load_manifest,
-    parse_frontmatter,
-    save_manifest,
-    sha256_file,
-)
-from src.shared.ingest_log import SourceChangeTracker
-
-
-_SOURCE_ROOTS = {
-    "conversation": PurePosixPath("sources/conversations"),
-    "note": PurePosixPath("sources/notes"),
-    "article": PurePosixPath("sources/articles"),
-}
-_ASSET_ROOT = PurePosixPath("sources/assets")
-_DEPENDENCY_FIELDS = ("duplicate_of", "fork_parent_source_id")
+from src.corpus.document import parse_frontmatter
+from src.corpus.ingest_log import SourceChangeTracker
+from src.corpus.manifest import load_manifest, save_manifest
+from src.corpus.paths import REPO_ROOT
+from src.corpus.scopes import SOURCE_ASSET_ROOT, SOURCE_DEPENDENCY_FIELDS, SOURCE_ROOTS
+from src.corpus.storage import sha256_file
 
 
 class SourceRemovalError(ValueError):
@@ -74,7 +62,7 @@ def _registered_assets(record: dict[str, Any], repo_root: Path) -> tuple[Path, .
             item.get("stored_path"), f"manifest asset {index} stored_path"
         )
         path = _resolve_under(
-            repo_root, relative, (_ASSET_ROOT,), f"manifest asset {index} stored_path"
+            repo_root, relative, (SOURCE_ASSET_ROOT,), f"manifest asset {index} stored_path"
         )
         if path in paths:
             raise SourceRemovalError(
@@ -89,7 +77,7 @@ def _dependency_conflicts(source_id: str, sources: dict[str, Any]) -> list[str]:
     for other_id, item in sources.items():
         if other_id == source_id or not isinstance(item, dict):
             continue
-        for field in _DEPENDENCY_FIELDS:
+        for field in SOURCE_DEPENDENCY_FIELDS:
             if item.get(field) == source_id:
                 conflicts.append(f"{other_id}:{field}")
     return sorted(conflicts)
@@ -138,7 +126,7 @@ def plan_source_removal(
     output_path = _resolve_under(
         repo_root,
         relative_output,
-        tuple(_SOURCE_ROOTS.values()),
+        tuple(SOURCE_ROOTS.values()),
         "manifest output_path",
     )
     if output_path.suffix.lower() != ".md":
@@ -152,7 +140,7 @@ def plan_source_removal(
     if metadata.get("id") != source_id:
         raise SourceRemovalError(f"standardized source ID does not match: {relative_output.as_posix()}")
     scope = next(
-        name for name, root in _SOURCE_ROOTS.items() if relative_output.is_relative_to(root)
+        name for name, root in SOURCE_ROOTS.items() if relative_output.is_relative_to(root)
     )
     if metadata.get("type") != scope:
         raise SourceRemovalError(
@@ -229,32 +217,3 @@ def remove_source(
     save_manifest(plan["manifest"], plan["manifest_path"])
     tracker.append("remove-source")
     return result
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Remove one standardized Markdown source and its registered assets."
-    )
-    parser.add_argument("source_id", help="exact manifest source ID to remove")
-    parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
-    parser.add_argument("--manifest", type=Path)
-    parser.add_argument("--dry-run", action="store_true")
-    args = parser.parse_args()
-    try:
-        result = remove_source(
-            args.source_id,
-            repo_root=args.repo_root,
-            manifest_path=args.manifest,
-            dry_run=args.dry_run,
-        )
-    except SourceRemovalError as exc:
-        parser.error(str(exc))
-    mode = "dry-run" if args.dry_run else "removed"
-    print(
-        f"Source removal ({mode}): source_id={result['source_id']}, "
-        f"output={result['output_path']}, assets={result['assets']}"
-    )
-
-
-if __name__ == "__main__":
-    main()

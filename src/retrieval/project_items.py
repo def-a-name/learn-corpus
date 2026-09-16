@@ -28,17 +28,14 @@ from src.retrieval.contracts import (
     SourceSnapshot,
 )
 from src.retrieval.text import estimate_evidence_tokens
-from src.shared.corpus_core import MANIFEST_PATH, REPO_ROOT, parse_frontmatter, parse_line_locator
+from src.corpus.document import parse_frontmatter, parse_line_locator
+from src.corpus.paths import MANIFEST_PATH, REPO_ROOT
+from src.corpus.scopes import SOURCE_ROOTS
 
 TARGET_MIN_TOKENS = 400
 TARGET_MAX_TOKENS = 600
 HARD_MAX_TOKENS = 800
 
-_ALLOWED_ROOTS = {
-    "conversation": PurePosixPath("sources/conversations"),
-    "note": PurePosixPath("sources/notes"),
-    "article": PurePosixPath("sources/articles"),
-}
 _ATX_HEADING = re.compile(r"^ {0,3}(?P<level>#{1,6})[ \t]+(?P<title>.*?)[ \t]*#*[ \t]*$")
 _FENCE_START = re.compile(r"^ {0,3}(?P<marker>`{3,}|~{3,})")
 _LIST_START = re.compile(r"^\s*(?:[-+*]|\d+[.)])[ \t]+")
@@ -757,7 +754,7 @@ def _parse_document(
 
 def _source_type(output_path: str) -> str:
     pure = PurePosixPath(output_path)
-    for scope, root in _ALLOWED_ROOTS.items():
+    for scope, root in SOURCE_ROOTS.items():
         try:
             pure.relative_to(root)
         except ValueError:
@@ -785,7 +782,7 @@ def _validate_source(
     ):
         raise ProjectionError(f"source {source_id} has an invalid output_path")
     scope = _source_type(output_path)
-    allowed_root = (repo_root / _ALLOWED_ROOTS[scope]).resolve()
+    allowed_root = (repo_root / SOURCE_ROOTS[scope]).resolve()
     path = (repo_root / output_path).resolve()
     try:
         path.relative_to(allowed_root)
@@ -961,7 +958,7 @@ def project_corpus(
 
     discovered = {
         path.relative_to(repo_root).as_posix()
-        for root in _ALLOWED_ROOTS.values()
+        for root in SOURCE_ROOTS.values()
         for path in (repo_root / root).rglob("*.md")
         if path.is_file()
     }

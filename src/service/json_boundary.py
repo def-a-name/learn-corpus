@@ -12,6 +12,13 @@ MAX_JSON_KEYS = 32
 MAX_JSON_ARRAY_ITEMS = 20
 
 
+class JSONLimitFailure(HTTPFailure):
+    """区分资源预算超限与 JSON 语法或值非法。"""
+
+    def __init__(self):
+        super().__init__("invalid_request")
+
+
 def parse_json(raw: bytes, *, max_keys: int, max_array_items: int) -> object:
     """先限制容器深度，再解析并拒绝重复 key、非 JSON 数值和非法字符。"""
 
@@ -31,7 +38,7 @@ def parse_json(raw: bytes, *, max_keys: int, max_array_items: int) -> object:
             elif char in "[{":
                 depth += 1
                 if depth > 8:
-                    raise ValueError("depth exceeded")
+                    raise JSONLimitFailure()
             elif char in "]}":
                 depth -= 1
         key_count = 0
@@ -40,8 +47,10 @@ def parse_json(raw: bytes, *, max_keys: int, max_array_items: int) -> object:
             nonlocal key_count
             key_count += len(values)
             result = dict(values)
-            if len(result) != len(values) or key_count > max_keys:
+            if len(result) != len(values):
                 raise ValueError("invalid keys")
+            if key_count > max_keys:
+                raise JSONLimitFailure()
             return result
 
         def reject_constant(_):
@@ -60,7 +69,7 @@ def parse_json(raw: bytes, *, max_keys: int, max_array_items: int) -> object:
                     validate(child)
             elif isinstance(node, list):
                 if len(node) > max_array_items:
-                    raise ValueError("array exceeded")
+                    raise JSONLimitFailure()
                 for child in node:
                     validate(child)
             elif isinstance(node, float) and not math.isfinite(node):

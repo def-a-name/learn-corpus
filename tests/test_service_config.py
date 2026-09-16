@@ -34,6 +34,22 @@ def write_config(tmp_path, values):
     return path
 
 
+def test_deployment_examples_share_loopback_http_baseline():
+    root = Path(__file__).resolve().parents[1]
+    values = json.loads((root / "config/config.json.example").read_text())
+    http = values["http"]
+    assert (http["host"], http["port"]) == ("127.0.0.1", 2699)
+    assert http["allowed_peers"] == ["127.0.0.1"]
+
+    nginx = (root / "config/nginx.conf.example").read_text()
+    assert "proxy_pass http://127.0.0.1:2699;" in nginx
+    assert f"server_name {http['allowed_hosts'][0]};" in nginx
+
+    systemd = (root / "config/systemd.service.example").read_text()
+    assert "--config /opt/learn-corpus/config/config.json" in systemd
+    assert " --host " not in systemd and " --port " not in systemd
+
+
 def test_unified_http_keeps_auth_and_shared_mcp_core(unified, config, tmp_path):
     path = write_config(tmp_path, unified)
     selected = load_service_config(path)
@@ -124,20 +140,39 @@ def test_unified_duplicate_keys_and_size_limit(tmp_path):
             load_service_config(path)
 
 
-@pytest.mark.parametrize("overrides, expected", [
-    ([], ("127.0.0.1", 8765)),
-    (["--host", "192.168.123.45", "--port", "2699"], ("192.168.123.45", 2699)),
-])
-def test_unified_http_launcher_uses_config_and_cli_overrides(unified, tmp_path, monkeypatch, overrides, expected):
+def test_unified_http_launcher_uses_only_config_bind(unified, tmp_path, monkeypatch):
     from src.service.http import http_server
 
     path = write_config(tmp_path, unified)
     calls = []
     monkeypatch.setattr(http_server.uvicorn, "run", lambda app, **kwargs: calls.append(kwargs))
-    monkeypatch.setattr(sys, "argv", ["server", "--config", str(path), *overrides])
+    monkeypatch.setattr(sys, "argv", ["server", "--config", str(path)])
     assert server.main() == 0
-    assert (calls[0]["host"], calls[0]["port"]) == expected
+    assert (calls[0]["host"], calls[0]["port"]) == ("127.0.0.1", 8765)
     assert calls[0]["workers"] == 1 and calls[0]["proxy_headers"] is False
+
+
+@pytest.mark.parametrize("field", ["host", "port"])
+def test_unified_http_launcher_reports_missing_bind_field(unified, tmp_path, monkeypatch, capsys, field):
+    del unified["http"][field]
+    path = write_config(tmp_path, unified)
+    monkeypatch.setattr(sys, "argv", ["server", "--config", str(path)])
+    assert server.main() == 2
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert f"HTTP configuration is missing required fields: {field}" in output.err
+    assert "Traceback" not in output.err
+
+
+def test_unified_launcher_reports_invalid_config_reason(unified, tmp_path, monkeypatch, capsys):
+    unified["http"]["port"] = 0
+    path = write_config(tmp_path, unified)
+    monkeypatch.setattr(sys, "argv", ["server", "--config", str(path)])
+    assert server.main() == 2
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "HTTP port must be an integer from 1 to 65535" in output.err
+    assert "Traceback" not in output.err
 
 
 def test_stdio_dispatch_never_constructs_http(unified, tmp_path, monkeypatch, capsys):
@@ -158,7 +193,9 @@ def test_stdio_dispatch_never_constructs_http(unified, tmp_path, monkeypatch, ca
     assert len(calls) == 1 and isinstance(calls[0], StdioConfig)
     for flags in (["--host", "127.0.0.1"], ["--port", "8765"]):
         monkeypatch.setattr(sys, "argv", ["server", "--config", str(path), *flags])
-        assert server.main() == 2
+        with pytest.raises(SystemExit) as exc:
+            server.main()
+        assert exc.value.code == 2
     assert len(calls) == 1
     output = capsys.readouterr()
     assert output.out == "" and "Traceback" not in output.err

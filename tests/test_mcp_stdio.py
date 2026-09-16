@@ -190,7 +190,7 @@ def test_unicode_sections_and_byte_budget(launch, config, open_core, scope):
     (b'{', -32700), (b'[]', -32600), (b'\xff', -32700),
     (b'{"jsonrpc":"2.0","jsonrpc":"2.0"}', -32700),
     (b'{"jsonrpc":"2.0","id":true,"method":"ping"}', -32600),
-    (b'[[[[[[[[[0]]]]]]]]]', -32700), (br'"\ud800"', -32700),
+    (b'[[[[[[[[[0]]]]]]]]]', -32600), (br'"\ud800"', -32700),
 ])
 def test_malformed_frames_are_bounded_and_connection_recovers(launch, raw, code):
     with launch() as (client, _):

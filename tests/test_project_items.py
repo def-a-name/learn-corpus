@@ -25,7 +25,7 @@ from src.retrieval.project_items import (  # noqa: E402
     stable_item_id,
 )
 from src.retrieval.text import estimate_evidence_tokens  # noqa: E402
-from src.shared.corpus_core import yaml_document  # noqa: E402
+from src.corpus.document import yaml_document  # noqa: E402
 
 
 class ProjectionFixture:

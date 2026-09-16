@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""更新来源的 ingest 或 curation 状态；不会修改来源正文。"""
+"""提供来源 ingest 或 curation 状态更新命令。"""
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
 
-from src.shared.corpus_core import (
+from src.corpus.manifest import (
     ALLOWED_CURATION_STATUSES,
     ALLOWED_INGEST_STATUSES,
-    MANIFEST_PATH,
     load_manifest,
     save_manifest,
     utc_now,
 )
+from src.corpus.paths import MANIFEST_PATH
 
 
 def main() -> None:

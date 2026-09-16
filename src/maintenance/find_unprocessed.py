@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""列出 manifest 中真实触发了 curation 流程的来源。"""
+"""提供未完成 curation 来源的查询命令。"""
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
 
-from src.shared.corpus_core import MANIFEST_PATH, load_manifest
+from src.corpus.manifest import load_manifest
+from src.corpus.paths import MANIFEST_PATH
 
 
 def main() -> None:

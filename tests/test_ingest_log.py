@@ -10,7 +10,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from src.shared.ingest_log import SourceChangeTracker, check_ingest_log  # noqa: E402
+from src.corpus.ingest_log import SourceChangeTracker, check_ingest_log  # noqa: E402
 
 
 def git(repo: Path, *args: str) -> None:

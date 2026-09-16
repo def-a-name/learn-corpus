@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""扫描即将进入 Git 的文本文件，只报告位置和类型，不回显可疑值。"""
+"""提供 Git 候选文本的凭据模式扫描命令。"""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from src.shared.corpus_core import REPO_ROOT
+from src.corpus.paths import REPO_ROOT
 
 
 ALLOW_MARKER = "secret-scan: allow"

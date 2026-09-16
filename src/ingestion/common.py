@@ -1,32 +1,16 @@
 #!/usr/bin/env python3
-"""Learn Corpus 导入和维护脚本共用工具。"""
+"""来源导入器共用的文本清洗、过滤和标准化辅助逻辑。"""
 
 from __future__ import annotations
 
-import hashlib
 import json
 import re
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-import yaml
+from src.corpus.document import yaml_document
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-MANIFEST_PATH = REPO_ROOT / "meta" / "manifest.json"
-ALLOWED_INGEST_STATUSES = {"ready", "review", "skipped", "excluded"}
-ALLOWED_CURATION_STATUSES = {
-    "unassessed",
-    "candidate",
-    "drafted",
-    "promoted",
-    "store_only",
-    "rejected",
-    "conflict",
-}
-# 兼容首次基线中的旧 CLI 名称；新代码应使用上面两个独立状态集合。
-ALLOWED_SOURCE_STATUSES = ALLOWED_CURATION_STATUSES
 CLAUDE_IMPORTER_VERSION = 9
 CLAUDE_ASSISTANT_FINAL_DETECTION = "heuristic"
 # 兼容尚未迁移的外部调用；Claude importer 使用专用版本常量。
@@ -92,38 +76,6 @@ _SECRET_PATTERNS = [
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.DOTALL),
 ]
-
-_LINE_LOCATOR_SUFFIX = re.compile(r"@L(?P<start>\d+)-L(?P<end>\d+)$")
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def sha256_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def format_line_locator(locator: str, start_line: int, end_line: int) -> str:
-    if start_line < 1 or end_line < start_line:
-        raise ValueError(f"invalid locator line range: {start_line}-{end_line}")
-    base, _, _ = parse_line_locator(locator)
-    return f"{base}@L{start_line}-L{end_line}"
-
-
-def parse_line_locator(locator: str) -> tuple[str, int | None, int | None]:
-    match = _LINE_LOCATOR_SUFFIX.search(locator)
-    if match is None:
-        return locator, None, None
-    return locator[: match.start()], int(match.group("start")), int(match.group("end"))
 
 
 def read_jsonl(path: Path) -> tuple[list[dict[str, Any]], int]:
@@ -294,47 +246,6 @@ def project_from_path(path: str | Path) -> str:
             name = name[len(prefix):]
             break
     return name.strip("-") or "global"
-
-
-def yaml_document(metadata: dict[str, Any], body: str) -> str:
-    header = yaml.safe_dump(metadata, allow_unicode=True, sort_keys=False).strip()
-    return f"---\n{header}\n---\n\n{body.rstrip()}\n"
-
-
-def parse_frontmatter(path: Path) -> tuple[dict[str, Any], str]:
-    text = path.read_text(encoding="utf-8")
-    if not text.startswith("---\n"):
-        return {}, text
-    end = text.find("\n---\n", 4)
-    if end == -1:
-        raise ValueError(f"front matter is not closed: {path}")
-    metadata = yaml.safe_load(text[4:end]) or {}
-    if not isinstance(metadata, dict):
-        raise ValueError(f"front matter must be an object: {path}")
-    return metadata, text[end + 5 :].lstrip("\n")
-
-
-def load_manifest(path: Path = MANIFEST_PATH) -> dict[str, Any]:
-    if not path.exists():
-        return {"version": 2, "sources": {}}
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or not isinstance(data.get("sources"), dict):
-        raise ValueError(f"invalid manifest format: {path}")
-    return data
-
-
-def save_manifest(data: dict[str, Any], path: Path = MANIFEST_PATH) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_suffix(path.suffix + ".tmp")
-    temp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temp_path.replace(path)
-
-
-def relative_to_repo(path: Path) -> str:
-    try:
-        return path.resolve().relative_to(REPO_ROOT).as_posix()
-    except ValueError:
-        return str(path.resolve())
 
 
 def build_conversation_document(

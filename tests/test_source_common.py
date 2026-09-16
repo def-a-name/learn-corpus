@@ -8,22 +8,24 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from src.shared.corpus_core import (  # noqa: E402
+from src.corpus.document import (  # noqa: E402
+    format_line_locator,
+    parse_frontmatter,
+    parse_line_locator,
+    yaml_document,
+)
+from src.ingestion.common import (  # noqa: E402
     clean_message,
     derive_title,
-    format_line_locator,
     has_substantive_exchange,
     is_exact_meaningless_exchange,
     is_noise_message,
     is_trivial_session,
-    parse_frontmatter,
-    parse_line_locator,
     redact_secrets,
-    yaml_document,
 )
 
 
-class TestCorpusCore:
+class TestSourceCommon:
     def test_line_locator_round_trip(self) -> None:
         locator = format_line_locator("synthetic-export.md#Session:7", 120, 145)
         assert locator == "synthetic-export.md#Session:7@L120-L145"

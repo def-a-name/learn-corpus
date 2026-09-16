@@ -16,8 +16,8 @@ from src.ingestion.import_web_chat import (  # noqa: E402
     load_review_resolutions,
     unit_skip_reason,
 )
-from src.operations.check_corpus import check_source_consistency  # noqa: E402
-from src.operations.rebuild_review_queue import build_queue  # noqa: E402
+from src.maintenance.check_corpus import check_source_consistency  # noqa: E402
+from src.maintenance.rebuild_review_queue import build_queue  # noqa: E402
 
 
 DEEPSEEK_REVIEW = """> From: https://chat.deepseek.com/a/chat/s/synthetic-deepseek-session

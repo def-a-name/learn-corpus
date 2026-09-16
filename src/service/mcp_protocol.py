@@ -6,12 +6,16 @@ import json
 from dataclasses import dataclass
 
 from src.retrieval.lexical_store import LexicalStoreError
-from src.service.json_boundary import strict_json
+from src.service.json_boundary import JSONLimitFailure, parse_json
 from src.service.http.openapi import build_openapi
 from src.service.errors import ERRORS, HTTPFailure
 
 
 PROTOCOL_VERSION = "2025-06-18"
+# 元数据独立限额为工具参数和协议字段留出余量；传输层仍限制整份消息字节数。
+MCP_MAX_JSON_KEYS = 256
+MCP_MAX_META_KEYS = 192
+MCP_MAX_META_BYTES = 8192
 TOOLS = {"search_sources": "search", "read_bundle": "read_bundle", "status": "status"}
 _DESCRIPTIONS = {
     "search_sources": "Find candidate evidence. Snippets are only for selection; call read_bundle before factual answers. Put the strongest lexical query first. Do not infer ranking scores.",
@@ -96,7 +100,9 @@ def _valid_id(value):
 def parse_envelope(raw):
     """校验封装后再由入口检查 transport 专属字段，保留 HTTP 的检查顺序。"""
     try:
-        value = strict_json(raw)
+        value = parse_json(raw, max_keys=MCP_MAX_JSON_KEYS, max_array_items=20)
+    except JSONLimitFailure:
+        raise RPCFailure(-32600, "Request resource limit exceeded") from None
     except HTTPFailure:
         raise RPCFailure(-32700, "Parse error") from None
     if type(value) is not dict or value.get("jsonrpc") != "2.0" or value.keys() - {"jsonrpc", "id", "method", "params"}:
@@ -118,6 +124,14 @@ def prepare_message(value, core):
     params = value.get("params", {})
     if "_meta" in params and type(params["_meta"]) is not dict:
         raise RPCFailure(-32602, "Invalid params", rpc_id)
+    if "_meta" in params:
+        raw_meta = json.dumps(params["_meta"], ensure_ascii=False, separators=(",", ":")).encode()
+        if len(raw_meta) > MCP_MAX_META_BYTES:
+            raise RPCFailure(-32602, "Metadata resource limit exceeded", rpc_id)
+        try:
+            parse_json(raw_meta, max_keys=MCP_MAX_META_KEYS, max_array_items=20)
+        except JSONLimitFailure:
+            raise RPCFailure(-32602, "Metadata resource limit exceeded", rpc_id) from None
     params = {key: child for key, child in params.items() if key != "_meta"}
     if "id" not in value:
         if method == "notifications/initialized" and not params:

@@ -91,7 +91,7 @@ def test_no_other_capabilities(config, method):
     (b'{"jsonrpc":"2.0","id":1,"method":"ping","extra":1}', -32600),
     (b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_item"}}', -32602),
     (b'{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"cursor":"secret"}}', -32602),
-    (b'[[[[[[[[[0]]]]]]]]]', -32700), (b'"\\ud800"', -32700), (b'\xff', -32700),
+    (b'[[[[[[[[[0]]]]]]]]]', -32600), (b'"\\ud800"', -32700), (b'\xff', -32700),
 ])
 def test_protocol_parser_failures_are_safe(config, body, code):
     with client_for(config) as client:

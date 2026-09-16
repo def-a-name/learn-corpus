@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""检查来源与派生状态完整性。"""
+"""提供来源与派生状态完整性检查命令。"""
 
 from __future__ import annotations
 
@@ -9,19 +9,20 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from src.shared.ingest_log import check_ingest_log
-from src.shared.corpus_core import (
+from src.corpus.ingest_log import check_ingest_log
+from src.corpus.document import parse_frontmatter
+from src.corpus.manifest import (
     ALLOWED_CURATION_STATUSES,
     ALLOWED_INGEST_STATUSES,
+    load_manifest,
+)
+from src.corpus.paths import MANIFEST_PATH, REPO_ROOT
+from src.corpus.storage import sha256_file
+from src.ingestion.common import (
     CLAUDE_ASSISTANT_FINAL_DETECTION,
     CODEX_ASSISTANT_FINAL_DETECTION,
-    MANIFEST_PATH,
-    REPO_ROOT,
     WEB_CHAT_ASSISTANT_FINAL_DETECTION,
-    load_manifest,
-    parse_frontmatter,
     redact_secrets,
-    sha256_file,
 )
 
 

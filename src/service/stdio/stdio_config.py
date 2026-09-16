@@ -21,10 +21,15 @@ class StdioConfig:
     def __post_init__(self):
         if self.shutdown_timeout_ms is None:
             object.__setattr__(self, "shutdown_timeout_ms", self.corpus_timeout_ms + 1000)
-        values = (self.corpus_timeout_ms, self.frame_timeout_ms,
-                  self.write_timeout_ms, self.shutdown_timeout_ms)
-        if not all(positive_integer(value) for value in values):
-            raise ValueError("stdio limits must be positive integers")
+        values = {
+            "corpus_timeout_ms": self.corpus_timeout_ms,
+            "frame_timeout_ms": self.frame_timeout_ms,
+            "write_timeout_ms": self.write_timeout_ms,
+            "shutdown_timeout_ms": self.shutdown_timeout_ms,
+        }
+        for name, value in values.items():
+            if not positive_integer(value):
+                raise ValueError(f"{name} must be a positive integer")
 
 
 def parse_stdio_config(values: dict, path: Path) -> StdioConfig:
@@ -33,7 +38,7 @@ def parse_stdio_config(values: dict, path: Path) -> StdioConfig:
     values = dict(values)
     candidate = values["corpus_path"]
     if not isinstance(candidate, str) or not candidate:
-        raise ValueError("configuration path is invalid")
+        raise ValueError("corpus_path must be a non-empty path string")
     candidate = Path(candidate)
     values["corpus_path"] = candidate if candidate.is_absolute() else path.parent / candidate
     return StdioConfig(**values)

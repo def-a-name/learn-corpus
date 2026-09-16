@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""根据 inventory 和 manifest 重建来源导入问题队列。"""
+"""提供来源导入问题队列的重建命令。"""
 
 from __future__ import annotations
 
@@ -9,7 +9,9 @@ import shlex
 from pathlib import Path
 from typing import Any
 
-from src.shared.corpus_core import MANIFEST_PATH, REPO_ROOT, load_manifest, parse_line_locator
+from src.corpus.document import parse_line_locator
+from src.corpus.manifest import load_manifest
+from src.corpus.paths import MANIFEST_PATH, REPO_ROOT
 
 
 DEFAULT_INVENTORY = REPO_ROOT / "meta" / "source-inventory.json"
@@ -90,7 +92,7 @@ def build_queue(
     lines = [
         "# 来源导入审核队列",
         "",
-        "<!-- 此文件由 src.operations.rebuild_review_queue 生成。 -->",
+        "<!-- 此文件由 src.maintenance.rebuild_review_queue 生成。 -->",
         "",
         "这里只列出会阻塞来源正确性的解析、角色、locator、敏感信息或完整性问题。",
         "`ready + unassessed` 的普通来源不会进入本队列。",
