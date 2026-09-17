@@ -10,7 +10,7 @@ from time import monotonic
 from typing import Any
 from uuid import uuid4
 
-from src.retrieval.bundle import bundle_key, check_deadline, read_members
+from src.retrieval.bundle import bundle_key, check_deadline, prioritize_members, read_members
 from src.retrieval.contracts import ESTIMATOR_VERSION, Item
 from src.retrieval.lexical_store import (
     BudgetExceededError,
@@ -151,19 +151,26 @@ def _validate_response(payload: dict[str, Any], operation: str) -> None:
             raise IndexUnavailableError("public search response is invalid")
     else:
         if set(payload) != common | {
-            "bundle_key", "bundle_status", "membership_complete", "missing_item_ids", "items",
+            "seed_item_id", "bundle_key", "bundle_status", "membership_complete",
+            "missing_item_ids", "items",
         }:
             raise IndexUnavailableError("public bundle response schema is invalid")
         items = payload["items"]
         extra = {"body", "is_truncated", "relations"}
         missing = payload["missing_item_ids"]
+        if type(items) is not list or type(missing) is not list:
+            raise IndexUnavailableError("public bundle item arrays are invalid")
+        returned_ids = {item["item_id"] for item in items}
         if (
-            payload["bundle_status"] not in {"complete", "partial_budget", "partial_error"}
+            not isinstance(payload["seed_item_id"], str)
+            or _ITEM_ID.fullmatch(payload["seed_item_id"]) is None
+            or payload["seed_item_id"] not in returned_ids
+            or payload["bundle_status"] not in {"complete", "partial_budget", "partial_error"}
             or re.fullmatch(r"bnd_[0-9a-f]{40}", payload["bundle_key"]) is None
             or type(payload["membership_complete"]) is not bool
             or len(set(missing)) != len(missing)
             or any(not isinstance(ref, str) or _ITEM_ID.fullmatch(ref) is None for ref in missing)
-            or set(missing) & {item["item_id"] for item in items}
+            or set(missing) & returned_ids
             or (payload["bundle_status"] == "complete" and (
                 not payload["membership_complete"] or missing or not items
             ))
@@ -263,25 +270,41 @@ class RetrievalCore:
         seed = self.store.read_canonical_item(values.seed_item_id, values.generation, deadline=deadline)
         key = bundle_key(seed)
         members = read_members(self.store, seed, deadline)
-        items = []
+        item_payloads = {}
         for item in members:
             check_deadline(deadline)
-            items.append({
+            item_payloads[item.item_id] = {
                 **_metadata(item), "body": item.body, "is_truncated": False,
                 "relations": asdict(item.relations),
-            })
-        for count in range(len(items), -1, -1):
-            response = self._encode({
+            }
+
+        def encode(selected: set[str]) -> PublicResponse | None:
+            complete = len(selected) == len(members)
+            return self._encode({
                 "request_id": request_id, "generation": self.store.generation,
-                "bundle_key": key,
-                "bundle_status": "complete" if count == len(items) else "partial_budget",
+                "seed_item_id": seed.item_id, "bundle_key": key,
+                "bundle_status": "complete" if complete else "partial_budget",
                 "membership_complete": True,
-                "missing_item_ids": [item.item_id for item in members[count:]],
-                "items": items[:count],
+                "missing_item_ids": [
+                    item.item_id for item in members if item.item_id not in selected
+                ],
+                "items": [item_payloads[item.item_id] for item in members if item.item_id in selected],
             }, "bundle", max_tokens, deadline)
-            if response is not None:
-                return response
-        raise BudgetExceededError("minimum bundle response exceeds the response budget")
+
+        priority = prioritize_members(members, seed.item_id)
+        selected = {seed.item_id}
+        response = encode(selected)
+        if response is None:
+            raise BudgetExceededError("bundle seed exceeds the response budget")
+        for item in priority[1:]:
+            check_deadline(deadline)
+            candidate = selected | {item.item_id}
+            expanded = encode(candidate)
+            if expanded is None:
+                break
+            selected = candidate
+            response = expanded
+        return response
 
     def validate_request(self, operation: str, request: object) -> _PreparedRequest:
         """校验并编译一次；入口和后续 core 执行复用不可变结果。"""

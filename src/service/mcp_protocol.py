@@ -19,7 +19,7 @@ MCP_MAX_META_BYTES = 8192
 TOOLS = {"search_sources": "search", "read_bundle": "read_bundle", "status": "status"}
 _DESCRIPTIONS = {
     "search_sources": "Find candidate evidence. Snippets are only for selection; call read_bundle before factual answers. Put the strongest lexical query first. Do not infer ranking scores.",
-    "read_bundle": "Read one bounded exchange or section selected by search. Judge each item's role and evidence_role separately; assistant suggestions do not imply user adoption. turn_index only orders items within the same source.",
+    "read_bundle": "Read a seed-centered bounded window from one exchange or section selected by search. A successful response always includes the complete seed body; items are returned in source order. Judge each item's role and evidence_role separately; assistant suggestions do not imply user adoption.",
     "status": "Return the pinned generation, supported scopes and per-request limits.",
 }
 _UNTRUSTED = (

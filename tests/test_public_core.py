@@ -131,23 +131,45 @@ def test_public_whitelist_and_exact_serialized_usage(open_core):
 
 
 @pytest.mark.parametrize("constraint", ["tokens", "bytes"])
-def test_bundle_budget_preserves_full_prefix_and_all_missing_ids(open_core, monkeypatch, constraint):
-    items = parts("note", "A", ("# A\n" + "quasar " * 160, "quasar " * 160, "quasar " * 160))
+def test_bundle_budget_centers_on_seed_and_preserves_source_order(open_core, monkeypatch, constraint):
+    items = parts("note", "A", tuple("# A\n" + "quasar " * 160 for _ in range(5)))
     core = open_core(items)
-    full = read(core, items[-1])
+    seed = items[2]
+    full = read(core, seed)
     if constraint == "tokens":
-        partial = read(core, items[-1], max_estimated_tokens=full.payload["usage"]["estimated_evidence_tokens"] - 300)
+        partial = read(core, seed, max_estimated_tokens=full.payload["usage"]["estimated_evidence_tokens"] - 300)
     else:
         monkeypatch.setattr(public_core, "MAX_RESPONSE_BYTES", len(full.json_bytes) - 900)
-        partial = read(core, items[-1])
+        partial = read(core, seed)
     payload = partial.payload
     count = len(payload["items"])
-    assert 0 < count < len(items)
+    assert 1 < count < len(items)
+    assert payload["seed_item_id"] == seed.item_id
     assert payload["bundle_status"] == "partial_budget"
     assert payload["membership_complete"] is True
-    assert payload["missing_item_ids"] == [item.item_id for item in items[count:]]
-    assert [item["body"] for item in payload["items"]] == [item.body for item in items[:count]]
+    priority = (items[2], items[3], items[1], items[4], items[0])
+    selected = {item.item_id for item in priority[:count]}
+    assert [item["item_id"] for item in payload["items"]] == [
+        item.item_id for item in items if item.item_id in selected
+    ]
+    assert payload["missing_item_ids"] == [
+        item.item_id for item in items if item.item_id not in selected
+    ]
     assert all(item["is_truncated"] is False for item in payload["items"])
+
+
+@pytest.mark.parametrize("seed_index", [0, 2, 4])
+def test_partial_bundle_always_contains_the_requested_seed(open_core, seed_index):
+    items = parts("note", "A", tuple("quasar " * 160 for _ in range(5)))
+    core = open_core(items)
+    full = read(core, items[seed_index]).payload
+    partial = read(
+        core, items[seed_index],
+        max_estimated_tokens=full["usage"]["estimated_evidence_tokens"] - 300,
+    ).payload
+    assert partial["bundle_status"] == "partial_budget"
+    assert partial["seed_item_id"] == items[seed_index].item_id
+    assert items[seed_index].item_id in {item["item_id"] for item in partial["items"]}
 
 
 @pytest.mark.parametrize("constraint", ["tokens", "bytes"])
@@ -169,14 +191,11 @@ def test_search_budget_returns_ranked_prefix_and_distinguishes_no_matches(open_c
     assert len(limited["results"]) == 1 and limited["is_truncated"] is False
 
 
-def test_empty_prefix_is_partial_and_impossible_minimum_fails(open_core, monkeypatch):
+def test_seed_must_fit_and_impossible_minimum_fails(open_core, monkeypatch):
     item = parts("note", "A", ("quasar " * 250,))[0]
     core = open_core((item,))
-    partial = read(core, item, max_estimated_tokens=250).payload
-    assert partial["items"] == []
-    assert partial["missing_item_ids"] == [item.item_id]
-    assert partial["bundle_status"] == "partial_budget"
     for operation in (
+        lambda: read(core, item, max_estimated_tokens=250),
         lambda: read(core, item, max_estimated_tokens=1),
         lambda: core.search({"queries": ["quasar"], "max_estimated_tokens": 1}),
     ):
@@ -272,6 +291,7 @@ def test_more_than_eight_parts_and_unicode_json_are_preserved(open_core):
     core = open_core(items)
     response = read(core, items[-1])
     payload = response.payload
+    assert payload["seed_item_id"] == items[-1].item_id
     assert payload["bundle_status"] == "complete"
     assert len(payload["items"]) == 12
     assert all(item["body"] == body for item in payload["items"])

@@ -31,33 +31,36 @@ def new_ledger(tmp_path: Path, **limits: int) -> str:
     return run(*args)["ledger_path"]
 
 
-def search_response(*, usage: int = 300, generation: str = GENERATION) -> dict:
+def search_response(*, usage: int = 300, generation: str = GENERATION,
+                    item_ids: tuple[str, ...] = (ITEM_A,)) -> dict:
     return {
         "request_id": "req_synthetic",
         "generation": generation,
         "is_truncated": False,
         "results": [{
-            "item_id": ITEM_A,
+            "item_id": item_id,
             "bundle_key": BUNDLE,
             "source_type": "conversation",
             "title": "Sensitive synthetic title",
             "path": "sources/conversations/synthetic.md",
             "locator": "synthetic/turn:1/user",
-            "role": "human",
-            "evidence_role": "user_statement",
+            "role": "human" if item_id == ITEM_A else "assistant",
+            "evidence_role": "user_statement" if item_id == ITEM_A else "assistant_suggestion",
             "turn_index": 1,
             "snippet": "Synthetic secret snippet",
             "truncated_before": False,
             "truncated_after": False,
-        }],
+        } for item_id in item_ids],
         "usage": {"estimated_evidence_tokens": usage, "estimator_version": "synthetic-v1"},
     }
 
 
-def read_response(*, status: str, usage: int, items: list[dict], missing: list[str]) -> dict:
+def read_response(*, status: str, usage: int, items: list[dict], missing: list[str],
+                  seed_item_id: str = ITEM_A) -> dict:
     return {
         "request_id": "req_synthetic_read",
         "generation": GENERATION,
+        "seed_item_id": seed_item_id,
         "bundle_key": BUNDLE,
         "bundle_status": status,
         "membership_complete": True,
@@ -83,13 +86,15 @@ def bundle_item(item_id: str, role: str) -> dict:
     }
 
 
-def record_search(ledger: str, *, cap: int = 1000, usage: int = 300) -> None:
+def record_search(ledger: str, *, cap: int = 1000, usage: int = 300,
+                  item_ids: tuple[str, ...] = (ITEM_A,)) -> None:
     pending = run(
         "begin", ledger, "search",
         value={"queries": ["Synthetic Anchor"], "scopes": ["conversation"],
                "limit": 5, "max_estimated_tokens": cap},
     )
-    run("complete", ledger, pending["call_id"], value=search_response(usage=usage))
+    run("complete", ledger, pending["call_id"],
+        value=search_response(usage=usage, item_ids=item_ids))
 
 
 def test_records_counts_usage_and_discards_evidence_text(tmp_path: Path) -> None:
@@ -160,9 +165,9 @@ def test_requires_explicit_per_request_token_cap(tmp_path: Path) -> None:
     assert "missing a required field" in search
 
 
-def test_partial_budget_allows_one_higher_cap_remedy(tmp_path: Path) -> None:
+def test_partial_window_allows_an_unreturned_candidate_seed(tmp_path: Path) -> None:
     ledger = new_ledger(tmp_path)
-    record_search(ledger, usage=200)
+    record_search(ledger, usage=200, item_ids=(ITEM_A, ITEM_B))
     first = run(
         "begin", ledger, "read_bundle",
         value={"seed_item_id": ITEM_A, "generation": GENERATION, "max_estimated_tokens": 800},
@@ -172,34 +177,28 @@ def test_partial_budget_allows_one_higher_cap_remedy(tmp_path: Path) -> None:
         value=read_response(status="partial_budget", usage=600,
                             items=[bundle_item(ITEM_A, "human")], missing=[ITEM_B]),
     )
-    low_cap = run(
+    repeated = run(
         "begin", ledger, "read_bundle",
         value={"seed_item_id": ITEM_A, "generation": GENERATION, "max_estimated_tokens": 800},
         ok=False,
     )
-    assert "higher cap" in low_cap
-    remedy = run(
+    assert "already been attempted" in repeated
+    second = run(
         "begin", ledger, "read_bundle",
-        value={"seed_item_id": ITEM_A, "generation": GENERATION, "max_estimated_tokens": 1600},
+        value={"seed_item_id": ITEM_B, "generation": GENERATION, "max_estimated_tokens": 800},
     )
     summary = run(
-        "complete", ledger, remedy["call_id"],
-        value=read_response(status="complete", usage=900,
-                            items=[bundle_item(ITEM_A, "human"), bundle_item(ITEM_B, "assistant")],
-                            missing=[]),
+        "complete", ledger, second["call_id"],
+        value=read_response(status="partial_budget", usage=600,
+                            items=[bundle_item(ITEM_B, "assistant")], missing=[ITEM_A],
+                            seed_item_id=ITEM_B),
     )
     assert summary["partial_bundles"] == [] and summary["evidence_items"] == 2
-    third = run(
-        "begin", ledger, "read_bundle",
-        value={"seed_item_id": ITEM_A, "generation": GENERATION, "max_estimated_tokens": 2000},
-        ok=False,
-    )
-    assert "not eligible" in third
 
 
-def test_failed_partial_remedy_preserves_evidence_and_uses_the_chance(tmp_path: Path) -> None:
+def test_failed_second_window_preserves_evidence_and_cannot_repeat_seed(tmp_path: Path) -> None:
     ledger = new_ledger(tmp_path)
-    record_search(ledger, usage=200)
+    record_search(ledger, usage=200, item_ids=(ITEM_A, ITEM_B))
     first = run(
         "begin", ledger, "read_bundle",
         value={"seed_item_id": ITEM_A, "generation": GENERATION, "max_estimated_tokens": 800},
@@ -209,18 +208,18 @@ def test_failed_partial_remedy_preserves_evidence_and_uses_the_chance(tmp_path: 
         value=read_response(status="partial_budget", usage=600,
                             items=[bundle_item(ITEM_A, "human")], missing=[ITEM_B]),
     )
-    remedy = run(
+    second = run(
         "begin", ledger, "read_bundle",
-        value={"seed_item_id": ITEM_A, "generation": GENERATION, "max_estimated_tokens": 1600},
+        value={"seed_item_id": ITEM_B, "generation": GENERATION, "max_estimated_tokens": 800},
     )
-    summary = run("fail", ledger, remedy["call_id"], "service_error")
+    summary = run("fail", ledger, second["call_id"], "service_error")
     assert summary["evidence_items"] == 1 and summary["partial_bundles"] == [BUNDLE]
     retry = run(
         "begin", ledger, "read_bundle",
-        value={"seed_item_id": ITEM_A, "generation": GENERATION, "max_estimated_tokens": 2000},
+        value={"seed_item_id": ITEM_B, "generation": GENERATION, "max_estimated_tokens": 800},
         ok=False,
     )
-    assert "not eligible" in retry
+    assert "already been attempted" in retry
 
 
 def test_completion_is_idempotent_but_cannot_be_replaced(tmp_path: Path) -> None:

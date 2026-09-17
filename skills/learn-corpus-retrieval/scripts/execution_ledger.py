@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 import unicodedata
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DEFAULT_LIMITS = {"search_calls": 4, "read_calls": 8, "evidence_tokens": 8000}
 OPERATIONS = {"search", "read_bundle"}
 SCOPES = {"conversation", "note", "article"}
@@ -168,15 +168,12 @@ def _validate_request(operation: str, request: object, ledger: dict) -> dict:
     if candidate is None:
         raise LedgerError("read seed must come from a recorded search response")
     cap = _integer(request["max_estimated_tokens"], "request token cap", 1)
-    existing = ledger["bundles"].get(candidate["bundle_key"])
-    if existing is not None:
-        attempts = existing["attempts"]
-        if (existing.get("bundle_status") != "partial_budget" or len(attempts) != 1
-                or attempts[0]["status"] != "succeeded"):
-            raise LedgerError("bundle is not eligible for a partial-budget remedy")
-        first = attempts[0]
-        if seed != existing["seed_item_id"] or cap <= first["requested_token_cap"]:
-            raise LedgerError("partial-budget remedy must reuse the seed with a higher cap")
+    if any(
+        call["operation"] == "read_bundle"
+        and call["request"]["seed_item_id"] == seed
+        for call in ledger["calls"]
+    ):
+        raise LedgerError("read seed has already been attempted")
     return {"seed_item_id": seed, "generation": generation, "max_estimated_tokens": cap}
 
 
@@ -185,10 +182,10 @@ def _summary(ledger: dict) -> dict:
     search_calls = sum(call["operation"] == "search" for call in ledger["calls"])
     read_calls = sum(call["operation"] == "read_bundle" for call in ledger["calls"])
     pending = [call["id"] for call in ledger["calls"] if call["status"] == "pending"]
-    partial = sorted(
-        key for key, value in ledger["bundles"].items()
-        if value.get("bundle_status") != "complete"
-    )
+    partial = sorted(key for key, value in ledger["bundles"].items() if (
+        not value.get("membership_complete")
+        or bool(set(value.get("missing_item_ids", ())) - set(value["returned_item_ids"]))
+    ))
     return {
         "ledger_path": ledger["ledger_path"],
         "generation": ledger["generation"],
@@ -309,6 +306,8 @@ def _complete_read(ledger: dict, call: dict, response: dict) -> None:
         raise LedgerError("response generation does not match the pinned generation")
     key = _string(response.get("bundle_key"), "bundle key", BUNDLE_PATTERN)
     seed = call["request"]["seed_item_id"]
+    if response.get("seed_item_id") != seed:
+        raise LedgerError("read response seed does not match the request")
     candidate = ledger["candidate_items"][seed]
     if key != candidate["bundle_key"]:
         raise LedgerError("read response bundle does not match the seed candidate")
@@ -331,14 +330,16 @@ def _complete_read(ledger: dict, call: dict, response: dict) -> None:
         metadata = _minimal_metadata(item)
         returned.append(metadata["item_id"])
         ledger["evidence_items"][metadata["item_id"]] = metadata
+    if seed not in returned:
+        raise LedgerError("read response does not contain the seed item")
     bundle = ledger["bundles"].setdefault(key, {
-        "seed_item_id": seed,
         "attempts": [],
         "returned_item_ids": [],
         "missing_item_ids": [],
     })
     bundle["attempts"].append({
         "call_id": call["id"], "status": "succeeded",
+        "seed_item_id": seed,
         "requested_token_cap": call["request"]["max_estimated_tokens"],
     })
     bundle["bundle_status"] = status
@@ -402,10 +403,11 @@ def command_fail(args: argparse.Namespace) -> dict:
         seed = call["request"]["seed_item_id"]
         key = ledger["candidate_items"][seed]["bundle_key"]
         bundle = ledger["bundles"].setdefault(key, {
-            "seed_item_id": seed, "attempts": [], "returned_item_ids": [], "missing_item_ids": [],
+            "attempts": [], "returned_item_ids": [], "missing_item_ids": [],
         })
         bundle["attempts"].append({
             "call_id": call["id"], "status": "failed",
+            "seed_item_id": seed,
             "requested_token_cap": call["request"]["max_estimated_tokens"],
             "error_category": args.category,
         })

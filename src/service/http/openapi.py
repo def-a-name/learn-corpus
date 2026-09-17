@@ -81,12 +81,15 @@ def build_openapi() -> dict:
             "results": _array(_ref("SearchResult"), maxItems=MAX_RESULT_LIMIT),
         }),
         "ReadBundleResponse": _object({
-            **common, "bundle_key": bundle_key,
+            **common,
+            "seed_item_id": {**item_id, "description": "本次窗口的搜索命中种子；成功响应保证 items 包含其完整正文。"},
+            "bundle_key": bundle_key,
             "bundle_status": {"type": "string", "enum": ["complete", "partial_budget", "partial_error"],
                               "description": "complete=全部返回；partial_budget=预算限制导致部分条目未返回。当前实现不返回 partial_error，完整性故障直接返回错误。"},
             "membership_complete": {**boolean, "description": "是否已确定完整成员集合；为 true 不代表所有正文都已返回，应同时检查 bundle_status。"},
-            "missing_item_ids": _array(item_id, uniqueItems=True, description="已知但因预算未返回正文的成员 ID。"),
-            "items": _array(_ref("BundleItem")),
+            "missing_item_ids": _array(item_id, uniqueItems=True, description="完整成员集合中因预算未进入本次种子窗口的成员 ID。"),
+            "items": _array(_ref("BundleItem"), minItems=1,
+                            description="以 seed 为中心选择、按来源规范顺序输出的完整条目；不截断单条正文。"),
         }),
         "StatusResponse": _object({
             "generation": generation, "source_digest": string, "built_at": string,
@@ -180,7 +183,7 @@ def build_openapi() -> dict:
                         "无命中返回 200 和空 results。首次请求省略 generation；读取证据时复制响应的 generation 和 results 中的 item_id。")},
         "/v1/read-bundle": {"post": operation("read_bundle", "读取搜索命中项的相关证据", "ReadBundleResponse", "ReadBundleRequest",
             description="先执行 search，再替换示例中的 seed_item_id 和 generation；示例 ID 仅演示格式，不指向真实条目。"
-                        "返回种子条目所在证据组，不是任意数量的相邻条目。预算不足会省略完整条目，不截断单条正文；检查 bundle_status 和 missing_item_ids。")},
+                        "返回种子条目所在证据组。先保证种子完整返回，再按距离扩展，同距离优先后项；最终按来源顺序输出。预算不足会省略完整条目，不截断单条正文；检查 bundle_status 和 missing_item_ids。")},
     }
     paths["/v1/search"]["post"]["requestBody"]["content"]["application/json"]["examples"] = {
         "single_keyword": {"summary": "单关键词（最小请求）", "value": {"queries": ["SQLite"]}},

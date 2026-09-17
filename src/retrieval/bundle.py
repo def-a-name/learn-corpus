@@ -144,3 +144,23 @@ def read_members(store: LexicalStore, seed: Item, deadline: float) -> tuple[Item
         ordered.extend(parts)
     check_deadline(deadline)
     return tuple(ordered)
+
+
+def prioritize_members(members: tuple[Item, ...], seed_item_id: str) -> tuple[Item, ...]:
+    """从种子开始按距离扩展，同距离优先后项；不改变成员集合或规范顺序。"""
+
+    positions = [index for index, item in enumerate(members) if item.item_id == seed_item_id]
+    if len(positions) != 1:
+        raise IndexUnavailableError("bundle seed is not a unique member")
+    center = positions[0]
+    prioritized = [members[center]]
+    for distance in range(1, len(members)):
+        following = center + distance
+        previous = center - distance
+        if following < len(members):
+            prioritized.append(members[following])
+        if previous >= 0:
+            prioritized.append(members[previous])
+    if len(prioritized) != len(members):
+        raise IndexUnavailableError("bundle priority is incomplete")
+    return tuple(prioritized)

@@ -160,7 +160,7 @@ def test_errors_logs_and_shared_admission(config, monkeypatch, caplog):
 def test_tools_list_contract_snapshot():
     import hashlib
     encoded = json.dumps(tool_definitions(), sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode()
-    assert hashlib.sha256(encoded).hexdigest() == '6ec1f96a9c9268bfe00b41048c2b1202cc6318db913499584190a23c466546e9'
+    assert hashlib.sha256(encoded).hexdigest() == '07d45b657f71367332556b0c181fd0d5fcb4ca5b1f06e71705504ab91708fe1e'
 
 
 @pytest.mark.parametrize('scope', ['note', 'article'])

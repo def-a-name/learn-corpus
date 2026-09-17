@@ -164,6 +164,7 @@ def test_swagger_schema_and_authenticated_browser_flow(config):
         })
         assert bundle.status_code == 200
         assert set(bundle.json()) == set(schemas["ReadBundleResponse"]["required"])
+        assert bundle.json()["seed_item_id"] == seed["item_id"]
         assert set(bundle.json()["items"][0]) == set(schemas["BundleItem"]["required"])
         status = client.get("/v1/status", headers=authorized)
         assert status.status_code == 200
