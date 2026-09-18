@@ -20,6 +20,7 @@ from starlette.responses import Response
 
 from src.retrieval.lexical_store import LexicalStore, LexicalStoreError
 from src.retrieval.public_core import RequestLimits, RetrievalCore
+from src.service.execution_ledger_store import ExecutionLedgerStore
 from src.service.http.http_config import (
     MAX_AUTHORIZATION_BYTES, MAX_HEADER_BYTES, MAX_HEADERS,
     HttpConfig, load_credentials,
@@ -29,6 +30,8 @@ from src.service.http.openapi import build_openapi
 from src.service.http import mcp
 from src.service.errors import ERRORS, HTTPFailure
 from src.service.http.security import Admissions, BearerVerifier
+from src.service.ledger_config import LedgerConfig
+from src.service.retrieval_tasks import RetrievalTaskService
 
 
 _LOG = logging.getLogger("learn_corpus.service")
@@ -161,6 +164,7 @@ class RestBoundary:
                 credential = self.state.verifier.authenticate(headers.get("authorization"))
                 client_id = credential.cid
                 admission_key = "client:" + client_id
+                scope["state"]["owner_key"] = client_id
             else:
                 admission_key = operation
             if scope.get("query_string"):
@@ -173,7 +177,7 @@ class RestBoundary:
                                      maximum=32 * 1024 if operation == "mcp" else 16 * 1024)
             values = None
             if operation == "mcp":
-                message = mcp.prepare(raw, headers, self.state.core)
+                message = mcp.prepare(raw, headers, self.state.tasks)
                 scope["state"]["mcp_message"] = message
                 operation = message[2] or message[0]
                 values = message[3]
@@ -221,15 +225,18 @@ class RestBoundary:
             _LOG.info(json.dumps(event, separators=(",", ":")))
 
 
-def create_app(config: HttpConfig) -> FastAPI:
+def create_app(config: HttpConfig, ledger_config: LedgerConfig) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app):
         # 启动失败不保留半初始化 store；凭据文件必须限制读取权限。
         store = None
+        ledger = None
         try:
             app.state.verifier = BearerVerifier(load_credentials(config.credentials_file))
             store = await anyio.to_thread.run_sync(LexicalStore.open_current, config.corpus_path)
             app.state.core = RetrievalCore(store, RequestLimits(config.corpus_timeout_ms))
+            ledger = await anyio.to_thread.run_sync(ExecutionLedgerStore.open, ledger_config)
+            app.state.tasks = RetrievalTaskService(app.state.core, ledger)
             app.state.admissions = Admissions(config.global_concurrency, config.client_concurrency)
             app.state.workers = anyio.CapacityLimiter(config.global_concurrency)
             yield
@@ -240,6 +247,8 @@ def create_app(config: HttpConfig) -> FastAPI:
         finally:
             if store is not None:
                 await anyio.to_thread.run_sync(store.close)
+            if ledger is not None:
+                await anyio.to_thread.run_sync(ledger.close)
 
     app = FastAPI(title="Learn Corpus HTTP API", version="1.0.0",
                   lifespan=lifespan, docs_url="/docs", redoc_url=None, openapi_url="/openapi.json",
@@ -283,13 +292,39 @@ def create_app(config: HttpConfig) -> FastAPI:
             raise
         return result
 
+    async def run_task(request, operation):
+        function = getattr(app.state.tasks, operation)
+        args = () if operation == "status" else (request.state.retrieval_values,)
+        kwargs = {} if operation == "status" else {
+            "owner_key": request.state.owner_key,
+            "request_id": request.state.request_id,
+        }
+        worker = asyncio.create_task(anyio.to_thread.run_sync(
+            partial(function, *args, **kwargs), abandon_on_cancel=False,
+            limiter=app.state.workers,
+        ))
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            with anyio.CancelScope(shield=True):
+                while not worker.done():
+                    try:
+                        await asyncio.shield(worker)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
+                if not worker.cancelled():
+                    worker.exception()
+            raise
+
     async def execute(request, operation):
         result = await run_core(request, operation)
         return Response(result.json_bytes, media_type="application/json")
 
     @app.post("/mcp", include_in_schema=False)
     async def mcp_endpoint(request: Request):
-        return await mcp.dispatch(request, run_core)
+        return await mcp.dispatch(request, run_task)
 
     @app.get("/healthz")
     async def health():

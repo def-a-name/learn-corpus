@@ -1,4 +1,4 @@
-"""通过临时 Codex 配置验收真实 stdio 三工具，不启动模型 turn。"""
+"""通过临时 Codex 配置验收真实 stdio 五工具，不启动模型 turn。"""
 
 import json
 import os
@@ -18,17 +18,21 @@ from test_public_core import open_core  # noqa: F401
 
 @pytest.mark.skipif(os.environ.get("LEARN_CORPUS_STDIO_CODEX_TEST") != "1",
                     reason="Explicit native Codex stdio integration run")
-def test_native_codex_stdio_three_tools(config, tmp_path):
+def test_native_codex_stdio_five_tools(config, tmp_path):
     codex = shutil.which("codex")
     if codex is None:
         pytest.skip("Codex executable is unavailable")
     root = Path(__file__).resolve().parents[1]
     home = tmp_path / "synthetic-client"
     home.mkdir()
+    ledger = tmp_path / "synthetic-ledger"
+    ledger.mkdir(mode=0o700)
     service = tmp_path / "synthetic-config.json"
     service.write_text(json.dumps({"corpus_path": str(config.corpus_path),
                                    "corpus_timeout_ms": config.corpus_timeout_ms,
-                                   "mcp": {"transport": "stdio"}}))
+                                   "mcp": {"transport": "stdio", "ledger": {
+                                       "path": str(ledger / "execution.sqlite3"),
+                                   }}}))
     pid_path = tmp_path / "synthetic-server.pid"
     bootstrap = ("import os; from pathlib import Path; from src.service.server import main; "
                  f"Path({str(pid_path)!r}).write_text(str(os.getpid())); raise SystemExit(main())")
@@ -67,7 +71,10 @@ def test_native_codex_stdio_three_tools(config, tmp_path):
             thread = call(2, "thread/start", {"cwd": str(tmp_path), "ephemeral": True})["thread"]["id"]
             inventory = call(3, "mcpServerStatus/list", {"threadId": thread})
             entry = next(entry for entry in inventory["data"] if entry["name"] == "learn_corpus")
-            assert {tool["name"] for tool in entry["tools"].values()} == {"status", "search_sources", "read_bundle"}
+            assert {tool["name"] for tool in entry["tools"].values()} == {
+                "start_retrieval_task", "search_sources", "read_bundle",
+                "get_retrieval_task", "status",
+            }
 
             def tool(rpc_id, name, args):
                 result = call(rpc_id, "mcpServer/tool/call", {"threadId": thread, "server": "learn_corpus",
@@ -76,11 +83,15 @@ def test_native_codex_stdio_three_tools(config, tmp_path):
                 return result["structuredContent"]
 
             status = tool(4, "status", {})
-            search = tool(5, "search_sources", {"queries": ["quasar"], "max_estimated_tokens": 2000})
+            task_id = tool(5, "start_retrieval_task", {})["task_id"]
+            search = tool(6, "search_sources", {
+                "task_id": task_id, "queries": ["quasar"], "max_estimated_tokens": 2000,
+            })
             assert status["generation"] == search["generation"]
-            read = tool(6, "read_bundle", {"generation": search["generation"],
-                                            "seed_item_id": search["results"][0]["item_id"],
-                                            "max_estimated_tokens": 4000})
+            read = tool(7, "read_bundle", {
+                "task_id": task_id, "seed_item_id": search["results"][0]["item_id"],
+                "max_estimated_tokens": 4000,
+            })
             assert read["bundle_status"] == "complete" and len(read["items"]) == 4
             assert read["bundle_key"] == search["results"][0]["bundle_key"]
         finally:

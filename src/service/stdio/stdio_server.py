@@ -17,12 +17,15 @@ from uuid import uuid4
 
 from src.retrieval.lexical_store import LexicalStore, LexicalStoreError
 from src.retrieval.public_core import MAX_RESPONSE_BYTES, RequestLimits, RetrievalCore
+from src.service.execution_ledger_store import ExecutionLedgerStore, LedgerFailure
 from src.service.mcp_protocol import (
     RPCFailure, control_result, parse_envelope, prepare_message, rpc_payload,
     tool_error_result, tool_success_result,
 )
-from src.service.errors import ERRORS, HTTPFailure
-from src.service.stdio.stdio_config import StdioConfig, load_stdio_config
+from src.service.errors import TOOL_ERRORS, HTTPFailure
+from src.service.ledger_config import LedgerConfig
+from src.service.retrieval_tasks import RetrievalTaskService
+from src.service.stdio.stdio_config import StdioConfig
 
 
 MAX_FRAME_BYTES = 32 * 1024
@@ -56,9 +59,12 @@ class _Output:
 class StdioServer:
     """连接状态只由主循环修改；仅一个 core 调用或生命周期操作可以在线程中执行。"""
 
-    def __init__(self, config: StdioConfig):
+    def __init__(self, config: StdioConfig, ledger_config: LedgerConfig):
         self.config = config
+        self.ledger_config = ledger_config
         self.core = None
+        self.ledger = None
+        self.tasks = None
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="corpus-stdio")
         self.future = None
         self.phase = "opening"
@@ -91,18 +97,22 @@ class StdioServer:
     def _open(self):
         store = LexicalStore.open_current(self.config.corpus_path)
         try:
-            return RetrievalCore(store, RequestLimits(self.config.corpus_timeout_ms))
+            core = RetrievalCore(store, RequestLimits(self.config.corpus_timeout_ms))
+            ledger = ExecutionLedgerStore.open(self.ledger_config)
+            return core, ledger, RetrievalTaskService(core, ledger)
         except BaseException:
             store.close()
             raise
 
     def _call(self, operation, values, request_id):
         try:
-            function = getattr(self.core, operation)
-            result = function() if operation == "status" else function(values, request_id=request_id)
+            function = getattr(self.tasks, operation)
+            result = function() if operation == "status" else function(
+                values, owner_key="stdio_local", request_id=request_id,
+            )
             return tool_success_result(result), "ok"
-        except (LexicalStoreError, HTTPFailure) as exc:
-            code = exc.code if exc.code in ERRORS else "internal_error"
+        except (LexicalStoreError, LedgerFailure, HTTPFailure) as exc:
+            code = exc.code if exc.code in TOOL_ERRORS else "internal_error"
         except Exception:
             code = "internal_error"
         return tool_error_result(code, request_id), code
@@ -131,7 +141,7 @@ class StdioServer:
                 _event("protocol", "duplicate_request_id")
                 self.close(2)
                 return
-            method, rpc_id, operation, values = prepare_message(value, self.core)
+            method, rpc_id, operation, values = prepare_message(value, self.tasks)
             if rpc_id is None:
                 if method == "notifications/initialized" and self.handshake == "initializing":
                     self.handshake = "ready"
@@ -173,7 +183,7 @@ class StdioServer:
         try:
             result = future.result()
             if self.phase == "opening":
-                self.core = result
+                self.core, self.ledger, self.tasks = result
                 self.phase = "idle"
                 _event("lifecycle", "ready")
             elif self.phase == "calling":
@@ -244,7 +254,10 @@ class StdioServer:
         if self.closing and self.future is None and not self.outputs:
             if self.core is not None and self.phase != "closed":
                 self.phase = "closing"
-                self.future = self.pool.submit(self.core.store.close)
+                def close_stores():
+                    self.core.store.close()
+                    self.ledger.close()
+                self.future = self.pool.submit(close_stores)
             else:
                 return False
         if (not self.closing and self.core is not None and b"\n" in self.buffer
@@ -288,7 +301,7 @@ class _Parser(argparse.ArgumentParser):
         self.exit(2, "Invalid command arguments.\n")
 
 
-def main(config: StdioConfig | None = None):
+def main(config: StdioConfig | None = None, ledger_config: LedgerConfig | None = None):
     """统一入口可传入已选配置；也可用本模块读取统一配置。"""
     if os.name != "posix":
         print("Stdio transport requires POSIX pipes.", file=sys.stderr)
@@ -301,8 +314,15 @@ def main(config: StdioConfig | None = None):
             parser = _Parser(description="Serve the read-only retrieval MCP over stdio")
             parser.add_argument("--config", type=Path, required=True, help="Path to the service JSON configuration")
             arguments = parser.parse_args()
-            config = load_stdio_config(arguments.config)
-        server = StdioServer(config)
+            from src.service.config import load_service_config
+
+            selected = load_service_config(arguments.config)
+            if selected.transport != "stdio":
+                raise ValueError("stdio transport is not selected")
+            config, ledger_config = selected.runtime, selected.ledger
+        if ledger_config is None:
+            raise ValueError("ledger configuration is required")
+        server = StdioServer(config, ledger_config)
     except (ValueError, OSError):
         _event("lifecycle", "invalid_configuration")
         return 2

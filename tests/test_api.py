@@ -17,6 +17,7 @@ from src.service.http.http_config import HttpConfig
 from src.service.json_boundary import strict_json
 from src.service.errors import HTTPFailure
 from src.service.http.security import Admissions, BearerVerifier, Credential
+from src.service.ledger_config import LedgerConfig
 from test_public_core import exchange, open_core  # noqa: F401
 
 
@@ -48,8 +49,15 @@ def config(open_core, tmp_path):
     )
 
 
+def ledger_for(config):
+    return LedgerConfig(config.credentials_file.parent / "synthetic-ledger.sqlite3")
+
+
 def client_for(config, *, peer="192.0.2.2"):
-    return TestClient(create_app(config), base_url="http://service.test", client=(peer, 4000))
+    return TestClient(
+        create_app(config, ledger_for(config)),
+        base_url="http://service.test", client=(peer, 4000),
+    )
 
 
 def assert_error(response, status, code):
@@ -437,7 +445,8 @@ def raw_scope(path="/v1/search", *, extra_headers=()):
 
 def test_raw_asgi_body_timeout_and_duplicate_headers_return_error_json(config):
     async def exercise():
-        app = create_app(replace(config, body_timeout_ms=5))
+        selected = replace(config, body_timeout_ms=5)
+        app = create_app(selected, ledger_for(selected))
         async with app.router.lifespan_context(app):
             for scope, slow, expected in ((raw_scope(), True, 408),
                                           (raw_scope(extra_headers=((b"authorization", b"duplicate"),)), False, 400)):
@@ -457,7 +466,7 @@ def test_raw_asgi_body_timeout_and_duplicate_headers_return_error_json(config):
 @pytest.mark.parametrize("transport", ["rest", "mcp"])
 def test_request_cancellation_keeps_admission_until_worker_finishes(config, monkeypatch, transport):
     async def exercise():
-        app = create_app(config)
+        app = create_app(config, ledger_for(config))
         async with app.router.lifespan_context(app):
             entered, release = threading.Event(), threading.Event()
             original = app.state.core.search
@@ -469,12 +478,18 @@ def test_request_cancellation_keeps_admission_until_worker_finishes(config, monk
             scope = raw_scope()
             body = b'{"queries":["quasar"]}'
             if transport == "mcp":
+                task_id = app.state.tasks.start_task(
+                    {}, owner_key="synthetic-client", request_id="req_synthetic_start",
+                ).payload["task_id"]
                 scope = raw_scope("/mcp", extra_headers=(
                     (b"accept", b"application/json, text/event-stream"),
                     (b"mcp-protocol-version", b"2025-06-18"),
                 ))
                 body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                                   "params": {"name": "search_sources", "arguments": {"queries": ["quasar"]}}}).encode()
+                                   "params": {"name": "search_sources", "arguments": {
+                                       "task_id": task_id, "queries": ["quasar"],
+                                       "max_estimated_tokens": 1000,
+                                   }}}).encode()
             async def receive():
                 return {"type": "http.request", "body": body}
             async def send(_):
@@ -514,7 +529,9 @@ def test_config_loader_and_launcher_preserve_trust_boundary(config, tmp_path, mo
             "client_concurrency": config.client_concurrency,
             "body_timeout_ms": config.body_timeout_ms,
         },
-        "mcp": {"transport": "http"},
+        "mcp": {"transport": "http", "ledger": {
+            "path": "synthetic-ledger/execution.sqlite3",
+        }},
     }
     path = tmp_path / "synthetic-service.json"
     path.write_text(json.dumps(values))

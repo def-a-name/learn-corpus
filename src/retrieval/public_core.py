@@ -217,7 +217,10 @@ class RetrievalCore:
 
     def _encode(
         self, payload: dict[str, Any], operation: str, max_tokens: int, deadline: float,
+        max_response_bytes: int | None = None,
     ) -> PublicResponse | None:
+        if max_response_bytes is None:
+            max_response_bytes = MAX_RESPONSE_BYTES
         check_deadline(deadline)
         payload["usage"] = {
             "estimated_evidence_tokens": 0,
@@ -233,11 +236,14 @@ class RetrievalCore:
             if measured == payload["usage"]["estimated_evidence_tokens"]:
                 break
             payload["usage"]["estimated_evidence_tokens"] = measured
-        if measured > max_tokens or len(encoded) > MAX_RESPONSE_BYTES:
+        if measured > max_tokens or len(encoded) > max_response_bytes:
             return None
         return PublicResponse(encoded)
 
-    def search(self, request: object, *, request_id: str | None = None) -> PublicResponse:
+    def search(
+        self, request: object, *, request_id: str | None = None,
+        max_response_bytes: int | None = None,
+    ) -> PublicResponse:
         deadline, request_id = self._start(request_id)
         values = self.validate_request("search", request)
         max_tokens = values.max_tokens
@@ -258,12 +264,15 @@ class RetrievalCore:
             response = self._encode({
                 "request_id": request_id, "generation": result.generation,
                 "is_truncated": count < len(candidates), "results": candidates[:count],
-            }, "search", max_tokens, deadline)
+            }, "search", max_tokens, deadline, max_response_bytes)
             if response is not None:
                 return response
         raise BudgetExceededError("minimum search response exceeds the response budget")
 
-    def read_bundle(self, request: object, *, request_id: str | None = None) -> PublicResponse:
+    def read_bundle(
+        self, request: object, *, request_id: str | None = None,
+        max_response_bytes: int | None = None,
+    ) -> PublicResponse:
         deadline, request_id = self._start(request_id)
         values = self.validate_request("read_bundle", request)
         max_tokens = values.max_tokens
@@ -289,7 +298,7 @@ class RetrievalCore:
                     item.item_id for item in members if item.item_id not in selected
                 ],
                 "items": [item_payloads[item.item_id] for item in members if item.item_id in selected],
-            }, "bundle", max_tokens, deadline)
+            }, "bundle", max_tokens, deadline, max_response_bytes)
 
         priority = prioritize_members(members, seed.item_id)
         selected = {seed.item_id}

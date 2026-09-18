@@ -85,13 +85,17 @@ def launch(config, tmp_path):
         directory = tmp_path / f"synthetic-process-{counter}"
         counter += 1
         directory.mkdir()
+        ledger_directory = directory / "ledger"
+        ledger_directory.mkdir(mode=0o700)
         selected = service_config or config
         corpus_path = overrides.pop("corpus_path", str(selected.corpus_path))
         corpus_timeout_ms = overrides.pop("corpus_timeout_ms", selected.corpus_timeout_ms)
         values = {
             "corpus_path": corpus_path,
             "corpus_timeout_ms": corpus_timeout_ms,
-            "mcp": {"transport": "stdio", "stdio": overrides},
+            "mcp": {"transport": "stdio",
+                    "ledger": {"path": str(ledger_directory / "execution.sqlite3")},
+                    "stdio": overrides},
         }
         path = directory / "stdio.json"
         path.write_text(json.dumps(values))
@@ -121,6 +125,12 @@ def error_code(result):
     return json.loads(result["content"][0]["text"])["error"]["code"]
 
 
+def start_task(client):
+    result = client.tool("start_retrieval_task")
+    assert result["isError"] is False
+    return result["structuredContent"]["task_id"]
+
+
 def test_handshake_controls_and_stdout(launch):
     with launch(initialize=False) as (client, directory):
         assert client.rpc("tools/list")["error"]["code"] == -32600
@@ -140,36 +150,49 @@ def test_handshake_controls_and_stdout(launch):
 
 
 @pytest.mark.parametrize("query", [
-    {"queries": ["quasar"]}, {"queries": ["quasar"], "max_estimated_tokens": 350},
-    {"queries": ["absentword"]}, {"queries": ["quasar"], "scopes": ["article"]},
-    {"queries": ["quasar", "QUASAR"]}, {"queries": ["quasar"], "max_estimated_tokens": 1},
-    {"queries": ["quasar"], "generation": "gen_" + "0" * 20},
+    {"queries": ["quasar"], "max_estimated_tokens": 2000},
+    {"queries": ["absentword"], "max_estimated_tokens": 2000},
+    {"queries": ["quasar"], "scopes": ["article"], "max_estimated_tokens": 2000},
 ])
 def test_rest_http_stdio_parity(launch, config, query):
     with launch() as (pipe, _), client_for(config) as http:
-        stdio = pipe.tool("search_sources", query)
-        mcp = http_call(http, "search_sources", query).json()["result"]
+        stdio_task = start_task(pipe)
+        http_task = http_call(http, "start_retrieval_task").json()["result"]["structuredContent"]["task_id"]
+        stdio = pipe.tool("search_sources", {"task_id": stdio_task, **query})
+        mcp = http_call(http, "search_sources", {"task_id": http_task, **query}).json()["result"]
         rest = http.post("/v1/search", json=query, headers=HEADERS).json()
-        if stdio["isError"]:
-            assert error_code(stdio) == error_code(mcp) == rest["error"]["code"]
-            return
         payload = stdio["structuredContent"]
-        mcp["structuredContent"]["request_id"] = rest["request_id"] = payload["request_id"]
-        assert payload == mcp["structuredContent"] == rest
-        assert pipe.tool("status")["structuredContent"] == http.get("/v1/status", headers=HEADERS).json()
+        http_payload = mcp["structuredContent"]
+        stdio_execution = payload.pop("execution")
+        http_execution = http_payload.pop("execution")
+        http_payload["request_id"] = rest["request_id"] = payload["request_id"]
+        assert payload == http_payload == rest
+        assert stdio_execution["task_id"] == stdio_task
+        assert http_execution["task_id"] == http_task
+        status = pipe.tool("status")["structuredContent"]
+        status.pop("execution_ledger")
+        assert status == http.get("/v1/status", headers=HEADERS).json()
         if not payload["results"]:
             return
-        for budget in (8000, 450):
-            args = {"generation": payload["generation"], "seed_item_id": payload["results"][0]["item_id"],
-                    "max_estimated_tokens": budget}
-            stdio = pipe.tool("read_bundle", args)
-            mcp = http_call(http, "read_bundle", args).json()["result"]
-            rest = http.post("/v1/read-bundle", json=args, headers=HEADERS).json()
-            if stdio["isError"]:
-                assert error_code(stdio) == error_code(mcp) == rest["error"]["code"]
-            else:
-                mcp["structuredContent"]["request_id"] = rest["request_id"] = stdio["structuredContent"]["request_id"]
-                assert stdio["structuredContent"] == mcp["structuredContent"] == rest
+        rest_args = {"generation": payload["generation"],
+                     "seed_item_id": payload["results"][0]["item_id"],
+                     "max_estimated_tokens": 450}
+        stdio = pipe.tool("read_bundle", {"task_id": stdio_task,
+                                           "seed_item_id": rest_args["seed_item_id"],
+                                           "max_estimated_tokens": 450})
+        mcp = http_call(http, "read_bundle", {"task_id": http_task,
+                                               "seed_item_id": rest_args["seed_item_id"],
+                                               "max_estimated_tokens": 450}).json()["result"]
+        rest = http.post("/v1/read-bundle", json=rest_args, headers=HEADERS).json()
+        if stdio["isError"]:
+            assert error_code(stdio) == error_code(mcp) == rest["error"]["code"]
+        else:
+            stdio_payload = stdio["structuredContent"]
+            http_payload = mcp["structuredContent"]
+            stdio_payload.pop("execution")
+            http_payload.pop("execution")
+            http_payload["request_id"] = rest["request_id"] = stdio_payload["request_id"]
+            assert stdio_payload == http_payload == rest
 
 
 @pytest.mark.parametrize("scope", ["note", "article"])
@@ -177,12 +200,19 @@ def test_unicode_sections_and_byte_budget(launch, config, open_core, scope):
     core = open_core(parts(scope, "Synthetic", ('# Synthetic\nquasar 虚构正文 "quoted"', 'quasar 中文续篇')))
     selected = replace(config, corpus_path=core.store._generation_path.parent.parent)
     with launch(service_config=selected) as (pipe, _), client_for(selected) as http:
-        query = {"queries": ["虚构正文"], "scopes": [scope]}
+        task_id = start_task(pipe)
+        query = {"task_id": task_id, "queries": ["虚构正文"], "scopes": [scope],
+                 "max_estimated_tokens": 2000}
         payload = pipe.tool("search_sources", query)["structuredContent"]
-        args = {"generation": payload["generation"], "seed_item_id": payload["results"][0]["item_id"]}
+        args = {"task_id": task_id, "seed_item_id": payload["results"][0]["item_id"],
+                "max_estimated_tokens": 4000}
         result = pipe.tool("read_bundle", args)["structuredContent"]
-        rest = http.post("/v1/read-bundle", json=args, headers=HEADERS).json()
+        rest = http.post("/v1/read-bundle", json={
+            "generation": payload["generation"], "seed_item_id": args["seed_item_id"],
+            "max_estimated_tokens": args["max_estimated_tokens"],
+        }, headers=HEADERS).json()
         rest["request_id"] = result["request_id"]
+        result.pop("execution")
         assert rest == result and len(result["items"]) == 2
 
 
@@ -255,12 +285,17 @@ def _wait_for(path):
 def test_busy_cancel_and_independent_processes(launch, tmp_path):
     marker, release = tmp_path / "synthetic-entered", tmp_path / "synthetic-release"
     with launch(bootstrap=_blocked_search(marker, release)) as (first, _), launch() as (second, _):
-        first.send("tools/call", {"name": "search_sources", "arguments": {"queries": ["quasar"]}}, rpc_id=100)
+        task_id = start_task(first)
+        first.send("tools/call", {"name": "search_sources", "arguments": {
+            "task_id": task_id, "queries": ["quasar"], "max_estimated_tokens": 1000,
+        }}, rpc_id=100)
         _wait_for(marker)
         try:
             first.send("notifications/cancelled", {"requestId": 100})
             for name in ("status", "search_sources"):
-                assert error_code(first.tool(name, {"queries": ["quasar"]} if name == "search_sources" else {})) == "rate_limited"
+                arguments = ({"task_id": task_id, "queries": ["other"],
+                              "max_estimated_tokens": 1000} if name == "search_sources" else {})
+                assert error_code(first.tool(name, arguments)) == "rate_limited"
             assert first.rpc("ping")["result"] == {}
             assert second.tool("status")["isError"] is False
         finally:
@@ -273,7 +308,10 @@ def test_busy_cancel_and_independent_processes(launch, tmp_path):
 def test_shutdown_grace_forces_stuck_worker_to_exit(launch, tmp_path, close_kind):
     marker, release = tmp_path / "synthetic-entered", tmp_path / "synthetic-release"
     with launch(bootstrap=_blocked_search(marker, release), shutdown_timeout_ms=120) as (client, directory):
-        client.send("tools/call", {"name": "search_sources", "arguments": {"queries": ["quasar"]}}, rpc_id=100)
+        task_id = start_task(client)
+        client.send("tools/call", {"name": "search_sources", "arguments": {
+            "task_id": task_id, "queries": ["quasar"], "max_estimated_tokens": 1000,
+        }}, rpc_id=100)
         _wait_for(marker)
         if close_kind == "eof":
             client.proc.stdin.close()
@@ -289,7 +327,10 @@ def test_shutdown_grace_forces_stuck_worker_to_exit(launch, tmp_path, close_kind
 def test_graceful_close_waits_for_worker_then_exits(launch, tmp_path):
     marker, release = tmp_path / "synthetic-entered", tmp_path / "synthetic-release"
     with launch(bootstrap=_blocked_search(marker, release), shutdown_timeout_ms=1000) as (client, _):
-        client.send("tools/call", {"name": "search_sources", "arguments": {"queries": ["quasar"]}}, rpc_id=100)
+        task_id = start_task(client)
+        client.send("tools/call", {"name": "search_sources", "arguments": {
+            "task_id": task_id, "queries": ["quasar"], "max_estimated_tokens": 1000,
+        }}, rpc_id=100)
         _wait_for(marker)
         client.proc.stdin.close()
         sleep(0.05)
@@ -311,7 +352,10 @@ RetrievalCore._encode = slow
 raise SystemExit(main())
 '''
     with launch(bootstrap=script, corpus_timeout_ms=50) as (client, _):
-        assert error_code(client.tool("search_sources", {"queries": ["quasar"]})) == "budget_exceeded"
+        task_id = start_task(client)
+        assert error_code(client.tool("search_sources", {
+            "task_id": task_id, "queries": ["quasar"], "max_estimated_tokens": 1000,
+        })) == "budget_exceeded"
         assert client.tool("status")["isError"] is False
 
 
@@ -346,7 +390,7 @@ def test_stdio_config_relative_paths_and_shutdown_default(config, tmp_path):
     path = tmp_path / "synthetic-config.json"
     path.write_text(json.dumps({
         "corpus_path": "index", "corpus_timeout_ms": config.corpus_timeout_ms,
-        "mcp": {"transport": "stdio"},
+        "mcp": {"transport": "stdio", "ledger": {"path": "ledger/execution.sqlite3"}},
     }))
     loaded = load_stdio_config(path)
     assert loaded.corpus_path == tmp_path / "index"
@@ -366,12 +410,21 @@ def test_generation_is_pinned_until_process_restart(launch, config):
                                   "sha256:" + "b" * 64)
     with launch() as (old, _):
         first = old.tool("status")["structuredContent"]["generation"]
+        old_task = start_task(old)
+        old_search = old.tool("search_sources", {
+            "task_id": old_task, "queries": ["quasar"], "max_estimated_tokens": 1000,
+        })["structuredContent"]
+        assert old_search["generation"] == first
         newer = build_generation(projection, config.corpus_path)
         publish_generation(config.corpus_path, newer.generation)
         assert old.tool("status")["structuredContent"]["generation"] == first
         with launch() as (new, _):
             assert new.tool("status")["structuredContent"]["generation"] == newer.generation
-            assert error_code(new.tool("search_sources", {"queries": ["quasar"], "generation": first})) == "generation_mismatch"
+            new_task = start_task(new)
+            result = new.tool("search_sources", {
+                "task_id": new_task, "queries": ["quasar"], "max_estimated_tokens": 1000,
+            })["structuredContent"]
+            assert result["generation"] == newer.generation
 
 
 @pytest.mark.parametrize("method", ["resources/list", "prompts/list", "admin/rebuild"])
@@ -389,7 +442,10 @@ RetrievalCore.search = fail
 raise SystemExit(main())
 '''
     with launch(bootstrap=script) as (client, directory):
-        result = client.tool("search_sources", {"queries": ["quasar"]})
+        task_id = start_task(client)
+        result = client.tool("search_sources", {
+            "task_id": task_id, "queries": ["quasar"], "max_estimated_tokens": 1000,
+        })
         assert error_code(result) == "internal_error"
         assert "synthetic-private" not in json.dumps(result)
         assert client.tool("status")["isError"] is False
@@ -400,7 +456,10 @@ raise SystemExit(main())
 def test_duplicate_active_id_closes_without_false_response(launch, tmp_path, params):
     marker, release = tmp_path / "synthetic-entered", tmp_path / "synthetic-release"
     with launch(bootstrap=_blocked_search(marker, release), shutdown_timeout_ms=150) as (client, directory):
-        client.send("tools/call", {"name": "search_sources", "arguments": {"queries": ["quasar"]}}, rpc_id=100)
+        task_id = start_task(client)
+        client.send("tools/call", {"name": "search_sources", "arguments": {
+            "task_id": task_id, "queries": ["quasar"], "max_estimated_tokens": 1000,
+        }}, rpc_id=100)
         _wait_for(marker)
         client.send("ping", params, rpc_id=100)
         assert client.proc.wait(timeout=3) == 3
@@ -432,8 +491,9 @@ def test_blocked_stderr_does_not_block_protocol_or_exit(config, tmp_path):
         path.write_text(json.dumps({
             "corpus_path": str(config.corpus_path),
             "corpus_timeout_ms": config.corpus_timeout_ms,
-            "mcp": {"transport": "stdio"},
+            "mcp": {"transport": "stdio", "ledger": {"path": "ledger/execution.sqlite3"}},
         }))
+        (tmp_path / "ledger").mkdir(mode=0o700, exist_ok=True)
         proc = subprocess.Popen([sys.executable, "-m", "src.service.stdio.stdio_server", "--config", str(path)],
                                 cwd=ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=write_fd)
         try:

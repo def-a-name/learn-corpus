@@ -22,10 +22,10 @@ def main() -> int:
     if selected.transport == "stdio":
         from src.service.stdio.stdio_server import main as run_stdio
 
-        return run_stdio(selected.runtime)
+        return run_stdio(selected.runtime, selected.ledger)
     from src.service.http.http_server import run as run_http
 
-    return run_http(selected.runtime, selected.host, selected.port)
+    return run_http(selected.runtime, selected.host, selected.port, selected.ledger)
 
 
 if __name__ == "__main__":

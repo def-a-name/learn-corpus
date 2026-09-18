@@ -8,6 +8,7 @@ import uvicorn
 
 from src.service.http.api import create_app
 from src.service.http.http_config import HttpConfig
+from src.service.ledger_config import LedgerConfig
 
 
 class UvicornLifecycleFilter(logging.Filter):
@@ -29,7 +30,7 @@ class UvicornLifecycleFilter(logging.Filter):
         )
 
 
-def run(config: HttpConfig, host: str, port: int) -> int:
+def run(config: HttpConfig, host: str, port: int, ledger_config: LedgerConfig) -> int:
     """使用已经校验的配置启动 HTTP transport。"""
 
     # 保留 Uvicorn 正常生命周期日志，关闭默认 access 和异常详情日志。
@@ -54,7 +55,7 @@ def run(config: HttpConfig, host: str, port: int) -> int:
             "uvicorn.access": {"handlers": ["discard"], "propagate": False},
         },
     }
-    uvicorn.run(create_app(config), host=host, port=port, workers=1,
+    uvicorn.run(create_app(config, ledger_config), host=host, port=port, workers=1,
                 proxy_headers=False, access_log=False, server_header=False,
                 ws="none", loop="asyncio", lifespan="on", log_config=log_config)
     return 0

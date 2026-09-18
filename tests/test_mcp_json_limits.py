@@ -14,12 +14,16 @@ from test_public_core import open_core  # noqa: F401
 def test_nested_metadata_search_and_read(config):
     meta = {"synthetic-context": {f"field_{i}": "fictional" for i in range(40)}}
     with client_for(config) as client:
+        task = rpc(client, "tools/call", {
+            "name": "start_retrieval_task", "arguments": {},
+        }).json()["result"]["structuredContent"]["task_id"]
         params = {"_meta": meta, "name": "search_sources",
-                  "arguments": {"queries": ["quasar"], "limit": 1, "max_estimated_tokens": 2000}}
+                  "arguments": {"task_id": task, "queries": ["quasar"], "limit": 1,
+                                "max_estimated_tokens": 2000}}
         response = rpc(client, "tools/call", params)
         assert response.status_code == 200
         search = response.json()["result"]["structuredContent"]
-        args = {"generation": search["generation"], "seed_item_id": search["results"][0]["item_id"],
+        args = {"task_id": task, "seed_item_id": search["results"][0]["item_id"],
                 "max_estimated_tokens": 4000}
         result = rpc(client, "tools/call", {"_meta": meta, "name": "read_bundle", "arguments": args})
         assert result.json()["result"]["isError"] is False

@@ -19,6 +19,23 @@ ERRORS = {
 }
 
 
+MCP_TASK_ERRORS = {
+    "task_not_found": (404, "Retrieval task not found"),
+    "task_busy": (409, "Retrieval task has an unresolved call"),
+    "task_blocked": (409, "Retrieval task is blocked"),
+    "search_already_attempted": (409, "Search query and scope set was already attempted"),
+    "seed_not_available": (409, "Read seed is not an available search candidate"),
+    "seed_already_attempted": (409, "Read seed was already attempted"),
+    "task_call_limit_exceeded": (429, "Retrieval task call limit exceeded"),
+    "task_budget_exceeded": (422, "Retrieval task evidence budget exceeded"),
+    "ledger_unavailable": (503, "Execution ledger unavailable"),
+    "ledger_capacity_exceeded": (503, "Execution ledger capacity exceeded"),
+}
+
+
+TOOL_ERRORS = {**ERRORS, **MCP_TASK_ERRORS}
+
+
 class HTTPFailure(Exception):
     """只携带固定公开错误，不保存请求中的敏感值。"""
 

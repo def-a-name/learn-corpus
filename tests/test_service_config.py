@@ -25,7 +25,9 @@ def unified(config):
     values["credentials_file"] = config.credentials_file.name
     common = {key: values.pop(key) for key in ("corpus_path", "corpus_timeout_ms")}
     return {**common, "http": {**values, "host": "127.0.0.1", "port": 8765},
-            "mcp": {"transport": "http", "stdio": {"frame_timeout_ms": 250}}}
+            "mcp": {"transport": "http",
+                    "ledger": {"path": "synthetic-ledger/execution.sqlite3"},
+                    "stdio": {"frame_timeout_ms": 250}}}
 
 
 def write_config(tmp_path, values):
@@ -55,12 +57,15 @@ def test_unified_http_keeps_auth_and_shared_mcp_core(unified, config, tmp_path):
     selected = load_service_config(path)
     assert selected.transport == "http" and (selected.host, selected.port) == ("127.0.0.1", 8765)
     assert selected.runtime == config
+    assert selected.ledger.path == tmp_path / "synthetic-ledger/execution.sqlite3"
     with client_for(load_http_config(path)) as client:
         assert client.get("/v1/status").status_code == 401
         rest = client.get("/v1/status", headers=HEADERS).json()
         response = rpc(client, "tools/call", {"name": "status", "arguments": {}})
         assert response.status_code == 200
-        assert response.json()["result"]["structuredContent"] == rest
+        status = response.json()["result"]["structuredContent"]
+        status.pop("execution_ledger")
+        assert status == rest
     with pytest.raises(ValueError, match="cannot load stdio configuration"):
         load_stdio_config(path)
 
@@ -89,6 +94,11 @@ def test_unified_stdio_ignores_inactive_http_settings(unified, tmp_path, with_ht
     (("mcp", "transport"), "both"),
     (("mcp", "transport"), None),
     (("mcp", "enabled"), True),
+    (("mcp", "ledger", "unknown"), True),
+    (("mcp", "ledger", "max_mb"), 0),
+    (("mcp", "ledger", "max_tasks"), True),
+    (("mcp", "ledger", "busy_timeout_ms"), 0),
+    (("mcp", "ledger", "path"), ""),
     (("mcp", "stdio", "global_concurrency"), 2),
     (("mcp", "stdio", "credentials_file"), "synthetic-secret"),
     (("http", "unknown"), True),
@@ -187,10 +197,10 @@ def test_stdio_dispatch_never_constructs_http(unified, tmp_path, monkeypatch, ca
         pytest.fail("HTTP service was started in stdio mode")
 
     monkeypatch.setattr(http_server, "run", unexpected)
-    monkeypatch.setattr(stdio_server, "main", lambda config: calls.append(config) or 3)
+    monkeypatch.setattr(stdio_server, "main", lambda config, ledger: calls.append((config, ledger)) or 3)
     monkeypatch.setattr(sys, "argv", ["server", "--config", str(path)])
     assert server.main() == 3
-    assert len(calls) == 1 and isinstance(calls[0], StdioConfig)
+    assert len(calls) == 1 and isinstance(calls[0][0], StdioConfig)
     for flags in (["--host", "127.0.0.1"], ["--port", "8765"]):
         monkeypatch.setattr(sys, "argv", ["server", "--config", str(path), *flags])
         with pytest.raises(SystemExit) as exc:
@@ -205,6 +215,7 @@ def test_stdio_dispatch_never_constructs_http(unified, tmp_path, monkeypatch, ca
 def test_unified_stdio_real_pipes_without_network(unified, tmp_path):
     unified["mcp"]["transport"] = "stdio"
     unified["http"] = {"credentials_file": "synthetic-missing-credentials"}
+    (tmp_path / "synthetic-ledger").mkdir(mode=0o700)
     path = write_config(tmp_path, unified)
     bootstrap = '''import socket
 import sys
@@ -224,11 +235,15 @@ raise SystemExit(main())
         try:
             client.initialize()
             status = client.tool("status")["structuredContent"]
-            search = client.tool("search_sources", {"queries": ["quasar"], "max_estimated_tokens": 2000})["structuredContent"]
+            task_id = client.tool("start_retrieval_task")["structuredContent"]["task_id"]
+            search = client.tool("search_sources", {
+                "task_id": task_id, "queries": ["quasar"], "max_estimated_tokens": 2000,
+            })["structuredContent"]
             assert search["generation"] == status["generation"]
-            read = client.tool("read_bundle", {"generation": search["generation"],
-                                                "seed_item_id": search["results"][0]["item_id"],
-                                                "max_estimated_tokens": 4000})["structuredContent"]
+            read = client.tool("read_bundle", {
+                "task_id": task_id, "seed_item_id": search["results"][0]["item_id"],
+                "max_estimated_tokens": 4000,
+            })["structuredContent"]
             assert read["bundle_status"] == "complete"
             assert read["bundle_key"] == search["results"][0]["bundle_key"]
             proc.stdin.close()

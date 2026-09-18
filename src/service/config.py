@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from src.service.json_boundary import parse_json
 from src.service.errors import HTTPFailure
+from src.service.ledger_config import LedgerConfig, parse_ledger_config
 
 if TYPE_CHECKING:
     from src.service.http.http_config import HttpConfig
@@ -60,6 +61,7 @@ class ServiceConfig:
 
     transport: str
     runtime: HttpConfig | StdioConfig
+    ledger: LedgerConfig
     host: str | None
     port: int | None
 
@@ -73,8 +75,9 @@ def parse_service_config(value: dict, path: Path) -> ServiceConfig:
     mcp = value["mcp"]
     if not isinstance(mcp, dict):
         raise ValueError("MCP configuration must be an object")
-    _reject_unknown_fields(mcp, {"transport", "stdio"}, "MCP")
-    _require_fields(mcp, {"transport"}, "MCP")
+    _reject_unknown_fields(mcp, {"transport", "ledger", "stdio"}, "MCP")
+    _require_fields(mcp, {"transport", "ledger"}, "MCP")
+    ledger = parse_ledger_config(mcp["ledger"], path)
     transport = mcp["transport"]
     if transport not in ("http", "stdio"):
         raise ValueError("MCP transport must be http or stdio")
@@ -94,7 +97,9 @@ def parse_service_config(value: dict, path: Path) -> ServiceConfig:
     if transport == "stdio":
         from src.service.stdio.stdio_config import parse_stdio_config
 
-        return ServiceConfig(transport, parse_stdio_config({**common, **stdio}, path), None, None)
+        return ServiceConfig(
+            transport, parse_stdio_config({**common, **stdio}, path), ledger, None, None,
+        )
     from src.service.http.http_config import parse_http_config, validate_bind
 
     _require_fields(http, _HTTP_KEYS, "HTTP")
@@ -102,7 +107,7 @@ def parse_service_config(value: dict, path: Path) -> ServiceConfig:
     runtime = parse_http_config(
         {**common, **{name: child for name, child in http.items() if name not in {"host", "port"}}}, path,
     )
-    return ServiceConfig(transport, runtime, host, port)
+    return ServiceConfig(transport, runtime, ledger, host, port)
 
 
 def load_service_config(path: Path) -> ServiceConfig:
