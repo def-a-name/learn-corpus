@@ -30,7 +30,7 @@ from src.service.http.openapi import build_openapi
 from src.service.http import mcp
 from src.service.errors import ERRORS, HTTPFailure
 from src.service.http.security import Admissions, BearerVerifier
-from src.service.ledger_config import LedgerConfig
+from src.service.ledger_config import LedgerConfig, TaskLimitsConfig
 from src.service.retrieval_tasks import RetrievalTaskService
 
 
@@ -225,7 +225,12 @@ class RestBoundary:
             _LOG.info(json.dumps(event, separators=(",", ":")))
 
 
-def create_app(config: HttpConfig, ledger_config: LedgerConfig) -> FastAPI:
+def create_app(
+    config: HttpConfig, ledger_config: LedgerConfig,
+    task_limits: TaskLimitsConfig | None = None,
+) -> FastAPI:
+    task_limits = task_limits or TaskLimitsConfig()
+
     @asynccontextmanager
     async def lifespan(app):
         # 启动失败不保留半初始化 store；凭据文件必须限制读取权限。
@@ -236,7 +241,7 @@ def create_app(config: HttpConfig, ledger_config: LedgerConfig) -> FastAPI:
             store = await anyio.to_thread.run_sync(LexicalStore.open_current, config.corpus_path)
             app.state.core = RetrievalCore(store, RequestLimits(config.corpus_timeout_ms))
             ledger = await anyio.to_thread.run_sync(ExecutionLedgerStore.open, ledger_config)
-            app.state.tasks = RetrievalTaskService(app.state.core, ledger)
+            app.state.tasks = RetrievalTaskService(app.state.core, ledger, task_limits)
             app.state.admissions = Admissions(config.global_concurrency, config.client_concurrency)
             app.state.workers = anyio.CapacityLimiter(config.global_concurrency)
             yield

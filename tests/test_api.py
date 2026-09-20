@@ -53,9 +53,9 @@ def ledger_for(config):
     return LedgerConfig(config.credentials_file.parent / "synthetic-ledger.sqlite3")
 
 
-def client_for(config, *, peer="192.0.2.2"):
+def client_for(config, *, peer="192.0.2.2", task_limits=None):
     return TestClient(
-        create_app(config, ledger_for(config)),
+        create_app(config, ledger_for(config), task_limits),
         base_url="http://service.test", client=(peer, 4000),
     )
 

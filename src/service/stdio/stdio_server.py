@@ -23,7 +23,7 @@ from src.service.mcp_protocol import (
     tool_error_result, tool_success_result,
 )
 from src.service.errors import TOOL_ERRORS, HTTPFailure
-from src.service.ledger_config import LedgerConfig
+from src.service.ledger_config import LedgerConfig, TaskLimitsConfig
 from src.service.retrieval_tasks import RetrievalTaskService
 from src.service.stdio.stdio_config import StdioConfig
 
@@ -59,9 +59,13 @@ class _Output:
 class StdioServer:
     """连接状态只由主循环修改；仅一个 core 调用或生命周期操作可以在线程中执行。"""
 
-    def __init__(self, config: StdioConfig, ledger_config: LedgerConfig):
+    def __init__(
+        self, config: StdioConfig, ledger_config: LedgerConfig,
+        task_limits: TaskLimitsConfig | None = None,
+    ):
         self.config = config
         self.ledger_config = ledger_config
+        self.task_limits = task_limits or TaskLimitsConfig()
         self.core = None
         self.ledger = None
         self.tasks = None
@@ -99,7 +103,7 @@ class StdioServer:
         try:
             core = RetrievalCore(store, RequestLimits(self.config.corpus_timeout_ms))
             ledger = ExecutionLedgerStore.open(self.ledger_config)
-            return core, ledger, RetrievalTaskService(core, ledger)
+            return core, ledger, RetrievalTaskService(core, ledger, self.task_limits)
         except BaseException:
             store.close()
             raise
@@ -301,7 +305,10 @@ class _Parser(argparse.ArgumentParser):
         self.exit(2, "Invalid command arguments.\n")
 
 
-def main(config: StdioConfig | None = None, ledger_config: LedgerConfig | None = None):
+def main(
+    config: StdioConfig | None = None, ledger_config: LedgerConfig | None = None,
+    task_limits: TaskLimitsConfig | None = None,
+):
     """统一入口可传入已选配置；也可用本模块读取统一配置。"""
     if os.name != "posix":
         print("Stdio transport requires POSIX pipes.", file=sys.stderr)
@@ -320,9 +327,10 @@ def main(config: StdioConfig | None = None, ledger_config: LedgerConfig | None =
             if selected.transport != "stdio":
                 raise ValueError("stdio transport is not selected")
             config, ledger_config = selected.runtime, selected.ledger
+            task_limits = selected.task_limits
         if ledger_config is None:
             raise ValueError("ledger configuration is required")
-        server = StdioServer(config, ledger_config)
+        server = StdioServer(config, ledger_config, task_limits)
     except (ValueError, OSError):
         _event("lifecycle", "invalid_configuration")
         return 2

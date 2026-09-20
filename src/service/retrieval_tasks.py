@@ -10,6 +10,7 @@ from src.retrieval.contracts import SUPPORTED_SCOPES
 from src.retrieval.lexical_store import LexicalStoreError
 from src.retrieval.public_core import MAX_RESPONSE_BYTES, PublicResponse, RetrievalCore
 from src.service.execution_ledger_store import ExecutionLedgerStore, LedgerFailure
+from src.service.ledger_config import TaskLimitsConfig
 
 
 EXECUTION_RESERVE_BYTES = 8 * 1024
@@ -30,9 +31,13 @@ class PreparedTaskRequest:
 class RetrievalTaskService:
     """同步执行 admission、core 调用和保守结算。"""
 
-    def __init__(self, core: RetrievalCore, ledger: ExecutionLedgerStore):
+    def __init__(
+        self, core: RetrievalCore, ledger: ExecutionLedgerStore,
+        task_limits: TaskLimitsConfig | None = None,
+    ):
         self.core = core
         self.ledger = ledger
+        self.task_limits = task_limits or TaskLimitsConfig()
         self._request_owner = object()
 
     def _task_id(self, value: object) -> str:
@@ -89,35 +94,79 @@ class RetrievalTaskService:
         return self.validate_request(operation, request)
 
     def _encode(self, payload: dict) -> PublicResponse:
+        encoded = self._json_bytes(payload)
+        if len(encoded) > MAX_RESPONSE_BYTES:
+            raise LedgerFailure("ledger_unavailable")
+        return PublicResponse(encoded)
+
+    def _json_bytes(self, payload: dict) -> bytes:
+        """生成确定性紧凑 JSON；大小判断与最终返回使用同一份编码。"""
+
         try:
-            encoded = json.dumps(
+            return json.dumps(
                 payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False,
             ).encode("utf-8")
         except (TypeError, ValueError, UnicodeError) as exc:
             raise LedgerFailure("ledger_unavailable") from exc
-        if len(encoded) > MAX_RESPONSE_BYTES:
-            raise LedgerFailure("ledger_unavailable")
-        return PublicResponse(encoded)
 
     def start_task(
         self, request: object, *, owner_key: str, request_id: str | None = None,
     ) -> PublicResponse:
         self._prepared("start_task", request)
-        return self._encode(self.ledger.create_task(owner_key))
+        return self._encode(self.ledger.create_task(owner_key, self.task_limits))
 
     def get_task(
         self, request: object, *, owner_key: str, request_id: str | None = None,
     ) -> PublicResponse:
         prepared = self._prepared("get_task", request)
         payload = self.ledger.get_task(owner_key, prepared.task_id)
-        while True:
-            try:
-                return self._encode(payload)
-            except LedgerFailure:
-                if not payload["server_returned_items"]:
-                    raise
-                payload["server_returned_items"].pop()
-                payload["items_truncated"] = True
+        calls = payload.pop("calls")
+        items = payload.pop("server_returned_items")
+        payload["calls"] = []
+        payload["server_returned_items"] = []
+        payload["calls_truncated"] = payload["calls_total"] > 0
+        payload["items_truncated"] = payload["items_total"] > 0
+
+        # 两类明细交替加入，分别保留最近的连续窗口；任一下一条放不下时，
+        # 只停止该类，另一类仍可使用剩余响应字节。字段永远整条保留。
+        call_candidates = list(reversed(calls))
+        item_candidates = items
+        call_index = 0
+        item_index = 0
+        call_blocked = False
+        item_blocked = False
+        while not (call_blocked and item_blocked):
+            if not call_blocked:
+                if call_index >= len(call_candidates):
+                    call_blocked = True
+                else:
+                    candidate = call_candidates[call_index]
+                    payload["calls"].insert(0, candidate)
+                    payload["calls_truncated"] = (
+                        payload["calls_total"] > len(payload["calls"])
+                    )
+                    if len(self._json_bytes(payload)) <= MAX_RESPONSE_BYTES:
+                        call_index += 1
+                    else:
+                        payload["calls"].pop(0)
+                        payload["calls_truncated"] = True
+                        call_blocked = True
+            if not item_blocked:
+                if item_index >= len(item_candidates):
+                    item_blocked = True
+                else:
+                    candidate = item_candidates[item_index]
+                    payload["server_returned_items"].append(candidate)
+                    payload["items_truncated"] = (
+                        payload["items_total"] > len(payload["server_returned_items"])
+                    )
+                    if len(self._json_bytes(payload)) <= MAX_RESPONSE_BYTES:
+                        item_index += 1
+                    else:
+                        payload["server_returned_items"].pop()
+                        payload["items_truncated"] = True
+                        item_blocked = True
+        return self._encode(payload)
 
     def _fail_after_admission(self, call_id: str, code: str) -> None:
         block = code in {"generation_mismatch", "item_not_found", "index_unavailable", "internal_error"}

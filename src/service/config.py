@@ -8,7 +8,9 @@ from typing import TYPE_CHECKING
 
 from src.service.json_boundary import parse_json
 from src.service.errors import HTTPFailure
-from src.service.ledger_config import LedgerConfig, parse_ledger_config
+from src.service.ledger_config import (
+    LedgerConfig, TaskLimitsConfig, parse_ledger_config, parse_task_limits_config,
+)
 
 if TYPE_CHECKING:
     from src.service.http.http_config import HttpConfig
@@ -62,6 +64,7 @@ class ServiceConfig:
     transport: str
     runtime: HttpConfig | StdioConfig
     ledger: LedgerConfig
+    task_limits: TaskLimitsConfig
     host: str | None
     port: int | None
 
@@ -75,9 +78,10 @@ def parse_service_config(value: dict, path: Path) -> ServiceConfig:
     mcp = value["mcp"]
     if not isinstance(mcp, dict):
         raise ValueError("MCP configuration must be an object")
-    _reject_unknown_fields(mcp, {"transport", "ledger", "stdio"}, "MCP")
+    _reject_unknown_fields(mcp, {"transport", "ledger", "task_limits", "stdio"}, "MCP")
     _require_fields(mcp, {"transport", "ledger"}, "MCP")
     ledger = parse_ledger_config(mcp["ledger"], path)
+    task_limits = parse_task_limits_config(mcp.get("task_limits"))
     transport = mcp["transport"]
     if transport not in ("http", "stdio"):
         raise ValueError("MCP transport must be http or stdio")
@@ -98,7 +102,8 @@ def parse_service_config(value: dict, path: Path) -> ServiceConfig:
         from src.service.stdio.stdio_config import parse_stdio_config
 
         return ServiceConfig(
-            transport, parse_stdio_config({**common, **stdio}, path), ledger, None, None,
+            transport, parse_stdio_config({**common, **stdio}, path), ledger,
+            task_limits, None, None,
         )
     from src.service.http.http_config import parse_http_config, validate_bind
 
@@ -107,7 +112,7 @@ def parse_service_config(value: dict, path: Path) -> ServiceConfig:
     runtime = parse_http_config(
         {**common, **{name: child for name, child in http.items() if name not in {"host", "port"}}}, path,
     )
-    return ServiceConfig(transport, runtime, ledger, host, port)
+    return ServiceConfig(transport, runtime, ledger, task_limits, host, port)
 
 
 def load_service_config(path: Path) -> ServiceConfig:

@@ -13,14 +13,13 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from src.retrieval.contracts import SUPPORTED_SCOPES
-from src.service.ledger_config import LedgerConfig
+from src.service.ledger_config import LedgerConfig, TaskLimitsConfig
 
 
 SCHEMA_VERSION = 1
-SEARCH_LIMIT = 4
-READ_LIMIT = 8
-EVIDENCE_TOKEN_LIMIT = 8000
-DETAIL_ITEM_LIMIT = 20
+# 固定响应最多 65,536 bytes；任何 call/item 对象都远大于 16 bytes，
+# 因而取最近 4,096+1 条足以覆盖所有可能进入单次响应的完整条目。
+DETAIL_CANDIDATE_LIMIT = 4096
 
 _TASK_ID = re.compile(r"tsk_[0-9a-f]{32}")
 _CALL_ID = re.compile(r"req_[A-Za-z0-9_-]{1,64}")
@@ -290,9 +289,12 @@ class ExecutionLedgerStore:
         page_size = connection.execute("PRAGMA page_size").fetchone()[0]
         return pages * page_size
 
-    def create_task(self, owner_key: str) -> dict:
+    def create_task(
+        self, owner_key: str, limits: TaskLimitsConfig | None = None,
+    ) -> dict:
         if not _valid_owner(owner_key):
             raise LedgerFailure("ledger_unavailable")
+        limits = limits or TaskLimitsConfig()
         try:
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
@@ -303,7 +305,10 @@ class ExecutionLedgerStore:
                 task_id = "tsk_" + uuid4().hex
                 connection.execute(
                     "INSERT INTO tasks VALUES (?, ?, 'active', NULL, ?, ?, ?, ?, NULL)",
-                    (task_id, owner_key, SEARCH_LIMIT, READ_LIMIT, EVIDENCE_TOKEN_LIMIT, _now()),
+                    (
+                        task_id, owner_key, limits.search_calls, limits.read_calls,
+                        limits.estimated_evidence_tokens, _now(),
+                    ),
                 )
                 task = self._task(connection, owner_key, task_id)
                 summary = self._summary(connection, task)
@@ -312,9 +317,9 @@ class ExecutionLedgerStore:
                     "task_id": task_id,
                     "task_state": "active",
                     "limits": {
-                        "search_calls": SEARCH_LIMIT,
-                        "read_calls": READ_LIMIT,
-                        "estimated_evidence_tokens": EVIDENCE_TOKEN_LIMIT,
+                        "search_calls": limits.search_calls,
+                        "read_calls": limits.read_calls,
+                        "estimated_evidence_tokens": limits.estimated_evidence_tokens,
                     },
                     "execution": summary,
                 }
@@ -635,10 +640,17 @@ class ExecutionLedgerStore:
             with self._connect() as connection:
                 connection.execute("BEGIN")
                 task = self._task(connection, owner_key, task_id)
+                calls_total = connection.execute(
+                    "SELECT COUNT(*) FROM calls WHERE task_id = ?", (task_id,),
+                ).fetchone()[0]
+                call_rows = connection.execute(
+                    "SELECT calls.*, (SELECT COUNT(*) FROM call_items "
+                    "WHERE call_items.call_id = calls.call_id) AS returned_item_count "
+                    "FROM calls WHERE task_id = ? ORDER BY sequence_number DESC LIMIT ?",
+                    (task_id, DETAIL_CANDIDATE_LIMIT + 1),
+                ).fetchall()
                 calls = []
-                for row in connection.execute(
-                    "SELECT * FROM calls WHERE task_id = ? ORDER BY sequence_number", (task_id,),
-                ):
+                for row in reversed(call_rows[:DETAIL_CANDIDATE_LIMIT]):
                     value = {
                         "call_id": row["call_id"], "sequence_number": row["sequence_number"],
                         "operation": row["operation"], "state": row["state"], "cap": row["cap"],
@@ -651,9 +663,6 @@ class ExecutionLedgerStore:
                             "limit": row["result_limit"],
                         })
                     else:
-                        returned = connection.execute(
-                            "SELECT COUNT(*) FROM call_items WHERE call_id = ?", (row["call_id"],),
-                        ).fetchone()[0]
                         missing = json.loads(row["missing_item_ids_json"] or "[]")
                         value.update({
                             "seed_item_id": row["seed_item_id"],
@@ -663,10 +672,22 @@ class ExecutionLedgerStore:
                                 None if row["membership_complete"] is None
                                 else bool(row["membership_complete"])
                             ),
-                            "returned_item_count": returned,
+                            "returned_item_count": row["returned_item_count"],
                             "missing_item_count": len(missing),
                         })
                     calls.append(value)
+                items_total = connection.execute(
+                    """
+                    SELECT COUNT(DISTINCT item.item_id)
+                    FROM task_items AS item
+                    JOIN call_items AS relation
+                      ON relation.task_id = item.task_id AND relation.item_id = item.item_id
+                    JOIN calls AS call ON call.call_id = relation.call_id
+                    WHERE item.task_id = ? AND call.operation = 'read_bundle'
+                                      AND call.state = 'succeeded'
+                    """,
+                    (task_id,),
+                ).fetchone()[0]
                 rows = connection.execute(
                     """
                     SELECT item.item_id, item.source_type, item.path, item.locator, item.role,
@@ -682,9 +703,9 @@ class ExecutionLedgerStore:
                     ORDER BY last_sequence DESC, item.item_id
                     LIMIT ?
                     """,
-                    (task_id, DETAIL_ITEM_LIMIT + 1),
+                    (task_id, DETAIL_CANDIDATE_LIMIT + 1),
                 ).fetchall()
-                items = [dict(row) for row in rows[:DETAIL_ITEM_LIMIT]]
+                items = [dict(row) for row in rows[:DETAIL_CANDIDATE_LIMIT]]
                 for item in items:
                     item.pop("last_sequence")
                 result = {
@@ -699,8 +720,11 @@ class ExecutionLedgerStore:
                     },
                     "execution": self._summary(connection, task),
                     "calls": calls,
+                    "calls_total": calls_total,
+                    "calls_truncated": calls_total > len(calls),
                     "server_returned_items": items,
-                    "items_truncated": len(rows) > DETAIL_ITEM_LIMIT,
+                    "items_total": items_total,
+                    "items_truncated": items_total > len(items),
                 }
                 connection.commit()
                 return result

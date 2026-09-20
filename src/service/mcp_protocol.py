@@ -29,7 +29,7 @@ _DESCRIPTIONS = {
     "start_retrieval_task": "Create one server-side retrieval task for one independent user question. Keep the returned task_id for follow-up search, read and detail calls.",
     "search_sources": "Find candidate evidence within an existing retrieval task. Snippets are only for selection; call read_bundle before factual answers. Put the strongest lexical query first. Do not infer ranking scores.",
     "read_bundle": "Read a seed-centered bounded window from one search candidate in the same retrieval task. A successful response always includes the complete seed body; items are returned in source order. Judge each item's role and evidence_role separately; assistant suggestions do not imply user adoption.",
-    "get_retrieval_task": "Return a bounded mechanical execution summary for one task. server_returned_items are citation metadata, not evidence bodies or proof that the host received them.",
+    "get_retrieval_task": "Return complete counters plus response-bounded recent call and citation details for one task. Truncation flags describe omitted detail. server_returned_items are citation metadata, not evidence bodies or proof that the host received them.",
     "status": "Return the pinned generation, supported scopes, per-request limits and execution-ledger health.",
 }
 _UNTRUSTED = (
@@ -58,8 +58,8 @@ def tool_definitions():
         "call_id": {"type": ["string", "null"]},
         "task_state": {"type": "string", "enum": ["active", "blocked"]},
         "generation": {"type": ["string", "null"], "pattern": "^gen_[0-9a-f]{20}$"},
-        "search_calls": {"type": "integer", "minimum": 0, "maximum": 4},
-        "read_calls": {"type": "integer", "minimum": 0, "maximum": 8},
+        "search_calls": {"type": "integer", "minimum": 0},
+        "read_calls": {"type": "integer", "minimum": 0},
         "estimated_evidence_tokens": {"type": "integer", "minimum": 0},
         "reserved_estimated_tokens": {"type": "integer", "minimum": 0},
         "available_estimated_tokens": {"type": "integer"},
@@ -67,9 +67,9 @@ def tool_definitions():
         "unresolved_calls": {"type": "integer", "minimum": 0, "maximum": 1},
     })
     limits = object_schema({
-        "search_calls": {"type": "integer", "const": 4},
-        "read_calls": {"type": "integer", "const": 8},
-        "estimated_evidence_tokens": {"type": "integer", "const": 8000},
+        "search_calls": {"type": "integer", "minimum": 1},
+        "read_calls": {"type": "integer", "minimum": 1},
+        "estimated_evidence_tokens": {"type": "integer", "minimum": 1},
     })
     citation = object_schema({
         "item_id": {"type": "string", "pattern": "^itm_[a-z2-7]{32}$"},
@@ -81,7 +81,7 @@ def tool_definitions():
     })
     call_common = {
         "call_id": {"type": "string"},
-        "sequence_number": {"type": "integer", "minimum": 1, "maximum": 12},
+        "sequence_number": {"type": "integer", "minimum": 1},
         "state": {"type": "string", "enum": ["pending", "succeeded", "failed", "uncertain"]},
         "cap": {"type": "integer", "minimum": 1, "maximum": 8000},
         "usage": nullable_integer, "error_category": nullable_string,
@@ -140,8 +140,11 @@ def tool_definitions():
         "blocked_category": nullable_string,
         "limits": {"$ref": "#/components/schemas/McpTaskLimits"},
         "execution": {"$ref": "#/components/schemas/McpExecutionSummary"},
-        "calls": {"type": "array", "items": {"$ref": "#/components/schemas/McpTaskCall"}, "maxItems": 12},
-        "server_returned_items": {"type": "array", "items": {"$ref": "#/components/schemas/McpTaskCitation"}, "maxItems": 20},
+        "calls": {"type": "array", "items": {"$ref": "#/components/schemas/McpTaskCall"}},
+        "calls_total": {"type": "integer", "minimum": 0},
+        "calls_truncated": {"type": "boolean"},
+        "server_returned_items": {"type": "array", "items": {"$ref": "#/components/schemas/McpTaskCitation"}},
+        "items_total": {"type": "integer", "minimum": 0},
         "items_truncated": {"type": "boolean"},
     })
     status_output = deepcopy(schemas["StatusResponse"])

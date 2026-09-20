@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from src.service.execution_ledger_store import ExecutionLedgerStore, LedgerFailure
-from src.service.ledger_config import LedgerConfig
+from src.service.ledger_config import LedgerConfig, TaskLimitsConfig
 
 
 GENERATION = "gen_" + "1" * 20
@@ -131,7 +131,7 @@ def test_successful_calls_derive_usage_and_store_no_evidence_text(store, ledger_
     assert b"sources/conversations/synthetic.md" in raw
 
 
-def test_task_detail_bounds_server_returned_items(store):
+def test_task_detail_reports_complete_counts_before_response_truncation(store):
     task_id = store.create_task("synthetic_owner")["task_id"]
     admit_search(store, task_id)
     store.finalize_success("req_synthetic_search", search_response("req_synthetic_search"))
@@ -145,8 +145,40 @@ def test_task_detail_bounds_server_returned_items(store):
         "req_many_items", read_response("req_many_items", usage=6000, items=item_ids),
     )
     detail = store.get_task("synthetic_owner", task_id)
-    assert len(detail["server_returned_items"]) == 20
-    assert detail["items_truncated"] is True
+    assert len(detail["server_returned_items"]) == 22
+    assert detail["items_total"] == 22
+    assert detail["items_truncated"] is False
+    assert detail["calls_total"] == 2
+    assert detail["calls_truncated"] is False
+
+
+def test_task_limits_are_snapshotted_and_enforced(store):
+    limits = TaskLimitsConfig(
+        search_calls=1, read_calls=2, estimated_evidence_tokens=500,
+    )
+    task = store.create_task("synthetic_owner", limits)
+    assert task["limits"] == {
+        "search_calls": 1, "read_calls": 2, "estimated_evidence_tokens": 500,
+    }
+    task_id = task["task_id"]
+    admit_search(store, task_id, cap=300)
+    store.finalize_success(
+        "req_synthetic_search", search_response("req_synthetic_search", usage=300),
+    )
+    with pytest.raises(LedgerFailure) as failure:
+        store.admit_search(
+            "synthetic_owner", task_id, "req_over_call_limit",
+            queries=("Other",), query_keys=("other",), scopes=("note",),
+            result_limit=8, cap=100, current_generation=GENERATION,
+        )
+    assert failure.value.code == "task_call_limit_exceeded"
+    with pytest.raises(LedgerFailure) as failure:
+        store.admit_read(
+            "synthetic_owner", task_id, "req_over_task_budget", seed_item_id=ITEM_A,
+            cap=201, current_generation=GENERATION,
+        )
+    assert failure.value.code == "task_budget_exceeded"
+    assert store.get_task("synthetic_owner", task_id)["limits"] == task["limits"]
 
 
 def test_owner_duplicate_pending_seed_and_budget_rules(store):

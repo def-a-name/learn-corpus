@@ -5,6 +5,7 @@ import json
 import pytest
 
 from src.service.http.mcp import PROTOCOL_VERSION, tool_definitions
+from src.service.ledger_config import TaskLimitsConfig
 from src.retrieval.lexical_store import IndexUnavailableError
 from test_api import HEADERS, TOKEN, config, client_for, assert_error  # noqa: F401
 from test_public_core import open_core  # noqa: F401
@@ -118,6 +119,8 @@ def test_task_switching_bounded_detail_and_owner_isolation(config):
         search = call(client, 'get_retrieval_task', {'task_id': task_a}).json()['result']
         detail = search['structuredContent']
         assert detail['execution']['search_calls'] == 1
+        assert detail['calls_total'] == 1 and detail['calls_truncated'] is False
+        assert detail['items_total'] == 0 and detail['items_truncated'] is False
         assert detail['calls'][0]['queries'] == ['quasar']
         assert detail['server_returned_items'] == []
 
@@ -131,6 +134,22 @@ def test_task_switching_bounded_detail_and_owner_isolation(config):
             'name': 'get_retrieval_task', 'arguments': {'task_id': task_a},
         }, headers=other_headers).json()['result']
         assert json.loads(foreign['content'][0]['text'])['error']['code'] == 'task_not_found'
+
+
+def test_configured_task_limits_are_returned_by_new_task(config):
+    limits = TaskLimitsConfig(
+        search_calls=7, read_calls=11, estimated_evidence_tokens=24000,
+    )
+    with client_for(config, task_limits=limits) as client:
+        result = call(client, 'start_retrieval_task').json()['result']
+        assert result['isError'] is False
+        task = result['structuredContent']
+        assert task['limits'] == {
+            'search_calls': 7,
+            'read_calls': 11,
+            'estimated_evidence_tokens': 24000,
+        }
+        assert task['execution']['available_estimated_tokens'] == 24000
 
 
 @pytest.mark.parametrize('method', ['resources/list', 'resources/templates/list', 'prompts/list', 'read_item', 'admin/rebuild'])
@@ -266,7 +285,7 @@ def test_errors_logs_and_shared_admission(config, monkeypatch, caplog):
 def test_tools_list_contract_snapshot():
     import hashlib
     encoded = json.dumps(tool_definitions(), sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode()
-    assert hashlib.sha256(encoded).hexdigest() == 'ca0dbe85ef6a32c9b471cd1d276d063845113be962abbc2cf621cdb6bd476849'
+    assert hashlib.sha256(encoded).hexdigest() == '0076fad28ffba781cb245e4a60442dab6216d1aa1cdafdc5e39c9f8d603a699a'
 
 
 @pytest.mark.parametrize('scope', ['note', 'article'])

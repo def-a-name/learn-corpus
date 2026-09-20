@@ -12,6 +12,7 @@ import pytest
 from src.service import server
 from src.service.config import load_http_config, load_service_config
 from src.service.stdio.stdio_config import StdioConfig, load_stdio_config
+from src.service.ledger_config import TaskLimitsConfig
 from test_api import HEADERS, client_for, config  # noqa: F401
 from test_mcp import rpc
 from test_mcp_stdio import PipeClient
@@ -27,6 +28,8 @@ def unified(config):
     return {**common, "http": {**values, "host": "127.0.0.1", "port": 8765},
             "mcp": {"transport": "http",
                     "ledger": {"path": "synthetic-ledger/execution.sqlite3"},
+                    "task_limits": {"search_calls": 4, "read_calls": 8,
+                                    "estimated_evidence_tokens": 8000},
                     "stdio": {"frame_timeout_ms": 250}}}
 
 
@@ -58,6 +61,7 @@ def test_unified_http_keeps_auth_and_shared_mcp_core(unified, config, tmp_path):
     assert selected.transport == "http" and (selected.host, selected.port) == ("127.0.0.1", 8765)
     assert selected.runtime == config
     assert selected.ledger.path == tmp_path / "synthetic-ledger/execution.sqlite3"
+    assert selected.task_limits == TaskLimitsConfig()
     with client_for(load_http_config(path)) as client:
         assert client.get("/v1/status").status_code == 401
         rest = client.get("/v1/status", headers=HEADERS).json()
@@ -99,6 +103,11 @@ def test_unified_stdio_ignores_inactive_http_settings(unified, tmp_path, with_ht
     (("mcp", "ledger", "max_tasks"), True),
     (("mcp", "ledger", "busy_timeout_ms"), 0),
     (("mcp", "ledger", "path"), ""),
+    (("mcp", "task_limits"), []),
+    (("mcp", "task_limits", "unknown"), 1),
+    (("mcp", "task_limits", "search_calls"), 0),
+    (("mcp", "task_limits", "read_calls"), True),
+    (("mcp", "task_limits", "estimated_evidence_tokens"), 2**63),
     (("mcp", "stdio", "global_concurrency"), 2),
     (("mcp", "stdio", "credentials_file"), "synthetic-secret"),
     (("http", "unknown"), True),
@@ -190,6 +199,9 @@ def test_stdio_dispatch_never_constructs_http(unified, tmp_path, monkeypatch, ca
     from src.service.stdio import stdio_server
 
     unified["mcp"]["transport"] = "stdio"
+    unified["mcp"]["task_limits"] = {
+        "search_calls": 7, "read_calls": 11, "estimated_evidence_tokens": 24000,
+    }
     path = write_config(tmp_path, unified)
     calls = []
 
@@ -197,10 +209,14 @@ def test_stdio_dispatch_never_constructs_http(unified, tmp_path, monkeypatch, ca
         pytest.fail("HTTP service was started in stdio mode")
 
     monkeypatch.setattr(http_server, "run", unexpected)
-    monkeypatch.setattr(stdio_server, "main", lambda config, ledger: calls.append((config, ledger)) or 3)
+    monkeypatch.setattr(
+        stdio_server, "main",
+        lambda config, ledger, task_limits: calls.append((config, ledger, task_limits)) or 3,
+    )
     monkeypatch.setattr(sys, "argv", ["server", "--config", str(path)])
     assert server.main() == 3
     assert len(calls) == 1 and isinstance(calls[0][0], StdioConfig)
+    assert calls[0][2] == TaskLimitsConfig(7, 11, 24000)
     for flags in (["--host", "127.0.0.1"], ["--port", "8765"]):
         monkeypatch.setattr(sys, "argv", ["server", "--config", str(path), *flags])
         with pytest.raises(SystemExit) as exc:
