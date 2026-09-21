@@ -55,8 +55,12 @@ class TestLexicalQuery:
     def test_anchor_count_is_enforced_before_component_splitting(self) -> None:
         assert compile_lexical_query("2026.4.10").anchor_count == 1
         assert compile_lexical_query("2026.4.10").clause_count == 3
-        with pytest.raises(QueryValidationError, match="between 1 and 3 anchors"):
-            compile_lexical_query("one two three four")
+        assert compile_lexical_query("one two three four five six").anchor_count == 6
+        with pytest.raises(QueryValidationError, match="between 1 and 6 anchors") as failure:
+            compile_lexical_query("one two three four five six seven")
+        assert failure.value.details == {
+            "reason": "anchor_count", "minimum": 1, "maximum": 6, "actual": 7,
+        }
 
     def test_empty_and_non_searchable_anchor_are_rejected(self) -> None:
         for query in ("", "   ", "---", "..."):
@@ -82,6 +86,10 @@ class TestLexicalQuery:
         ):
             with pytest.raises(QueryValidationError):
                 compile_lexical_query(query)
+
+        with pytest.raises(QueryValidationError) as failure:
+            compile_lexical_query('"private synthetic value"')
+        assert failure.value.details == {"reason": "raw_fts_syntax"}
 
     def test_length_limits_are_enforced(self) -> None:
         assert compile_lexical_query("a" * 256).clause_count == 1

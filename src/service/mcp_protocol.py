@@ -74,6 +74,14 @@ def tool_definitions():
     citation = object_schema({
         "item_id": {"type": "string", "pattern": "^itm_[a-z2-7]{32}$"},
         "source_type": {"type": "string", "enum": ["conversation", "note", "article"]},
+        "source_title": {
+            **nullable_string,
+            "description": "Document title for note/article citations; null for conversations.",
+        },
+        "heading_path": {
+            "type": ["array", "null"], "items": {"type": "string"},
+            "description": "Complete heading path for note/article citations; empty at the document root and null for conversations.",
+        },
         "path": {"type": "string"}, "locator": {"type": "string"},
         "role": nullable_string, "evidence_role": nullable_string,
         "turn_index": nullable_integer,
@@ -199,14 +207,25 @@ class RPCFailure(Exception):
     rpc_id: str | int | None = None
 
 
+@dataclass(frozen=True)
+class ToolFailure:
+    """携带可安全公开的工具错误类别与有界修正信息。"""
+
+    code: str
+    details: dict[str, object] | None = None
+
+
 def rpc_payload(rpc_id, *, result=None, error=None):
     payload = {"jsonrpc": "2.0", "id": rpc_id}
     payload["error" if error is not None else "result"] = error if error is not None else result
     return payload
 
 
-def tool_error_result(code, request_id):
-    payload = {"error": {"code": code, "message": TOOL_ERRORS[code][1], "request_id": request_id}}
+def tool_error_result(code, request_id, details=None):
+    error = {"code": code, "message": TOOL_ERRORS[code][1], "request_id": request_id}
+    if details is not None:
+        error["details"] = details
+    payload = {"error": error}
     return {"content": [{"type": "text", "text": json.dumps(payload, separators=(",", ":"))}],
             "isError": True}
 
@@ -302,5 +321,7 @@ def prepare_message(value, task_service):
     try:
         prepared = task_service.validate_request(operation, args)
     except (LexicalStoreError, LedgerFailure, HTTPFailure) as exc:
-        return method, rpc_id, operation, exc.code
+        return method, rpc_id, operation, ToolFailure(
+            exc.code, getattr(exc, "details", None),
+        )
     return method, rpc_id, operation, prepared

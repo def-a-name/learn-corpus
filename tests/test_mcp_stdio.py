@@ -216,6 +216,32 @@ def test_unicode_sections_and_byte_budget(launch, config, open_core, scope):
         assert rest == result and len(result["items"]) == 2
 
 
+def test_query_validation_details_match_http_and_stdio(launch, config):
+    query = ['one two three four five six synthetic-secret']
+    with launch() as (pipe, _), client_for(config) as http:
+        stdio_task = start_task(pipe)
+        http_task = http_call(http, "start_retrieval_task").json()["result"]["structuredContent"]["task_id"]
+        stdio_result = pipe.tool("search_sources", {
+            "task_id": stdio_task, "queries": query, "max_estimated_tokens": 500,
+        })
+        http_result = http_call(http, "search_sources", {
+            "task_id": http_task, "queries": query, "max_estimated_tokens": 500,
+        }).json()["result"]
+        stdio_error = json.loads(stdio_result["content"][0]["text"])["error"]
+        http_error = json.loads(http_result["content"][0]["text"])["error"]
+        stdio_error.pop("request_id")
+        http_error.pop("request_id")
+        assert stdio_error == http_error == {
+            "code": "invalid_request",
+            "message": "Request validation failed",
+            "details": {
+                "parameter": "queries[0]", "reason": "anchor_count",
+                "minimum": 1, "maximum": 6, "actual": 7,
+            },
+        }
+        assert "synthetic-secret" not in json.dumps(stdio_error)
+
+
 @pytest.mark.parametrize("raw,code", [
     (b'{', -32700), (b'[]', -32600), (b'\xff', -32700),
     (b'{"jsonrpc":"2.0","jsonrpc":"2.0"}', -32700),
@@ -355,7 +381,7 @@ raise SystemExit(main())
         task_id = start_task(client)
         assert error_code(client.tool("search_sources", {
             "task_id": task_id, "queries": ["quasar"], "max_estimated_tokens": 1000,
-        })) == "budget_exceeded"
+        })) == "retrieval_timeout"
         assert client.tool("status")["isError"] is False
 
 

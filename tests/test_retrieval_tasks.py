@@ -27,6 +27,8 @@ class _DetailLedger:
         items = [{
             "item_id": "itm_" + format(index, "032b").translate(str.maketrans("01", "ab")),
             "source_type": "note",
+            "source_title": f"Synthetic source {index}",
+            "heading_path": ["Synthetic section"],
             "path": f"sources/notes/synthetic-{index}-" + "p" * 180,
             "locator": f"note:synthetic/part:{index}/" + "l" * 180,
             "role": None,

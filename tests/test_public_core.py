@@ -30,6 +30,7 @@ def parts(scope, unit, bodies, *, role=None, occurrence=1, turn=1):
     ids = [stable_item_id(path, locator, role or "heading", n) for n in range(1, len(bodies) + 1)]
     return tuple(Item(
         item_id=ids[index], scope=scope, title="Synthetic heading" if role is None else None,
+        source_title="Synthetic source" if role is None else None,
         source_path=path, source_id="synthetic-archive", locator=f"{locator}/part:{index + 1}",
         locator_with_lines=None,
         evidence_role=("user_statement" if role == "human" else "assistant_suggestion")
@@ -107,6 +108,11 @@ def test_section_parts_do_not_include_children_neighbors_or_repeated_headings(op
     core = open_core((*section, *child, *repeated))
     result = read(core, section[1]).payload
     assert [item["item_id"] for item in result["items"]] == [item.item_id for item in section]
+    assert all(item["source_title"] == "Synthetic source" for item in result["items"])
+    assert all(item["heading_path"] == ["A"] for item in result["items"])
+    search = core.search({"queries": ["quasar"], "scopes": [scope]}).payload
+    assert search["results"][0]["source_title"] == "Synthetic source"
+    assert search["results"][0]["heading_path"] == ["A"]
     assert len({read(core, seed).payload["bundle_key"] for seed in (section[0], child[0], repeated[0])}) == 3
     assert len(read(core, child[0]).payload["items"]) == 1
 
@@ -126,6 +132,8 @@ def test_public_whitelist_and_exact_serialized_usage(open_core):
         assert len(response.json_bytes) <= public_core.MAX_RESPONSE_BYTES
         for item in payload.get("items", payload.get("results", [])):
             assert not {"provider", "session_id", "part", "source_id", "body_sha256"} & item.keys()
+            assert item["source_title"] is None
+            assert item["heading_path"] is None
         payload["generation"] = "changed-local-copy"
         assert response.payload["generation"] == core.store.generation
 

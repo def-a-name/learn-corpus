@@ -50,6 +50,7 @@ CREATE TABLE items (
     scope              TEXT NOT NULL
                        CHECK (scope IN ('conversation', 'note', 'article')),
     title              TEXT,
+    source_title       TEXT,
     source_path        TEXT NOT NULL,
     source_id          TEXT NOT NULL,
     locator            TEXT NOT NULL,
@@ -79,11 +80,11 @@ CREATE VIRTUAL TABLE items_fts USING fts5(
 """
 _INSERT_ITEM = """
 INSERT INTO items (
-    rowid, item_id, scope, title, source_path, source_id, locator,
+    rowid, item_id, scope, title, source_title, source_path, source_id, locator,
     locator_with_lines, evidence_role, provider, session_id, turn_index,
     role, heading_path_json, occurrence, part, body, body_sha256,
     token_estimate, relations_json
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 
@@ -157,9 +158,13 @@ def _validate_items(items: Sequence[Item]) -> tuple[Item, ...]:
         logical_locator = _logical_locator(item)
         groups.setdefault((item.source_path, logical_locator), []).append(item)
         if item.scope == "conversation":
-            if item.role not in {"human", "assistant"}:
+            if item.role not in {"human", "assistant"} or item.source_title is not None:
                 raise LexicalBuildError(f"conversation item has invalid role: {item.item_id}")
-        elif item.role is not None or item.relations.counterpart_item_ids:
+        elif (
+            item.role is not None or item.relations.counterpart_item_ids
+            or not isinstance(item.source_title, str) or not item.source_title.strip()
+            or item.heading_path is None
+        ):
             raise LexicalBuildError(f"document item has conversation metadata: {item.item_id}")
 
     for group_items in groups.values():
@@ -224,6 +229,7 @@ def _write_database(path: Path, items: Sequence[Item]) -> None:
                     item.item_id,
                     item.scope,
                     item.title,
+                    item.source_title,
                     item.source_path,
                     item.source_id,
                     item.locator,

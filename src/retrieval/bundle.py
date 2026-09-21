@@ -10,11 +10,11 @@ from time import monotonic
 
 from src.retrieval.contracts import Item
 from src.retrieval.lexical_store import (
-    BudgetExceededError,
     IndexUnavailableError,
     InvalidRequestError,
     ItemNotFoundError,
     LexicalStore,
+    RetrievalTimeoutError,
 )
 from src.retrieval.text import estimate_evidence_tokens
 
@@ -26,7 +26,7 @@ def check_deadline(deadline: float) -> None:
     """在 Python 聚合与序列化步骤之间检查同一个请求时限。"""
 
     if monotonic() >= deadline:
-        raise BudgetExceededError("request processing deadline exceeded")
+        raise RetrievalTimeoutError("request processing deadline exceeded")
 
 
 def logical_locator(item: Item) -> str:

@@ -5,10 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
-PROJECTION_SCHEMA_VERSION = "item-projection-v1"
+PROJECTION_SCHEMA_VERSION = "item-projection-v2"
+# item ID 是跨 generation 的引用身份；投影新增非身份元数据时不改变既有 ID。
+STABLE_ITEM_ID_VERSION = "item-projection-v1"
 CHUNK_POLICY_VERSION = "evidence-chunk-v2"
-LEXICAL_SCHEMA_VERSION = "lexical-schema-v1"
-QUERY_POLICY_VERSION = "qmd-style-v1"
+LEXICAL_SCHEMA_VERSION = "lexical-schema-v2"
+QUERY_POLICY_VERSION = "qmd-style-v2"
 RANKING_POLICY_VERSION = "bm25-rrf-v2"
 ESTIMATOR_VERSION = "evidence-estimator-v1"
 
@@ -27,6 +29,7 @@ class Item:
     item_id: str
     scope: str
     title: str | None
+    source_title: str | None
     source_path: str
     source_id: str
     locator: str
@@ -66,6 +69,8 @@ class SearchResult:
     item_id: str
     rank: int
     title: str | None
+    source_title: str | None
+    heading_path: tuple[str, ...] | None
     source_type: str
     path: str
     locator: str
@@ -93,6 +98,8 @@ class ReadResult:
     generation: str
     item_id: str
     title: str | None
+    source_title: str | None
+    heading_path: tuple[str, ...] | None
     source_type: str
     path: str
     locator: str

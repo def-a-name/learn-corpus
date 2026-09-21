@@ -119,6 +119,7 @@ class TestItemProjector:
         second = stable_item_id("sources/notes/a.md", "note:a/root", "root", 1)
         changed = stable_item_id("sources/notes/a.md", "note:a/root", "root", 2)
         assert first == second
+        assert first == "itm_odp6ldsmbddcjesvd2phvrn2j3tlj6up"
         assert first != changed
         assert re.search(r"^itm_[a-z2-7]{32}$", first)
 
@@ -354,6 +355,9 @@ External article body.
         parent = next(item for item in note_items if item.heading_path == ("Parent",))
         children = [item for item in note_items if item.heading_path == ("Parent", "Child")]
         assert root.title == "Title note-a"
+        assert all(item.source_title == "Title note-a" for item in note_items)
+        assert root.heading_path == ()
+        assert parent.title == "Parent"
         assert "https://example.test/path" in root.body
         assert "Parent direct text" in parent.body
         assert "Child text" not in parent.body
@@ -362,6 +366,8 @@ External article body.
         assert "diagram.png" in children[0].body
         assert ":occurrence:2/part:1" in children[1].locator
         assert len(article_items) == 1
+        assert article_items[0].source_title == "Title article-a"
+        assert article_items[0].heading_path == ("Article heading",)
         assert article_items[0].evidence_role == "external_source"
 
     def test_empty_parent_heading_does_not_create_an_item(self) -> None:

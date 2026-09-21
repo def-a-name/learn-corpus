@@ -198,7 +198,12 @@ def test_tool_errors_preserve_stable_codes(config):
             assert response.status_code == 200
             result = response.json()['result']
             assert result['isError'] is True and 'structuredContent' not in result
-            assert json.loads(result['content'][0]['text'])['error']['code'] == code
+            error = json.loads(result['content'][0]['text'])['error']
+            assert error['code'] == code
+            if code == 'budget_exceeded':
+                assert error['details'] == {
+                    'reason': 'minimum_search_response_exceeds_budget',
+                }
 
 
 def test_invalid_request_does_not_create_call(config):
@@ -208,13 +213,80 @@ def test_invalid_request_does_not_create_call(config):
             'task_id': task_id, 'queries': ['quasar', 'QUASAR'],
             'max_estimated_tokens': 500,
         }).json()['result']
-        assert json.loads(result['content'][0]['text'])['error']['code'] == 'invalid_request'
+        error = json.loads(result['content'][0]['text'])['error']
+        assert error['code'] == 'invalid_request'
+        assert error['details'] == {
+            'parameter': 'queries', 'reason': 'normalized_duplicate', 'indexes': [0, 1],
+        }
         detail = call(client, 'get_retrieval_task', {
             'task_id': task_id,
         }).json()['result']['structuredContent']
         assert detail['calls'] == []
         assert detail['execution']['search_calls'] == 0
         assert detail['execution']['reserved_estimated_tokens'] == 0
+
+
+def test_mcp_query_validation_returns_safe_indexed_details(config):
+    with client_for(config) as client:
+        task_id = start_task(client)
+        result = call(client, 'search_sources', {
+            'task_id': task_id,
+            'queries': ['one two three four five six synthetic-secret'],
+            'max_estimated_tokens': 500,
+        }).json()['result']
+        error = json.loads(result['content'][0]['text'])['error']
+        assert error['code'] == 'invalid_request'
+        assert error['details'] == {
+            'parameter': 'queries[0]', 'reason': 'anchor_count',
+            'minimum': 1, 'maximum': 6, 'actual': 7,
+        }
+        assert 'synthetic-secret' not in result['content'][0]['text']
+
+
+def test_mcp_task_limit_and_budget_errors_return_actionable_details(config):
+    limits = TaskLimitsConfig(search_calls=1, read_calls=1, estimated_evidence_tokens=300)
+    with client_for(config, task_limits=limits) as client:
+        task_id = start_task(client)
+        budget = call(client, 'search_sources', {
+            'task_id': task_id, 'queries': ['quasar'], 'max_estimated_tokens': 301,
+        }).json()['result']
+        error = json.loads(budget['content'][0]['text'])['error']
+        assert error['code'] == 'task_budget_exceeded'
+        assert error['details'] == {
+            'requested_estimated_tokens': 301,
+            'available_estimated_tokens': 300,
+            'task_limit': 300,
+        }
+
+        success = call(client, 'search_sources', {
+            'task_id': task_id, 'queries': ['quasar'], 'max_estimated_tokens': 300,
+        }).json()['result']
+        assert success['isError'] is False
+        limited = call(client, 'search_sources', {
+            'task_id': task_id, 'queries': ['other'], 'max_estimated_tokens': 1,
+        }).json()['result']
+        error = json.loads(limited['content'][0]['text'])['error']
+        assert error['code'] == 'task_call_limit_exceeded'
+        assert error['details'] == {'operation': 'search', 'used': 1, 'limit': 1}
+
+
+def test_mcp_blocked_task_returns_fixed_block_category(config):
+    with client_for(config) as client:
+        task_id = start_task(client)
+        with client.app.state.tasks.ledger._connect() as connection:
+            connection.execute(
+                "UPDATE tasks SET state = 'blocked', blocked_category = 'generation_mismatch' "
+                "WHERE task_id = ?",
+                (task_id,),
+            )
+        result = call(client, 'search_sources', {
+            'task_id': task_id, 'queries': ['quasar'], 'max_estimated_tokens': 500,
+        }).json()['result']
+        error = json.loads(result['content'][0]['text'])['error']
+        assert error['code'] == 'task_blocked'
+        assert error['details'] == {
+            'blocked_category': 'generation_mismatch', 'retryable': False,
+        }
 
 
 def test_finalize_failure_does_not_return_core_success(config, monkeypatch):
@@ -285,7 +357,7 @@ def test_errors_logs_and_shared_admission(config, monkeypatch, caplog):
 def test_tools_list_contract_snapshot():
     import hashlib
     encoded = json.dumps(tool_definitions(), sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode()
-    assert hashlib.sha256(encoded).hexdigest() == '0076fad28ffba781cb245e4a60442dab6216d1aa1cdafdc5e39c9f8d603a699a'
+    assert hashlib.sha256(encoded).hexdigest() == 'b1f8b1a967c951cd76718349aef51a9f08358c17c591c9f3bc558460df77535b'
 
 
 @pytest.mark.parametrize('scope', ['note', 'article'])

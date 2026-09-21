@@ -1,7 +1,7 @@
 """描述 HTTP 公开契约，仅用于文档，不参与请求校验或响应序列化。"""
 
 from src.retrieval.contracts import SUPPORTED_SCOPES
-from src.retrieval.lexical_query import MAX_QUERY_SCALARS
+from src.retrieval.lexical_query import MAX_ANCHORS, MAX_QUERY_SCALARS
 from src.retrieval.lexical_store import MAX_QUERIES, MAX_RESULT_LIMIT
 from src.retrieval.public_core import MAX_RESPONSE_BYTES, MAX_RESPONSE_TOKENS
 from src.service.errors import ERRORS
@@ -35,7 +35,19 @@ def build_openapi() -> dict:
               "default": MAX_RESPONSE_TOKENS,
               "description": "整个 JSON 响应的估算 token 上限，不是精确模型 token 数。预算不足时减少返回条目；连最小响应也放不下时返回 422。"}
     metadata = {
-        "item_id": item_id, "source_type": scope, "title": nullable_string,
+        "item_id": item_id, "source_type": scope,
+        "title": {
+            **nullable_string,
+            "description": "旧的条目标题字段；来源展示使用 source_title 与 heading_path。",
+        },
+        "source_title": {
+            **nullable_string,
+            "description": "note/article 的文档标题；conversation 为 null。",
+        },
+        "heading_path": {
+            "type": ["array", "null"], "items": string,
+            "description": "note/article 的完整章节路径；根条目为空数组，conversation 为 null。",
+        },
         "path": {"type": "string", "description": "标准化来源的相对路径。"},
         "locator": string, "role": nullable_string, "evidence_role": nullable_string,
         "turn_index": {"type": ["integer", "null"]},
@@ -48,7 +60,7 @@ def build_openapi() -> dict:
         "SearchRequest": _object({
             "queries": _array({"type": "string", "minLength": 1, "maxLength": MAX_QUERY_SCALARS},
                               minItems=1, maxItems=MAX_QUERIES, uniqueItems=True,
-                              description="1～6 条查询。每条用普通空格分隔 1～3 个关键词，要求在同一条目中同时命中，例如 SQLite 索引。数组中各条查询独立检索，再合并去重排序，不要求同时命中所有查询。每条最多 256 个 Unicode 字符、1024 UTF-8 字节；NFC 规范化、忽略大小写及空白差异后不能重复。"),
+                              description=f"1～6 条查询。每条用普通空格分隔关键词，通常使用 1～3 个、硬上限为 {MAX_ANCHORS} 个，要求在同一条目中同时命中，例如 SQLite 索引。数组中各条查询独立检索，再合并去重排序，不要求同时命中所有查询。每条最多 256 个 Unicode 字符、1024 UTF-8 字节；NFC 规范化、忽略大小写及空白差异后不能重复。"),
             "scopes": _array(scope, minItems=1, maxItems=len(SUPPORTED_SCOPES), uniqueItems=True,
                              description="省略表示所有来源；conversation=会话，note=笔记，article=文章。传入时不能为空或重复。"),
             "limit": {"type": "integer", "minimum": 1, "maximum": MAX_RESULT_LIMIT, "default": 8,
@@ -173,7 +185,7 @@ def build_openapi() -> dict:
         "/v1/status": {"get": operation("status", "查看当前索引版本与服务能力", "StatusResponse",
                                        description="返回当前固定的 generation、各类来源条目数和响应限制。服务重启才会加载新 generation；当前不支持语义检索。")},
         "/v1/search": {"post": operation("search", "检索来源片段", "SearchResponse", "SearchRequest",
-            description="一条 query 的多个关键词用空格分隔，最多 3 个，按 AND 同时匹配同一条目。"
+            description=f"一条 query 的多个关键词用空格分隔，通常使用 1～3 个、最多 {MAX_ANCHORS} 个，按 AND 同时匹配同一条目。"
                         "例如 `queries: [\"SQLite 索引\"]`；`queries: [\"SQLite\", \"索引\"]` 则是两条独立查询，合并去重后排序。\n\n"
                         "中文连续词按连续字符匹配；非中文词忽略大小写并做前缀匹配。标点可能拆分检索成分，不用逗号代替空格。"
                         "不支持自然语言问答或原始 FTS 语法：不要写 OR、NOT、NEAR、双引号、星号、括号或字段过滤；无需手写 AND。\n\n"

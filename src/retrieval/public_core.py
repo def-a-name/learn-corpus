@@ -27,7 +27,8 @@ MAX_RESPONSE_BYTES = 64 * 1024
 _REQUEST_ID = re.compile(r"req_[A-Za-z0-9_-]{1,64}")
 _ITEM_ID = re.compile(r"itm_[a-z2-7]{32}")
 _METADATA = frozenset({
-    "item_id", "source_type", "title", "path", "locator", "role", "evidence_role", "turn_index",
+    "item_id", "source_type", "title", "source_title", "heading_path", "path", "locator",
+    "role", "evidence_role", "turn_index",
 })
 
 
@@ -96,6 +97,8 @@ def _metadata(item: Item) -> dict[str, Any]:
         "item_id": item.item_id,
         "source_type": item.scope,
         "title": item.title,
+        "source_title": item.source_title,
+        "heading_path": None if item.heading_path is None else list(item.heading_path),
         "path": item.source_path,
         "locator": item.locator,
         "role": item.role,
@@ -118,11 +121,20 @@ def _validate_metadata(item: dict[str, Any]) -> None:
         or not isinstance(item["item_id"], str) or _ITEM_ID.fullmatch(item["item_id"]) is None
         or not isinstance(item["locator"], str) or not item["locator"]
         or (item["title"] is not None and not isinstance(item["title"], str))
+        or (item["source_title"] is not None and not isinstance(item["source_title"], str))
+        or (
+            item["heading_path"] is not None
+            and (
+                not isinstance(item["heading_path"], list)
+                or any(not isinstance(value, str) for value in item["heading_path"])
+            )
+        )
     ):
         raise IndexUnavailableError("public item metadata is invalid")
     if scope == "conversation":
         if (
-            item["role"] not in {"human", "assistant"}
+            item["source_title"] is not None or item["heading_path"] is not None
+            or item["role"] not in {"human", "assistant"}
             or item["evidence_role"] != (
                 "user_statement" if item["role"] == "human" else "assistant_suggestion"
             )
@@ -130,7 +142,9 @@ def _validate_metadata(item: dict[str, Any]) -> None:
         ):
             raise IndexUnavailableError("public conversation metadata is invalid")
     elif (
-        item["role"] is not None or item["turn_index"] is not None
+        not isinstance(item["source_title"], str) or not item["source_title"].strip()
+        or item["heading_path"] is None
+        or item["role"] is not None or item["turn_index"] is not None
         or (scope == "article" and item["evidence_role"] != "external_source")
         or (scope == "note" and item["evidence_role"] is not None
             and not isinstance(item["evidence_role"], str))
@@ -267,7 +281,10 @@ class RetrievalCore:
             }, "search", max_tokens, deadline, max_response_bytes)
             if response is not None:
                 return response
-        raise BudgetExceededError("minimum search response exceeds the response budget")
+        raise BudgetExceededError(
+            "minimum search response exceeds the response budget",
+            details={"reason": "minimum_search_response_exceeds_budget"},
+        )
 
     def read_bundle(
         self, request: object, *, request_id: str | None = None,
@@ -304,7 +321,10 @@ class RetrievalCore:
         selected = {seed.item_id}
         response = encode(selected)
         if response is None:
-            raise BudgetExceededError("bundle seed exceeds the response budget")
+            raise BudgetExceededError(
+                "bundle seed exceeds the response budget",
+                details={"reason": "bundle_seed_exceeds_budget"},
+            )
         for item in priority[1:]:
             check_deadline(deadline)
             candidate = selected | {item.item_id}
@@ -369,6 +389,9 @@ class RetrievalCore:
         }
         encoded = _json(payload)
         if len(encoded) > MAX_RESPONSE_BYTES:
-            raise BudgetExceededError("status response exceeds the response byte limit")
+            raise BudgetExceededError(
+                "status response exceeds the response byte limit",
+                details={"reason": "status_response_exceeds_byte_limit"},
+            )
         check_deadline(deadline)
         return PublicResponse(encoded)

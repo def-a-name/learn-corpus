@@ -16,7 +16,7 @@ from src.retrieval.contracts import SUPPORTED_SCOPES
 from src.service.ledger_config import LedgerConfig, TaskLimitsConfig
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 # 固定响应最多 65,536 bytes；任何 call/item 对象都远大于 16 bytes，
 # 因而取最近 4,096+1 条足以覆盖所有可能进入单次响应的完整条目。
 DETAIL_CANDIDATE_LIMIT = 4096
@@ -71,6 +71,8 @@ CREATE TABLE task_items (
     task_id TEXT NOT NULL,
     item_id TEXT NOT NULL,
     source_type TEXT NOT NULL,
+    source_title TEXT,
+    heading_path_json TEXT,
     path TEXT NOT NULL,
     locator TEXT NOT NULL,
     role TEXT,
@@ -105,9 +107,10 @@ CREATE INDEX call_items_task_item ON call_items(task_id, item_id);
 class LedgerFailure(RuntimeError):
     """只携带可公开的固定账本错误类别。"""
 
-    def __init__(self, code: str):
+    def __init__(self, code: str, *, details: dict[str, object] | None = None):
         super().__init__(code)
         self.code = code
+        self.details = details
 
 
 class _IntegrityFailure(RuntimeError):
@@ -127,17 +130,20 @@ def _valid_owner(owner_key: object) -> bool:
 
 
 def _metadata(item: object, bundle_key: str) -> tuple:
-    """验证并提取不含正文、snippet 和 title 的引用元数据。"""
+    """验证并提取不含正文和 snippet 的引用元数据。"""
 
     if not isinstance(item, dict):
         raise _IntegrityFailure
     required = {
-        "item_id", "source_type", "path", "locator", "role", "evidence_role", "turn_index",
+        "item_id", "source_type", "source_title", "heading_path", "path", "locator",
+        "role", "evidence_role", "turn_index",
     }
     if not required <= item.keys():
         raise _IntegrityFailure
     item_id = item["item_id"]
     source_type = item["source_type"]
+    source_title = item["source_title"]
+    heading_path = item["heading_path"]
     path = item["path"]
     locator = item["locator"]
     role = item["role"]
@@ -155,19 +161,27 @@ def _metadata(item: object, bundle_key: str) -> tuple:
         raise _IntegrityFailure
     if source_type == "conversation":
         expected = "user_statement" if role == "human" else "assistant_suggestion"
-        if role not in {"human", "assistant"} or evidence_role != expected:
+        if (
+            source_title is not None or heading_path is not None
+            or role not in {"human", "assistant"} or evidence_role != expected
+        ):
             raise _IntegrityFailure
         if type(turn_index) is not int or turn_index < 0:
             raise _IntegrityFailure
     elif (
-        role is not None or turn_index is not None
+        not isinstance(source_title, str) or not source_title.strip()
+        or not isinstance(heading_path, list)
+        or any(not isinstance(value, str) for value in heading_path)
+        or role is not None or turn_index is not None
         or (source_type == "article" and evidence_role != "external_source")
         or (source_type == "note" and evidence_role is not None
             and not isinstance(evidence_role, str))
     ):
         raise _IntegrityFailure
     return (
-        item_id, source_type, path, locator, role, evidence_role, turn_index, bundle_key,
+        item_id, source_type, source_title,
+        None if heading_path is None else _compact(heading_path),
+        path, locator, role, evidence_role, turn_index, bundle_key,
     )
 
 
@@ -213,6 +227,10 @@ class ExecutionLedgerStore:
                     for statement in _DDL.split(";"):
                         if statement.strip():
                             connection.execute(statement)
+                    connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                elif version == 1:
+                    connection.execute("ALTER TABLE task_items ADD COLUMN source_title TEXT")
+                    connection.execute("ALTER TABLE task_items ADD COLUMN heading_path_json TEXT")
                     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 elif version != SCHEMA_VERSION:
                     raise ValueError("ledger schema version is unsupported")
@@ -334,7 +352,13 @@ class ExecutionLedgerStore:
     ) -> tuple[sqlite3.Row, int]:
         task = self._task(connection, owner_key, task_id)
         if task["state"] != "active":
-            raise LedgerFailure("task_blocked")
+            raise LedgerFailure(
+                "task_blocked",
+                details={
+                    "blocked_category": task["blocked_category"] or "unknown",
+                    "retryable": False,
+                },
+            )
         unresolved = connection.execute(
             "SELECT 1 FROM calls WHERE task_id = ? AND state IN ('pending', 'uncertain')",
             (task_id,),
@@ -347,17 +371,30 @@ class ExecutionLedgerStore:
                 (task_id,),
             )
             connection.commit()
-            raise LedgerFailure("task_blocked")
+            raise LedgerFailure(
+                "task_blocked",
+                details={"blocked_category": "generation_mismatch", "retryable": False},
+            )
         count = connection.execute(
             "SELECT COUNT(*) FROM calls WHERE task_id = ? AND operation = ?",
             (task_id, operation),
         ).fetchone()[0]
         limit = task["search_limit"] if operation == "search" else task["read_limit"]
         if count >= limit:
-            raise LedgerFailure("task_call_limit_exceeded")
+            raise LedgerFailure(
+                "task_call_limit_exceeded",
+                details={"operation": operation, "used": count, "limit": limit},
+            )
         summary = self._summary(connection, task)
         if cap > summary["available_estimated_tokens"]:
-            raise LedgerFailure("task_budget_exceeded")
+            raise LedgerFailure(
+                "task_budget_exceeded",
+                details={
+                    "requested_estimated_tokens": cap,
+                    "available_estimated_tokens": summary["available_estimated_tokens"],
+                    "task_limit": task["evidence_token_limit"],
+                },
+            )
         return task, count + 1
 
     def admit_search(
@@ -463,7 +500,8 @@ class ExecutionLedgerStore:
         values = _metadata(item, bundle_key)
         existing = connection.execute(
             """
-            SELECT item_id, source_type, path, locator, role, evidence_role, turn_index, bundle_key
+            SELECT item_id, source_type, source_title, heading_path_json, path, locator,
+                   role, evidence_role, turn_index, bundle_key
             FROM task_items WHERE task_id = ? AND item_id = ?
             """,
             (task_id, values[0]),
@@ -472,7 +510,12 @@ class ExecutionLedgerStore:
             raise _IntegrityFailure
         if existing is None:
             connection.execute(
-                "INSERT INTO task_items VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                """
+                INSERT INTO task_items (
+                    task_id, item_id, source_type, source_title, heading_path_json,
+                    path, locator, role, evidence_role, turn_index, bundle_key
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
                 (task_id, *values),
             )
         connection.execute(
@@ -576,7 +619,10 @@ class ExecutionLedgerStore:
                 call_id, "ledger_integrity_error", usage=usage,
                 estimator_version=estimator, block=True,
             )
-            raise LedgerFailure("task_blocked") from None
+            raise LedgerFailure(
+                "task_blocked",
+                details={"blocked_category": "ledger_integrity_error", "retryable": False},
+            ) from None
         except LedgerFailure:
             raise
         except sqlite3.Error as exc:
@@ -690,7 +736,8 @@ class ExecutionLedgerStore:
                 ).fetchone()[0]
                 rows = connection.execute(
                     """
-                    SELECT item.item_id, item.source_type, item.path, item.locator, item.role,
+                    SELECT item.item_id, item.source_type, item.source_title,
+                           item.heading_path_json, item.path, item.locator, item.role,
                            item.evidence_role, item.turn_index, item.bundle_key,
                            MAX(call.sequence_number) AS last_sequence
                     FROM task_items AS item
@@ -708,6 +755,10 @@ class ExecutionLedgerStore:
                 items = [dict(row) for row in rows[:DETAIL_CANDIDATE_LIMIT]]
                 for item in items:
                     item.pop("last_sequence")
+                    raw_heading = item.pop("heading_path_json")
+                    item["heading_path"] = (
+                        None if raw_heading is None else json.loads(raw_heading)
+                    )
                 result = {
                     "task_id": task_id,
                     "task_state": task["state"],

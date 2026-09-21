@@ -9,7 +9,7 @@ from starlette.responses import Response
 from src.retrieval.lexical_store import LexicalStoreError
 from src.service.execution_ledger_store import LedgerFailure
 from src.service.mcp_protocol import (
-    PROTOCOL_VERSION, RPCFailure, TOOLS, control_result, parse_envelope,
+    PROTOCOL_VERSION, RPCFailure, TOOLS, ToolFailure, control_result, parse_envelope,
     prepare_message, rpc_payload, tool_definitions, tool_error_result, tool_success_result,
 )
 from src.service.errors import TOOL_ERRORS, HTTPFailure
@@ -21,8 +21,8 @@ def rpc_response(rpc_id, *, result=None, error=None, status=200):
                     status_code=status, media_type="application/json")
 
 
-def tool_error(rpc_id, code, request_id):
-    return rpc_response(rpc_id, result=tool_error_result(code, request_id))
+def tool_error(rpc_id, code, request_id, details=None):
+    return rpc_response(rpc_id, result=tool_error_result(code, request_id, details))
 
 
 def prepare(raw, headers, task_service):
@@ -46,13 +46,18 @@ async def dispatch(request, run_core):
     if operation is None:
         return rpc_response(rpc_id, result=control_result(method))
     try:
-        if isinstance(values, str):
-            raise HTTPFailure(values)
+        if isinstance(values, ToolFailure):
+            request.state.error_code = values.code
+            return tool_error(
+                rpc_id, values.code, request.state.request_id, values.details,
+            )
         result = await run_core(request, operation)
     except (LexicalStoreError, LedgerFailure, HTTPFailure) as exc:
         code = exc.code if exc.code in TOOL_ERRORS else "internal_error"
         request.state.error_code = code
-        return tool_error(rpc_id, code, request.state.request_id)
+        return tool_error(
+            rpc_id, code, request.state.request_id, getattr(exc, "details", None),
+        )
     except Exception:
         request.state.error_code = "internal_error"
         return tool_error(rpc_id, "internal_error", request.state.request_id)

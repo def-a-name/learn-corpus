@@ -19,7 +19,7 @@ from src.retrieval.lexical_store import LexicalStore, LexicalStoreError
 from src.retrieval.public_core import MAX_RESPONSE_BYTES, RequestLimits, RetrievalCore
 from src.service.execution_ledger_store import ExecutionLedgerStore, LedgerFailure
 from src.service.mcp_protocol import (
-    RPCFailure, control_result, parse_envelope, prepare_message, rpc_payload,
+    RPCFailure, ToolFailure, control_result, parse_envelope, prepare_message, rpc_payload,
     tool_error_result, tool_success_result,
 )
 from src.service.errors import TOOL_ERRORS, HTTPFailure
@@ -117,9 +117,11 @@ class StdioServer:
             return tool_success_result(result), "ok"
         except (LexicalStoreError, LedgerFailure, HTTPFailure) as exc:
             code = exc.code if exc.code in TOOL_ERRORS else "internal_error"
+            details = getattr(exc, "details", None)
         except Exception:
             code = "internal_error"
-        return tool_error_result(code, request_id), code
+            details = None
+        return tool_error_result(code, request_id, details), code
 
     def _queue(self, payload, *, releases_tool=False):
         data = _encode(payload)
@@ -161,9 +163,12 @@ class StdioServer:
                 self._queue(rpc_payload(rpc_id, result=control_result(method)))
                 return
             request_id = "req_" + uuid4().hex
-            if isinstance(values, str) or self.active_id is not None:
-                code = values if isinstance(values, str) else "rate_limited"
-                self._queue(rpc_payload(rpc_id, result=tool_error_result(code, request_id)))
+            if isinstance(values, ToolFailure) or self.active_id is not None:
+                code = values.code if isinstance(values, ToolFailure) else "rate_limited"
+                details = values.details if isinstance(values, ToolFailure) else None
+                self._queue(rpc_payload(
+                    rpc_id, result=tool_error_result(code, request_id, details),
+                ))
                 _event(operation, code, request_id)
                 return
             self.active_id, self.request_id, self.operation = rpc_id, request_id, operation

@@ -57,8 +57,8 @@ _TABLE_DELIMITER = re.compile(
 )
 
 _ITEM_SELECT = """
-SELECT item_id, scope, title, source_path, locator, evidence_role,
-       provider, session_id, turn_index, role, part, body,
+SELECT item_id, scope, title, source_title, source_path, locator, evidence_role,
+       provider, session_id, turn_index, role, heading_path_json, part, body,
        token_estimate, relations_json
 FROM items
 WHERE item_id = ?
@@ -69,6 +69,10 @@ class LexicalStoreError(RuntimeError):
     """可在传输边界稳定映射的运行时错误。"""
 
     code = "lexical_store_error"
+
+    def __init__(self, message: str, *, details: dict[str, object] | None = None):
+        super().__init__(message)
+        self.details = details
 
 
 class InvalidRequestError(LexicalStoreError):
@@ -89,6 +93,10 @@ class IndexUnavailableError(LexicalStoreError):
 
 class BudgetExceededError(LexicalStoreError):
     code = "budget_exceeded"
+
+
+class RetrievalTimeoutError(BudgetExceededError):
+    code = "retrieval_timeout"
 
 
 @dataclass(frozen=True)
@@ -118,6 +126,21 @@ def _fits(text: str, max_tokens: int, max_bytes: int | None = None) -> bool:
     return estimate_evidence_tokens(text) <= max_tokens and (
         max_bytes is None or len(text.encode("utf-8")) <= max_bytes
     )
+
+
+def _heading_path(row: sqlite3.Row) -> tuple[str, ...] | None:
+    """从索引行严格还原章节路径。"""
+
+    raw = row["heading_path_json"]
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise IndexUnavailableError("indexed heading path is unavailable") from exc
+    if not isinstance(value, list) or any(not isinstance(part, str) for part in value):
+        raise IndexUnavailableError("indexed heading path is unavailable")
+    return tuple(value)
 
 
 def _line_spans(text: str, start: int, end: int) -> list[tuple[int, int]]:
@@ -561,16 +584,16 @@ class LexicalStore:
 
         remaining = deadline - monotonic()
         if remaining <= 0 or not self._lock.acquire(timeout=remaining):
-            raise BudgetExceededError("request processing deadline exceeded")
+            raise RetrievalTimeoutError("request processing deadline exceeded")
         connection = None
         try:
             if monotonic() >= deadline:
-                raise BudgetExceededError("request processing deadline exceeded")
+                raise RetrievalTimeoutError("request processing deadline exceeded")
             connection = self._database()
             connection.set_progress_handler(lambda: int(monotonic() >= deadline), 100)
             yield
             if monotonic() >= deadline:
-                raise BudgetExceededError("request processing deadline exceeded")
+                raise RetrievalTimeoutError("request processing deadline exceeded")
         except IndexUnavailableError as exc:
             cause = exc.__cause__
             if (
@@ -581,7 +604,7 @@ class LexicalStore:
                 )
                 and monotonic() >= deadline
             ):
-                raise BudgetExceededError("request processing deadline exceeded") from exc
+                raise RetrievalTimeoutError("request processing deadline exceeded") from exc
             raise
         finally:
             if connection is not None:
@@ -701,7 +724,7 @@ class LexicalStore:
         total_tokens = 0
         for rank, item_id in enumerate(fused_ids, start=1):
             if deadline is not None and monotonic() >= deadline:
-                raise BudgetExceededError("request processing deadline exceeded")
+                raise RetrievalTimeoutError("request processing deadline exceeded")
             query_index = 0 if item_id in rankings[0] else min(
                 (index for index in range(1, len(rankings)) if item_id in rankings[index]),
                 key=lambda index: (rankings[index][item_id], index),
@@ -714,6 +737,8 @@ class LexicalStore:
                     item_id=item_id,
                     rank=rank,
                     title=row["title"],
+                    source_title=row["source_title"],
+                    heading_path=_heading_path(row),
                     source_type=row["scope"],
                     path=row["source_path"],
                     locator=row["locator"],
@@ -738,13 +763,28 @@ class LexicalStore:
             raise InvalidRequestError("queries must be an array")
         if not 1 <= len(queries) <= MAX_QUERIES:
             raise InvalidRequestError("queries must contain between 1 and 6 values")
-        try:
-            compiled = tuple(compile_lexical_query(query) for query in queries)
-        except QueryValidationError as exc:
-            raise InvalidRequestError(str(exc)) from exc
-        dedupe_keys = [query.dedupe_key for query in compiled]
-        if len(set(dedupe_keys)) != len(dedupe_keys):
-            raise InvalidRequestError("queries must be unique")
+        compiled_values = []
+        for index, query in enumerate(queries):
+            try:
+                compiled_values.append(compile_lexical_query(query))
+            except QueryValidationError as exc:
+                details = {"parameter": f"queries[{index}]"}
+                if exc.details is not None:
+                    details.update(exc.details)
+                raise InvalidRequestError(str(exc), details=details) from exc
+        compiled = tuple(compiled_values)
+        seen: dict[str, int] = {}
+        for index, query in enumerate(compiled):
+            previous = seen.get(query.dedupe_key)
+            if previous is not None:
+                raise InvalidRequestError(
+                    "queries must be unique",
+                    details={
+                        "parameter": "queries", "reason": "normalized_duplicate",
+                        "indexes": [previous, index],
+                    },
+                )
+            seen[query.dedupe_key] = index
         if scopes is not None:
             if isinstance(scopes, (str, bytes)) or not isinstance(scopes, Sequence):
                 raise InvalidRequestError("scopes must be an array")
@@ -807,6 +847,8 @@ class LexicalStore:
             generation=self.generation,
             item_id=row["item_id"],
             title=row["title"],
+            source_title=row["source_title"],
+            heading_path=_heading_path(row),
             source_type=row["scope"],
             path=row["source_path"],
             locator=row["locator"],

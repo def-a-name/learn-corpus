@@ -22,6 +22,7 @@ from src.retrieval.contracts import (
     PROJECTION_SCHEMA_VERSION,
     QUERY_POLICY_VERSION,
     RANKING_POLICY_VERSION,
+    STABLE_ITEM_ID_VERSION,
     Item,
     ItemRelations,
     ProjectionResult,
@@ -56,6 +57,7 @@ class ProjectionError(ValueError):
 class _LogicalItem:
     scope: str
     title: str | None
+    source_title: str | None
     source_path: str
     source_id: str
     identity_locator: str
@@ -100,7 +102,7 @@ def stable_item_id(
     part: int,
 ) -> str:
     identity = (
-        PROJECTION_SCHEMA_VERSION,
+        STABLE_ITEM_ID_VERSION,
         source_path,
         identity_locator,
         identity_kind,
@@ -687,6 +689,7 @@ def _parse_conversation(
                 _LogicalItem(
                     scope="conversation",
                     title=None,
+                    source_title=None,
                     source_path=source_path,
                     source_id=source_id,
                     identity_locator=identity_locator,
@@ -733,6 +736,7 @@ def _parse_document(
             _LogicalItem(
                 scope=scope,
                 title=title,
+                source_title=source_title,
                 source_path=source_path,
                 source_id=source_id,
                 identity_locator=section.identity_locator,
@@ -840,6 +844,7 @@ def _finalize_items(logical_items: Iterable[_LogicalItem]) -> tuple[Item, ...]:
                     item_id=item_id,
                     scope=logical.scope,
                     title=logical.title,
+                    source_title=logical.source_title,
                     source_path=logical.source_path,
                     source_id=logical.source_id,
                     locator=locator,

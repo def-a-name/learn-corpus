@@ -16,6 +16,7 @@ ERRORS = {
     "generation_mismatch": (409, "Requested generation does not match"),
     "index_unavailable": (503, "Index unavailable"),
     "budget_exceeded": (422, "Response budget exceeded"),
+    "retrieval_timeout": (408, "Retrieval processing timed out"),
 }
 
 

@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from src.service.execution_ledger_store import ExecutionLedgerStore, LedgerFailure
+from src.service.execution_ledger_store import _DDL, ExecutionLedgerStore, LedgerFailure
 from src.service.ledger_config import LedgerConfig, TaskLimitsConfig
 
 
@@ -33,6 +33,8 @@ def item(item_id=ITEM_A, role="human"):
         "item_id": item_id,
         "source_type": "conversation",
         "title": "Synthetic title must not be stored",
+        "source_title": None,
+        "heading_path": None,
         "path": "sources/conversations/synthetic.md",
         "locator": f"synthetic/turn:1/{role}",
         "role": role,
@@ -89,7 +91,7 @@ def test_schema_permissions_and_unknown_version_fail_closed(ledger_config):
     assert ledger_config.path.stat().st_mode & 0o777 == 0o600
     with store._connect() as connection:
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
     ledger_config.path.unlink()
     connection = sqlite3.connect(ledger_config.path)
@@ -98,6 +100,71 @@ def test_schema_permissions_and_unknown_version_fail_closed(ledger_config):
     ledger_config.path.chmod(0o600)
     with pytest.raises(ValueError, match="schema version"):
         ExecutionLedgerStore.open(ledger_config)
+
+
+def test_schema_v1_is_migrated_without_rebuilding_tasks(ledger_config):
+    connection = sqlite3.connect(ledger_config.path)
+    legacy = _DDL.replace(
+        "    source_title TEXT,\n    heading_path_json TEXT,\n", "",
+    )
+    for statement in legacy.split(";"):
+        if statement.strip():
+            connection.execute(statement)
+    connection.execute("PRAGMA user_version = 1")
+    connection.commit()
+    connection.close()
+    ledger_config.path.chmod(0o600)
+
+    migrated = ExecutionLedgerStore.open(ledger_config)
+    with migrated._connect() as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(task_items)")}
+    assert {"source_title", "heading_path_json"} <= columns
+
+
+def test_note_source_title_and_heading_path_are_retained_for_citations(store):
+    task_id = store.create_task("synthetic_owner")["task_id"]
+    call_id = "req_note_search"
+    store.admit_search(
+        "synthetic_owner", task_id, call_id,
+        queries=("Synthetic",), query_keys=("synthetic",), scopes=("note",),
+        result_limit=8, cap=1000, current_generation=GENERATION,
+    )
+    note = {
+        "item_id": ITEM_A,
+        "source_type": "note",
+        "title": "Synthetic section",
+        "source_title": "Synthetic source",
+        "heading_path": ["Parent", "Synthetic section"],
+        "path": "sources/notes/synthetic.md",
+        "locator": "note:synthetic/heading:parent/synthetic-section/part:1",
+        "role": None,
+        "evidence_role": None,
+        "turn_index": None,
+    }
+    response = search_response(call_id)
+    response["results"] = [{
+        **note, "bundle_key": BUNDLE, "rank": 1, "snippet": "Synthetic snippet",
+        "truncated_before": False, "truncated_after": False,
+    }]
+    store.finalize_success(call_id, response)
+    read_id = "req_note_read"
+    store.admit_read(
+        "synthetic_owner", task_id, read_id, seed_item_id=ITEM_A,
+        cap=1000, current_generation=GENERATION,
+    )
+    read = read_response(read_id)
+    read["items"] = [{
+        **note, "body": "Synthetic body", "is_truncated": False,
+        "relations": {"counterpart_item_ids": [], "previous_part_id": None,
+                      "next_part_id": None},
+    }]
+    store.finalize_success(read_id, read)
+
+    citation = store.get_task("synthetic_owner", task_id)["server_returned_items"][0]
+    assert citation["source_title"] == "Synthetic source"
+    assert citation["heading_path"] == ["Parent", "Synthetic section"]
+    assert citation["locator"] == note["locator"]
 
 
 def test_successful_calls_derive_usage_and_store_no_evidence_text(store, ledger_config):
@@ -172,12 +239,18 @@ def test_task_limits_are_snapshotted_and_enforced(store):
             result_limit=8, cap=100, current_generation=GENERATION,
         )
     assert failure.value.code == "task_call_limit_exceeded"
+    assert failure.value.details == {"operation": "search", "used": 1, "limit": 1}
     with pytest.raises(LedgerFailure) as failure:
         store.admit_read(
             "synthetic_owner", task_id, "req_over_task_budget", seed_item_id=ITEM_A,
             cap=201, current_generation=GENERATION,
         )
     assert failure.value.code == "task_budget_exceeded"
+    assert failure.value.details == {
+        "requested_estimated_tokens": 201,
+        "available_estimated_tokens": 200,
+        "task_limit": 500,
+    }
     assert store.get_task("synthetic_owner", task_id)["limits"] == task["limits"]
 
 
@@ -280,6 +353,9 @@ def test_metadata_conflict_records_usage_and_blocks(store):
     with pytest.raises(LedgerFailure) as failure:
         store.finalize_success("req_conflict", response)
     assert failure.value.code == "task_blocked"
+    assert failure.value.details == {
+        "blocked_category": "ledger_integrity_error", "retryable": False,
+    }
     detail = store.get_task("synthetic_owner", task_id)
     assert detail["task_state"] == "blocked"
     assert detail["execution"]["estimated_evidence_tokens"] == 800
@@ -302,6 +378,9 @@ def test_empty_search_pins_generation_and_generation_change_blocks(store):
             result_limit=8, cap=500, current_generation="gen_" + "2" * 20,
         )
     assert failure.value.code == "task_blocked"
+    assert failure.value.details == {
+        "blocked_category": "generation_mismatch", "retryable": False,
+    }
     detail = store.get_task("synthetic_owner", task_id)
     assert detail["task_state"] == "blocked"
     assert detail["generation"] == GENERATION
