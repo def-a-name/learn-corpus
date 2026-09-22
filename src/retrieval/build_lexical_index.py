@@ -158,8 +158,12 @@ def _validate_items(items: Sequence[Item]) -> tuple[Item, ...]:
         logical_locator = _logical_locator(item)
         groups.setdefault((item.source_path, logical_locator), []).append(item)
         if item.scope == "conversation":
-            if item.role not in {"human", "assistant"} or item.source_title is not None:
-                raise LexicalBuildError(f"conversation item has invalid role: {item.item_id}")
+            if (
+                item.role not in {"human", "assistant"}
+                or not isinstance(item.source_title, str) or not item.source_title.strip()
+                or item.heading_path is not None
+            ):
+                raise LexicalBuildError(f"conversation item has invalid metadata: {item.item_id}")
         elif (
             item.role is not None or item.relations.counterpart_item_ids
             or not isinstance(item.source_title, str) or not item.source_title.strip()

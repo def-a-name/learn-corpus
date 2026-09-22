@@ -27,9 +27,10 @@ MAX_RESPONSE_BYTES = 64 * 1024
 _REQUEST_ID = re.compile(r"req_[A-Za-z0-9_-]{1,64}")
 _ITEM_ID = re.compile(r"itm_[a-z2-7]{32}")
 _METADATA = frozenset({
-    "item_id", "source_type", "title", "source_title", "heading_path", "path", "locator",
+    "item_id", "source_type", "title", "source_title", "heading_path",
     "role", "evidence_role", "turn_index",
 })
+_SOURCE_LOCATION = frozenset({"path", "locator"})
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,7 @@ class PublicResponse:
     """保存已经计量和校验的精确 JSON 字节，避免 adapter 意外修改共享结果。"""
 
     json_bytes: bytes
+    source_locations: tuple[dict[str, str], ...] = ()
 
     @property
     def payload(self) -> dict[str, Any]:
@@ -92,34 +94,33 @@ def _json(payload: dict[str, Any]) -> bytes:
         raise IndexUnavailableError("public response cannot be serialized") from exc
 
 
-def _metadata(item: Item) -> dict[str, Any]:
-    return {
+def _metadata(item: Item, *, include_source_location: bool) -> dict[str, Any]:
+    value = {
         "item_id": item.item_id,
         "source_type": item.scope,
         "title": item.title,
         "source_title": item.source_title,
         "heading_path": None if item.heading_path is None else list(item.heading_path),
-        "path": item.source_path,
-        "locator": item.locator,
         "role": item.role,
         "evidence_role": item.evidence_role,
         "turn_index": item.turn_index,
     }
+    if include_source_location:
+        value.update({"path": item.source_path, "locator": item.locator})
+    return value
 
 
-def _validate_metadata(item: dict[str, Any]) -> None:
+def _source_location(item: Item) -> dict[str, str]:
+    return {"item_id": item.item_id, "path": item.source_path, "locator": item.locator}
+
+
+def _validate_metadata(item: dict[str, Any], *, include_source_location: bool) -> None:
     """只允许公开字段的合法类型和标准化来源相对路径。"""
 
     scope = item["source_type"]
-    path = item["path"]
     if (
         scope not in {"conversation", "note", "article"}
-        or not isinstance(path, str)
-        or not path.startswith(f"sources/{scope}s/")
-        or ".." in PurePosixPath(path).parts or "\\" in path
-        or any(ord(char) < 32 for char in path)
         or not isinstance(item["item_id"], str) or _ITEM_ID.fullmatch(item["item_id"]) is None
-        or not isinstance(item["locator"], str) or not item["locator"]
         or (item["title"] is not None and not isinstance(item["title"], str))
         or (item["source_title"] is not None and not isinstance(item["source_title"], str))
         or (
@@ -131,9 +132,19 @@ def _validate_metadata(item: dict[str, Any]) -> None:
         )
     ):
         raise IndexUnavailableError("public item metadata is invalid")
+    if include_source_location:
+        path = item["path"]
+        if (
+            not isinstance(path, str) or not path.startswith(f"sources/{scope}s/")
+            or ".." in PurePosixPath(path).parts or "\\" in path
+            or any(ord(char) < 32 for char in path)
+            or not isinstance(item["locator"], str) or not item["locator"]
+        ):
+            raise IndexUnavailableError("public item source location is invalid")
     if scope == "conversation":
         if (
-            item["source_title"] is not None or item["heading_path"] is not None
+            not isinstance(item["source_title"], str) or not item["source_title"].strip()
+            or item["heading_path"] is not None
             or item["role"] not in {"human", "assistant"}
             or item["evidence_role"] != (
                 "user_statement" if item["role"] == "human" else "assistant_suggestion"
@@ -152,7 +163,9 @@ def _validate_metadata(item: dict[str, Any]) -> None:
         raise IndexUnavailableError("public section metadata is invalid")
 
 
-def _validate_response(payload: dict[str, Any], operation: str) -> None:
+def _validate_response(
+    payload: dict[str, Any], operation: str, *, include_source_location: bool,
+) -> None:
     """序列化之前验证公开结果的字段白名单与完整性不变量。"""
 
     common = {"request_id", "generation", "usage"}
@@ -193,9 +206,12 @@ def _validate_response(payload: dict[str, Any], operation: str) -> None:
     if len({item["item_id"] for item in items}) != len(items):
         raise IndexUnavailableError("public response contains duplicate items")
     for rank, item in enumerate(items, start=1):
-        if set(item) != _METADATA | extra:
+        expected = _METADATA | extra
+        if include_source_location:
+            expected |= _SOURCE_LOCATION
+        if set(item) != expected:
             raise IndexUnavailableError("public item schema is invalid")
-        _validate_metadata(item)
+        _validate_metadata(item, include_source_location=include_source_location)
         if operation == "search":
             if (
                 item["rank"] != rank or not isinstance(item["snippet"], str)
@@ -231,7 +247,7 @@ class RetrievalCore:
 
     def _encode(
         self, payload: dict[str, Any], operation: str, max_tokens: int, deadline: float,
-        max_response_bytes: int | None = None,
+        max_response_bytes: int | None = None, *, include_source_location: bool = True,
     ) -> PublicResponse | None:
         if max_response_bytes is None:
             max_response_bytes = MAX_RESPONSE_BYTES
@@ -240,7 +256,9 @@ class RetrievalCore:
             "estimated_evidence_tokens": 0,
             "estimator_version": ESTIMATOR_VERSION,
         }
-        _validate_response(payload, operation)
+        _validate_response(
+            payload, operation, include_source_location=include_source_location,
+        )
         # usage 自身的数字也占空间；迭代到包含该数字的完整 JSON 估算值不再变化。
         while True:
             check_deadline(deadline)
@@ -256,7 +274,7 @@ class RetrievalCore:
 
     def search(
         self, request: object, *, request_id: str | None = None,
-        max_response_bytes: int | None = None,
+        max_response_bytes: int | None = None, include_source_location: bool = True,
     ) -> PublicResponse:
         deadline, request_id = self._start(request_id)
         values = self.validate_request("search", request)
@@ -265,11 +283,14 @@ class RetrievalCore:
             values.compiled, values.scopes, values.limit, deadline=deadline,
         )
         candidates = []
+        candidate_items = []
         for hit in result.results:
             check_deadline(deadline)
             item = self.store.read_canonical_item(hit.item_id, result.generation, deadline=deadline)
+            candidate_items.append(item)
             candidates.append({
-                **_metadata(item), "bundle_key": bundle_key(item), "rank": hit.rank,
+                **_metadata(item, include_source_location=include_source_location),
+                "bundle_key": bundle_key(item), "rank": hit.rank,
                 "snippet": hit.snippet, "truncated_before": hit.truncated_before,
                 "truncated_after": hit.truncated_after,
             })
@@ -278,9 +299,13 @@ class RetrievalCore:
             response = self._encode({
                 "request_id": request_id, "generation": result.generation,
                 "is_truncated": count < len(candidates), "results": candidates[:count],
-            }, "search", max_tokens, deadline, max_response_bytes)
+            }, "search", max_tokens, deadline, max_response_bytes,
+                include_source_location=include_source_location)
             if response is not None:
-                return response
+                locations = tuple(
+                    _source_location(item) for item in candidate_items[:count]
+                )
+                return PublicResponse(response.json_bytes, locations)
         raise BudgetExceededError(
             "minimum search response exceeds the response budget",
             details={"reason": "minimum_search_response_exceeds_budget"},
@@ -288,7 +313,7 @@ class RetrievalCore:
 
     def read_bundle(
         self, request: object, *, request_id: str | None = None,
-        max_response_bytes: int | None = None,
+        max_response_bytes: int | None = None, include_source_location: bool = True,
     ) -> PublicResponse:
         deadline, request_id = self._start(request_id)
         values = self.validate_request("read_bundle", request)
@@ -300,13 +325,14 @@ class RetrievalCore:
         for item in members:
             check_deadline(deadline)
             item_payloads[item.item_id] = {
-                **_metadata(item), "body": item.body, "is_truncated": False,
+                **_metadata(item, include_source_location=include_source_location),
+                "body": item.body, "is_truncated": False,
                 "relations": asdict(item.relations),
             }
 
         def encode(selected: set[str]) -> PublicResponse | None:
             complete = len(selected) == len(members)
-            return self._encode({
+            response = self._encode({
                 "request_id": request_id, "generation": self.store.generation,
                 "seed_item_id": seed.item_id, "bundle_key": key,
                 "bundle_status": "complete" if complete else "partial_budget",
@@ -315,7 +341,14 @@ class RetrievalCore:
                     item.item_id for item in members if item.item_id not in selected
                 ],
                 "items": [item_payloads[item.item_id] for item in members if item.item_id in selected],
-            }, "bundle", max_tokens, deadline, max_response_bytes)
+            }, "bundle", max_tokens, deadline, max_response_bytes,
+                include_source_location=include_source_location)
+            if response is None:
+                return None
+            locations = tuple(
+                _source_location(item) for item in members if item.item_id in selected
+            )
+            return PublicResponse(response.json_bytes, locations)
 
         priority = prioritize_members(members, seed.item_id)
         selected = {seed.item_id}

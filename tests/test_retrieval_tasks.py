@@ -10,8 +10,9 @@ TASK_ID = "tsk_" + "0" * 32
 
 
 class _DetailLedger:
-    def get_task(self, owner_key, task_id):
+    def get_task(self, owner_key, task_id, *, item_ids=None):
         assert owner_key == "synthetic_owner" and task_id == TASK_ID
+        assert item_ids is None
         calls = [{
             "call_id": f"req_synthetic_{index}",
             "sequence_number": index,
@@ -58,6 +59,8 @@ class _DetailLedger:
             "server_returned_items": items,
             "items_total": len(items),
             "items_truncated": False,
+            "item_filter_applied": False,
+            "unavailable_item_ids": [],
         }
 
 

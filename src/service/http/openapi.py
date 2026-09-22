@@ -41,8 +41,8 @@ def build_openapi() -> dict:
             "description": "旧的条目标题字段；来源展示使用 source_title 与 heading_path。",
         },
         "source_title": {
-            **nullable_string,
-            "description": "note/article 的文档标题；conversation 为 null。",
+            **string,
+            "description": "可直接展示的来源名称；note/article 为文档标题，conversation 为 provider 与创建日期组成的会话标识。",
         },
         "heading_path": {
             "type": ["array", "null"], "items": string,

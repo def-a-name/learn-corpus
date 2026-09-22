@@ -33,7 +33,7 @@ def item(item_id=ITEM_A, role="human"):
         "item_id": item_id,
         "source_type": "conversation",
         "title": "Synthetic title must not be stored",
-        "source_title": None,
+        "source_title": "Synthetic conversation · 2025-01-02",
         "heading_path": None,
         "path": "sources/conversations/synthetic.md",
         "locator": f"synthetic/turn:1/{role}",
@@ -191,6 +191,17 @@ def test_successful_calls_derive_usage_and_store_no_evidence_text(store, ledger_
     detail = store.get_task("synthetic_owner", task_id)
     assert len(detail["calls"]) == 2
     assert {value["item_id"] for value in detail["server_returned_items"]} == {ITEM_A, ITEM_B}
+    assert detail["item_filter_applied"] is False
+    assert detail["unavailable_item_ids"] == []
+    unavailable = "itm_" + "c" * 32
+    filtered = store.get_task(
+        "synthetic_owner", task_id, item_ids=(ITEM_B, unavailable),
+    )
+    assert [value["item_id"] for value in filtered["server_returned_items"]] == [ITEM_B]
+    assert filtered["item_filter_applied"] is True
+    assert filtered["unavailable_item_ids"] == [unavailable]
+    assert filtered["items_total"] == 2
+    assert filtered["items_truncated"] is False
     raw = ledger_config.path.read_bytes()
     assert b"Synthetic body" not in raw
     assert b"Synthetic snippet" not in raw

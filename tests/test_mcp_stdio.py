@@ -16,7 +16,7 @@ import pytest
 from src.service.mcp_protocol import PROTOCOL_VERSION, tool_definitions
 from src.service.stdio.stdio_config import StdioConfig, load_stdio_config
 from test_api import HEADERS, client_for, config  # noqa: F401
-from test_mcp import call as http_call
+from test_mcp import assert_mcp_redacted_view, call as http_call
 from test_public_core import open_core, parts  # noqa: F401
 
 
@@ -166,7 +166,8 @@ def test_rest_http_stdio_parity(launch, config, query):
         stdio_execution = payload.pop("execution")
         http_execution = http_payload.pop("execution")
         http_payload["request_id"] = rest["request_id"] = payload["request_id"]
-        assert payload == http_payload == rest
+        assert payload == http_payload
+        assert_mcp_redacted_view(payload, rest, "results")
         assert stdio_execution["task_id"] == stdio_task
         assert http_execution["task_id"] == http_task
         status = pipe.tool("status")["structuredContent"]
@@ -192,7 +193,8 @@ def test_rest_http_stdio_parity(launch, config, query):
             stdio_payload.pop("execution")
             http_payload.pop("execution")
             http_payload["request_id"] = rest["request_id"] = stdio_payload["request_id"]
-            assert stdio_payload == http_payload == rest
+            assert stdio_payload == http_payload
+            assert_mcp_redacted_view(stdio_payload, rest, "items")
 
 
 @pytest.mark.parametrize("scope", ["note", "article"])
@@ -213,7 +215,8 @@ def test_unicode_sections_and_byte_budget(launch, config, open_core, scope):
         }, headers=HEADERS).json()
         rest["request_id"] = result["request_id"]
         result.pop("execution")
-        assert rest == result and len(result["items"]) == 2
+        assert_mcp_redacted_view(result, rest, "items")
+        assert len(result["items"]) == 2
 
 
 def test_query_validation_details_match_http_and_stdio(launch, config):

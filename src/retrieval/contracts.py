@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
-PROJECTION_SCHEMA_VERSION = "item-projection-v2"
+PROJECTION_SCHEMA_VERSION = "item-projection-v3"
 # item ID 是跨 generation 的引用身份；投影新增非身份元数据时不改变既有 ID。
 STABLE_ITEM_ID_VERSION = "item-projection-v1"
 CHUNK_POLICY_VERSION = "evidence-chunk-v2"

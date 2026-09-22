@@ -16,6 +16,7 @@ from src.service.ledger_config import TaskLimitsConfig
 EXECUTION_RESERVE_BYTES = 8 * 1024
 MCP_CORE_RESPONSE_BYTES = MAX_RESPONSE_BYTES - EXECUTION_RESERVE_BYTES
 _TASK_ID = re.compile(r"tsk_[0-9a-f]{32}")
+_ITEM_ID = re.compile(r"itm_[a-z2-7]{32}")
 
 
 @dataclass(frozen=True)
@@ -26,6 +27,7 @@ class PreparedTaskRequest:
     operation: str
     task_id: str | None = None
     core_request: object = None
+    item_ids: tuple[str, ...] | None = None
 
 
 class RetrievalTaskService:
@@ -59,10 +61,19 @@ class RetrievalTaskService:
                 raise LedgerFailure("invalid_request")
             return PreparedTaskRequest(self._request_owner, operation)
         if operation == "get_task":
-            if set(request) != {"task_id"}:
+            if set(request) - {"task_id", "item_ids"} or "task_id" not in request:
+                raise LedgerFailure("invalid_request")
+            item_ids = request.get("item_ids")
+            if item_ids is not None and (
+                not isinstance(item_ids, list) or not 1 <= len(item_ids) <= 20
+                or len(set(item_ids)) != len(item_ids)
+                or any(not isinstance(value, str) or _ITEM_ID.fullmatch(value) is None
+                       for value in item_ids)
+            ):
                 raise LedgerFailure("invalid_request")
             return PreparedTaskRequest(
                 self._request_owner, operation, self._task_id(request["task_id"]),
+                item_ids=None if item_ids is None else tuple(item_ids),
             )
         if operation == "search":
             if set(request) - {
@@ -119,13 +130,17 @@ class RetrievalTaskService:
         self, request: object, *, owner_key: str, request_id: str | None = None,
     ) -> PublicResponse:
         prepared = self._prepared("get_task", request)
-        payload = self.ledger.get_task(owner_key, prepared.task_id)
+        payload = self.ledger.get_task(
+            owner_key, prepared.task_id, item_ids=prepared.item_ids,
+        )
         calls = payload.pop("calls")
         items = payload.pop("server_returned_items")
+        calls_were_truncated = payload["calls_truncated"]
+        items_were_truncated = payload["items_truncated"]
         payload["calls"] = []
         payload["server_returned_items"] = []
-        payload["calls_truncated"] = payload["calls_total"] > 0
-        payload["items_truncated"] = payload["items_total"] > 0
+        payload["calls_truncated"] = calls_were_truncated or bool(calls)
+        payload["items_truncated"] = items_were_truncated or bool(items)
 
         # 两类明细交替加入，分别保留最近的连续窗口；任一下一条放不下时，
         # 只停止该类，另一类仍可使用剩余响应字节。字段永远整条保留。
@@ -143,7 +158,8 @@ class RetrievalTaskService:
                     candidate = call_candidates[call_index]
                     payload["calls"].insert(0, candidate)
                     payload["calls_truncated"] = (
-                        payload["calls_total"] > len(payload["calls"])
+                        calls_were_truncated
+                        or len(calls) > len(payload["calls"])
                     )
                     if len(self._json_bytes(payload)) <= MAX_RESPONSE_BYTES:
                         call_index += 1
@@ -158,7 +174,8 @@ class RetrievalTaskService:
                     candidate = item_candidates[item_index]
                     payload["server_returned_items"].append(candidate)
                     payload["items_truncated"] = (
-                        payload["items_total"] > len(payload["server_returned_items"])
+                        items_were_truncated
+                        or len(items) > len(payload["server_returned_items"])
                     )
                     if len(self._json_bytes(payload)) <= MAX_RESPONSE_BYTES:
                         item_index += 1
@@ -188,6 +205,7 @@ class RetrievalTaskService:
         try:
             response = self.core.search(
                 values, request_id=request_id, max_response_bytes=MCP_CORE_RESPONSE_BYTES,
+                include_source_location=False,
             )
         except LexicalStoreError as exc:
             self._fail_after_admission(request_id, exc.code)
@@ -196,7 +214,9 @@ class RetrievalTaskService:
             self._fail_after_admission(request_id, "internal_error")
             raise
         payload = response.payload
-        payload["execution"] = self.ledger.finalize_success(request_id, payload)
+        payload["execution"] = self.ledger.finalize_success(
+            request_id, payload, source_locations=response.source_locations,
+        )
         return self._encode(payload)
 
     def read_bundle(
@@ -218,6 +238,7 @@ class RetrievalTaskService:
         try:
             response = self.core.read_bundle(
                 values, request_id=request_id, max_response_bytes=MCP_CORE_RESPONSE_BYTES,
+                include_source_location=False,
             )
         except LexicalStoreError as exc:
             self._fail_after_admission(request_id, exc.code)
@@ -226,7 +247,9 @@ class RetrievalTaskService:
             self._fail_after_admission(request_id, "internal_error")
             raise
         payload = response.payload
-        payload["execution"] = self.ledger.finalize_success(request_id, payload)
+        payload["execution"] = self.ledger.finalize_success(
+            request_id, payload, source_locations=response.source_locations,
+        )
         return self._encode(payload)
 
     def status(self) -> PublicResponse:

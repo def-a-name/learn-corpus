@@ -56,7 +56,8 @@ def make_item(
         item_id=item_id,
         scope=scope,
         title=title,
-        source_title=(title or "Synthetic source") if scope != "conversation" else None,
+        source_title=(title or "Synthetic source") if scope != "conversation"
+        else "Codex 会话 · 2025-01-02",
         source_path=source_path,
         source_id=source_id,
         locator=f"{identity_locator}/part:1",

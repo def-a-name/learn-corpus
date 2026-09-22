@@ -162,7 +162,8 @@ def _metadata(item: object, bundle_key: str) -> tuple:
     if source_type == "conversation":
         expected = "user_statement" if role == "human" else "assistant_suggestion"
         if (
-            source_title is not None or heading_path is not None
+            not isinstance(source_title, str) or not source_title.strip()
+            or heading_path is not None
             or role not in {"human", "assistant"} or evidence_role != expected
         ):
             raise _IntegrityFailure
@@ -183,6 +184,37 @@ def _metadata(item: object, bundle_key: str) -> tuple:
         None if heading_path is None else _compact(heading_path),
         path, locator, role, evidence_role, turn_index, bundle_key,
     )
+
+
+def _attach_source_locations(
+    items: list[object], source_locations: tuple[dict[str, str], ...] | None,
+) -> list[object]:
+    """将未公开的来源定位合并到服务端结算副本。"""
+
+    if source_locations is None:
+        return items
+    locations: dict[str, dict[str, str]] = {}
+    for value in source_locations:
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"item_id", "path", "locator"}
+            or not isinstance(value["item_id"], str)
+            or value["item_id"] in locations
+            or not isinstance(value["path"], str)
+            or not isinstance(value["locator"], str)
+        ):
+            raise _IntegrityFailure
+        locations[value["item_id"]] = value
+    item_ids = {
+        item.get("item_id") for item in items if isinstance(item, dict)
+    }
+    if len(item_ids) != len(items) or item_ids != set(locations):
+        raise _IntegrityFailure
+    return [
+        {**item, "path": locations[item["item_id"]]["path"],
+         "locator": locations[item["item_id"]]["locator"]}
+        for item in items if isinstance(item, dict)
+    ]
 
 
 class ExecutionLedgerStore:
@@ -522,7 +554,10 @@ class ExecutionLedgerStore:
             "INSERT INTO call_items VALUES (?, ?, ?)", (call_id, values[0], task_id),
         )
 
-    def finalize_success(self, call_id: str, response: dict) -> dict:
+    def finalize_success(
+        self, call_id: str, response: dict,
+        *, source_locations: tuple[dict[str, str], ...] | None = None,
+    ) -> dict:
         """从同一份 core payload 结算一次调用并返回派生摘要。"""
 
         usage_value = response.get("usage") if isinstance(response, dict) else None
@@ -551,6 +586,7 @@ class ExecutionLedgerStore:
                     results = response.get("results")
                     if not isinstance(results, list):
                         raise _IntegrityFailure
+                    results = _attach_source_locations(results, source_locations)
                     for item in results:
                         bundle_key = item.get("bundle_key") if isinstance(item, dict) else None
                         if not isinstance(bundle_key, str):
@@ -561,6 +597,7 @@ class ExecutionLedgerStore:
                     missing = response.get("missing_item_ids")
                     if not isinstance(items, list) or not isinstance(missing, list):
                         raise _IntegrityFailure
+                    items = _attach_source_locations(items, source_locations)
                     returned = [item.get("item_id") for item in items if isinstance(item, dict)]
                     if (
                         response.get("seed_item_id") != call["seed_item_id"]
@@ -681,7 +718,10 @@ class ExecutionLedgerStore:
         except sqlite3.Error as exc:
             raise LedgerFailure("ledger_unavailable") from exc
 
-    def get_task(self, owner_key: str, task_id: str) -> dict:
+    def get_task(
+        self, owner_key: str, task_id: str,
+        *, item_ids: tuple[str, ...] | None = None,
+    ) -> dict:
         try:
             with self._connect() as connection:
                 connection.execute("BEGIN")
@@ -734,6 +774,14 @@ class ExecutionLedgerStore:
                     """,
                     (task_id,),
                 ).fetchone()[0]
+                item_filter = ""
+                item_parameters: tuple[object, ...] = (task_id,)
+                if item_ids is not None:
+                    item_filter = (
+                        " AND item.item_id IN ("
+                        + ",".join("?" for _ in item_ids) + ")"
+                    )
+                    item_parameters += item_ids
                 rows = connection.execute(
                     """
                     SELECT item.item_id, item.source_type, item.source_title,
@@ -746,11 +794,12 @@ class ExecutionLedgerStore:
                     JOIN calls AS call ON call.call_id = relation.call_id
                     WHERE item.task_id = ? AND call.operation = 'read_bundle'
                                       AND call.state = 'succeeded'
+                    """ + item_filter + """
                     GROUP BY item.task_id, item.item_id
                     ORDER BY last_sequence DESC, item.item_id
                     LIMIT ?
                     """,
-                    (task_id, DETAIL_CANDIDATE_LIMIT + 1),
+                    (*item_parameters, DETAIL_CANDIDATE_LIMIT + 1),
                 ).fetchall()
                 items = [dict(row) for row in rows[:DETAIL_CANDIDATE_LIMIT]]
                 for item in items:
@@ -759,6 +808,13 @@ class ExecutionLedgerStore:
                     item["heading_path"] = (
                         None if raw_heading is None else json.loads(raw_heading)
                     )
+                unavailable_item_ids: list[str] = []
+                if item_ids is not None:
+                    by_id = {item["item_id"]: item for item in items}
+                    unavailable_item_ids = [
+                        item_id for item_id in item_ids if item_id not in by_id
+                    ]
+                    items = [by_id[item_id] for item_id in item_ids if item_id in by_id]
                 result = {
                     "task_id": task_id,
                     "task_state": task["state"],
@@ -775,7 +831,12 @@ class ExecutionLedgerStore:
                     "calls_truncated": calls_total > len(calls),
                     "server_returned_items": items,
                     "items_total": items_total,
-                    "items_truncated": items_total > len(items),
+                    "items_truncated": (
+                        len(rows) > DETAIL_CANDIDATE_LIMIT
+                        if item_ids is not None else items_total > len(items)
+                    ),
+                    "item_filter_applied": item_ids is not None,
+                    "unavailable_item_ids": unavailable_item_ids,
                 }
                 connection.commit()
                 return result

@@ -7,6 +7,7 @@ import pytest
 from src.service.http.mcp import PROTOCOL_VERSION, tool_definitions
 from src.service.ledger_config import TaskLimitsConfig
 from src.retrieval.lexical_store import IndexUnavailableError
+from src.retrieval.text import estimate_evidence_tokens
 from test_api import HEADERS, TOKEN, config, client_for, assert_error  # noqa: F401
 from test_public_core import open_core  # noqa: F401
 
@@ -30,6 +31,33 @@ def start_task(client):
     result = call(client, 'start_retrieval_task').json()['result']
     assert result['isError'] is False
     return result['structuredContent']['task_id']
+
+
+def without_source_locations(payload):
+    value = json.loads(json.dumps(payload))
+    for item in value.get('results', value.get('items', [])):
+        item.pop('path')
+        item.pop('locator')
+    return value
+
+
+def assert_mcp_redacted_view(value, rest, item_key):
+    """MCP 可因省略定位字段而在同一预算下返回更多项。"""
+
+    assert value['generation'] == rest['generation']
+    if item_key == 'items':
+        assert value['seed_item_id'] == rest['seed_item_id']
+        assert value['bundle_key'] == rest['bundle_key']
+    mcp_items = value[item_key]
+    rest_items = without_source_locations(rest)[item_key]
+    shared = min(len(mcp_items), len(rest_items))
+    assert [item['item_id'] for item in mcp_items[:shared]] == [
+        item['item_id'] for item in rest_items[:shared]
+    ]
+    assert mcp_items[:shared] == rest_items[:shared]
+    assert all('path' not in item and 'locator' not in item for item in mcp_items)
+    encoded = json.dumps(value, ensure_ascii=False, separators=(',', ':'))
+    assert value['usage']['estimated_evidence_tokens'] == estimate_evidence_tokens(encoded)
 
 
 def test_handshake_discovery_and_status(config):
@@ -77,7 +105,7 @@ def test_rest_mcp_search_read_deep_parity(config, query):
                                               if key != 'task_id'}, headers=HEADERS).json()
         rest['request_id'] = value['request_id']
         execution = value.pop('execution')
-        assert value == rest
+        assert_mcp_redacted_view(value, rest, 'results')
         assert execution['task_id'] == task_id and execution['search_calls'] == 1
         if not value['results']:
             return
@@ -94,8 +122,17 @@ def test_rest_mcp_search_read_deep_parity(config, query):
             structured = result['structuredContent']
             rest['request_id'] = structured['request_id']
             execution = structured.pop('execution')
-            assert structured == rest
+            assert_mcp_redacted_view(structured, rest, 'items')
             assert execution['read_calls'] == 1
+            item_id = structured['items'][0]['item_id']
+            detail = call(client, 'get_retrieval_task', {
+                'task_id': task_id, 'item_ids': [item_id],
+            }).json()['result']['structuredContent']
+            assert detail['item_filter_applied'] is True
+            assert detail['unavailable_item_ids'] == []
+            assert detail['items_truncated'] is False
+            assert [item['item_id'] for item in detail['server_returned_items']] == [item_id]
+            assert {'path', 'locator'} <= detail['server_returned_items'][0].keys()
 
 
 def test_task_switching_bounded_detail_and_owner_isolation(config):
@@ -121,6 +158,8 @@ def test_task_switching_bounded_detail_and_owner_isolation(config):
         assert detail['execution']['search_calls'] == 1
         assert detail['calls_total'] == 1 and detail['calls_truncated'] is False
         assert detail['items_total'] == 0 and detail['items_truncated'] is False
+        assert detail['item_filter_applied'] is False
+        assert detail['unavailable_item_ids'] == []
         assert detail['calls'][0]['queries'] == ['quasar']
         assert detail['server_returned_items'] == []
 
@@ -357,7 +396,7 @@ def test_errors_logs_and_shared_admission(config, monkeypatch, caplog):
 def test_tools_list_contract_snapshot():
     import hashlib
     encoded = json.dumps(tool_definitions(), sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode()
-    assert hashlib.sha256(encoded).hexdigest() == 'b1f8b1a967c951cd76718349aef51a9f08358c17c591c9f3bc558460df77535b'
+    assert hashlib.sha256(encoded).hexdigest() == '00a09e2e425035b348b939dd64737ccd4b0e2189f919eb538afe4f657e8c86a8'
 
 
 @pytest.mark.parametrize('scope', ['note', 'article'])
@@ -381,7 +420,8 @@ def test_section_unicode_body_parity(config, open_core, scope):
         }, headers=HEADERS).json()
         rest['request_id'] = bundle['request_id']
         execution = bundle.pop('execution')
-        assert bundle == rest and len(bundle['items']) == 2
+        assert_mcp_redacted_view(bundle, rest, 'items')
+        assert len(bundle['items']) == 2
         assert execution['task_id'] == task_id
 
 

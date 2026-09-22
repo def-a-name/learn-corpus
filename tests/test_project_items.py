@@ -44,6 +44,7 @@ class ProjectionFixture:
         evidence_role: str | None = None,
         raw_hash: str | None = None,
         filename: str | None = None,
+        created: str = "2025-01-02",
     ) -> Path:
         raw_hash = raw_hash or (source_id[0] * 64)
         relative = Path("sources") / f"{scope}s" / (filename or f"{source_id}.md")
@@ -66,6 +67,7 @@ class ProjectionFixture:
                     "provider": provider,
                     "provider_session_id": f"session-{source_id}",
                     "exchange_count": exchange_count,
+                    "created": created,
                 }
             )
             record["provider"] = provider
@@ -146,6 +148,12 @@ class TestItemProjector:
             assistant = next(item for item in items if item.role == "assistant")
             assert human.evidence_role == "user_statement"
             assert assistant.evidence_role == "assistant_suggestion"
+            expected_provider = {
+                "claude": "Claude", "codex": "Codex",
+                "chatgpt": "ChatGPT", "deepseek": "DeepSeek",
+            }[provider]
+            assert human.source_title == f"{expected_provider} 会话 · 2025-01-02"
+            assert assistant.source_title == human.source_title
             assert human.turn_index == 1
             assert human.relations.counterpart_item_ids == (assistant.item_id,)
             assert assistant.relations.counterpart_item_ids == (human.item_id,)

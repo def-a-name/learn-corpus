@@ -47,6 +47,12 @@ _EXCHANGE = re.compile(r"^## Exchange (?P<number>[1-9]\d*)$")
 _TURN = re.compile(r"^- \*\*Turn\*\*: (?P<number>[1-9]\d*)$")
 _USER_LOCATOR = re.compile(r"^- \*\*User locator\*\*: `(?P<locator>[^`]+)`$")
 _ASSISTANT_LOCATOR = re.compile(r"^- \*\*Assistant locator\*\*: `(?P<locator>[^`]+)`$")
+_PROVIDER_DISPLAY_NAMES = {
+    "claude": "Claude",
+    "codex": "Codex",
+    "chatgpt": "ChatGPT",
+    "deepseek": "DeepSeek",
+}
 
 
 class ProjectionError(ValueError):
@@ -607,6 +613,12 @@ def _parse_conversation(
     provider = metadata.get("provider")
     if not isinstance(provider, str) or not provider:
         raise ProjectionError(f"conversation {source_id} has no provider")
+    created = metadata.get("created")
+    if not isinstance(created, str) or not created.strip():
+        raise ProjectionError(f"conversation {source_id} has no created value")
+    provider_label = _PROVIDER_DISPLAY_NAMES.get(provider.casefold(), provider)
+    created_label = "日期未知" if created == "unknown" else created
+    source_title = f"{provider_label} 会话 · {created_label}"
     session_id = metadata.get("provider_session_id") or metadata.get("derived_session_key")
     if session_id is not None and not isinstance(session_id, str):
         raise ProjectionError(f"conversation {source_id} has invalid session identity")
@@ -689,7 +701,7 @@ def _parse_conversation(
                 _LogicalItem(
                     scope="conversation",
                     title=None,
-                    source_title=None,
+                    source_title=source_title,
                     source_path=source_path,
                     source_id=source_id,
                     identity_locator=identity_locator,

@@ -29,7 +29,7 @@ _DESCRIPTIONS = {
     "start_retrieval_task": "Create one server-side retrieval task for one independent user question. Keep the returned task_id for follow-up search, read and detail calls.",
     "search_sources": "Find candidate evidence within an existing retrieval task. Snippets are only for selection; call read_bundle before factual answers. Put the strongest lexical query first. Do not infer ranking scores.",
     "read_bundle": "Read a seed-centered bounded window from one search candidate in the same retrieval task. A successful response always includes the complete seed body; items are returned in source order. Judge each item's role and evidence_role separately; assistant suggestions do not imply user adoption.",
-    "get_retrieval_task": "Return complete counters plus response-bounded recent call and citation details for one task. Truncation flags describe omitted detail. server_returned_items are citation metadata, not evidence bodies or proof that the host received them.",
+    "get_retrieval_task": "Return complete counters plus response-bounded call and citation details for one task. Optionally request exact citation metadata for item_ids previously returned by successful reads. Truncation flags describe omitted detail. server_returned_items are citation metadata, not evidence bodies or proof that the host received them.",
     "status": "Return the pinned generation, supported scopes, per-request limits and execution-ledger health.",
 }
 _UNTRUSTED = (
@@ -76,7 +76,7 @@ def tool_definitions():
         "source_type": {"type": "string", "enum": ["conversation", "note", "article"]},
         "source_title": {
             **nullable_string,
-            "description": "Document title for note/article citations; null for conversations.",
+            "description": "Human-readable source label: document title for note/article or provider and creation date for conversations. Legacy task records may be null.",
         },
         "heading_path": {
             "type": ["array", "null"], "items": {"type": "string"},
@@ -114,6 +114,14 @@ def tool_definitions():
             "missing_item_count": {"type": "integer", "minimum": 0},
         }),
     ]}
+
+    # REST 保留完整定位；MCP search/read 只公开可读来源字段，精确定位由任务账本返回。
+    for schema_name in ("SearchResult", "BundleItem"):
+        schema = schemas[schema_name]
+        schema["properties"].pop("path")
+        schema["properties"].pop("locator")
+        schema["required"].remove("path")
+        schema["required"].remove("locator")
 
     search_input = deepcopy(schemas["SearchRequest"])
     search_input["properties"].pop("generation")
@@ -154,6 +162,11 @@ def tool_definitions():
         "server_returned_items": {"type": "array", "items": {"$ref": "#/components/schemas/McpTaskCitation"}},
         "items_total": {"type": "integer", "minimum": 0},
         "items_truncated": {"type": "boolean"},
+        "item_filter_applied": {"type": "boolean"},
+        "unavailable_item_ids": {
+            "type": "array", "items": {"type": "string", "pattern": "^itm_[a-z2-7]{32}$"},
+            "uniqueItems": True,
+        },
     })
     status_output = deepcopy(schemas["StatusResponse"])
     status_output["properties"]["execution_ledger"] = object_schema({
@@ -178,7 +191,14 @@ def tool_definitions():
         "start_retrieval_task": empty,
         "search_sources": search_input,
         "read_bundle": read_input,
-        "get_retrieval_task": object_schema({"task_id": task_id}),
+        "get_retrieval_task": object_schema({
+            "task_id": task_id,
+            "item_ids": {
+                "type": "array", "items": {"type": "string", "pattern": "^itm_[a-z2-7]{32}$"},
+                "minItems": 1, "maxItems": 20, "uniqueItems": True,
+                "description": "Optional item IDs from successful read_bundle results whose exact citation metadata should be returned.",
+            },
+        }, required=["task_id"]),
         "status": empty,
     }
     outputs = {

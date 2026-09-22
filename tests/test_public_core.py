@@ -30,7 +30,7 @@ def parts(scope, unit, bodies, *, role=None, occurrence=1, turn=1):
     ids = [stable_item_id(path, locator, role or "heading", n) for n in range(1, len(bodies) + 1)]
     return tuple(Item(
         item_id=ids[index], scope=scope, title="Synthetic heading" if role is None else None,
-        source_title="Synthetic source" if role is None else None,
+        source_title="Synthetic source" if role is None else "Codex 会话 · 2025-01-02",
         source_path=path, source_id="synthetic-archive", locator=f"{locator}/part:{index + 1}",
         locator_with_lines=None,
         evidence_role=("user_statement" if role == "human" else "assistant_suggestion")
@@ -132,7 +132,7 @@ def test_public_whitelist_and_exact_serialized_usage(open_core):
         assert len(response.json_bytes) <= public_core.MAX_RESPONSE_BYTES
         for item in payload.get("items", payload.get("results", [])):
             assert not {"provider", "session_id", "part", "source_id", "body_sha256"} & item.keys()
-            assert item["source_title"] is None
+            assert item["source_title"] == "Codex 会话 · 2025-01-02"
             assert item["heading_path"] is None
         payload["generation"] = "changed-local-copy"
         assert response.payload["generation"] == core.store.generation
