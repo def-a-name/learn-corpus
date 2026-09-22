@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-import ipaddress
 import asyncio
+import errno
+import ipaddress
 import json
 import logging
+import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from functools import partial
@@ -44,6 +46,73 @@ _ROUTES = {
     "/docs": ("GET", "docs"),
     "/openapi.json": ("GET", "openapi"),
 }
+
+_OS_ERROR_CATEGORIES = {
+    errno.EACCES: "permission_denied",
+    errno.EPERM: "permission_denied",
+    errno.ENOENT: "not_found",
+    errno.EROFS: "read_only_filesystem",
+    errno.ENOSPC: "storage_exhausted",
+    errno.EMFILE: "resource_exhausted",
+    errno.ENFILE: "resource_exhausted",
+}
+if hasattr(errno, "EDQUOT"):
+    _OS_ERROR_CATEGORIES[errno.EDQUOT] = "storage_exhausted"
+
+_SQLITE_ERROR_CATEGORIES = {
+    "SQLITE_BUSY": "resource_busy",
+    "SQLITE_CANTOPEN": "storage_unavailable",
+    "SQLITE_CORRUPT": "data_corrupt",
+    "SQLITE_FULL": "storage_exhausted",
+    "SQLITE_LOCKED": "resource_busy",
+    "SQLITE_NOTADB": "data_corrupt",
+    "SQLITE_READONLY": "read_only_filesystem",
+}
+
+
+def _exception_chain(error: BaseException):
+    """遍历显式或隐式异常链，并防止异常对象形成循环。"""
+
+    seen = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        if current.__cause__ is not None:
+            current = current.__cause__
+        elif not current.__suppress_context__:
+            current = current.__context__
+        else:
+            current = None
+
+
+def _lifecycle_failure(error: BaseException, component: str) -> dict[str, str]:
+    """只从稳定错误码生成启动诊断，不记录异常消息或路径。"""
+
+    for current in _exception_chain(error):
+        if isinstance(current, sqlite3.Error):
+            sqlite_error = getattr(current, "sqlite_errorname", None)
+            if isinstance(sqlite_error, str):
+                base_error = next((
+                    name for name in _SQLITE_ERROR_CATEGORIES
+                    if sqlite_error == name or sqlite_error.startswith(name + "_")
+                ), None)
+                if base_error is not None:
+                    return {
+                        "error_category": _SQLITE_ERROR_CATEGORIES[base_error],
+                        "sqlite_error": base_error,
+                    }
+        if isinstance(current, OSError) and current.errno in _OS_ERROR_CATEGORIES:
+            return {
+                "error_category": _OS_ERROR_CATEGORIES[current.errno],
+                "os_error": errno.errorcode[current.errno],
+            }
+    fallback = {
+        "credentials": "credentials_unavailable",
+        "index": "index_unavailable",
+        "ledger": "ledger_unavailable",
+    }.get(component, "initialization_failed")
+    return {"error_category": fallback}
 
 
 def error_response(error: HTTPFailure, request_id: str) -> Response:
@@ -236,18 +305,27 @@ def create_app(
         # 启动失败不保留半初始化 store；凭据文件必须限制读取权限。
         store = None
         ledger = None
+        phase = "startup"
+        component = "credentials"
         try:
             app.state.verifier = BearerVerifier(load_credentials(config.credentials_file))
+            component = "index"
             store = await anyio.to_thread.run_sync(LexicalStore.open_current, config.corpus_path)
             app.state.core = RetrievalCore(store, RequestLimits(config.corpus_timeout_ms))
+            component = "ledger"
             ledger = await anyio.to_thread.run_sync(ExecutionLedgerStore.open, ledger_config)
+            component = "runtime"
             app.state.tasks = RetrievalTaskService(app.state.core, ledger, task_limits)
             app.state.admissions = Admissions(config.global_concurrency, config.client_concurrency)
             app.state.workers = anyio.CapacityLimiter(config.global_concurrency)
+            phase = "runtime"
             yield
-        except Exception:
-            _LOG.error(json.dumps({"operation": "lifecycle", "status": "failed",
-                                   "error_category": "service_unavailable"}))
+        except Exception as exc:
+            event = {
+                "operation": "lifecycle", "phase": phase, "component": component,
+                "status": "failed", **_lifecycle_failure(exc, component),
+            }
+            _LOG.error(json.dumps(event, separators=(",", ":")))
             raise
         finally:
             if store is not None:

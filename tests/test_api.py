@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-import base64
 import asyncio
+import base64
+import errno
 import json
 import logging
+import sqlite3
 import threading
 from dataclasses import replace
 
@@ -310,6 +312,52 @@ def test_lifespan_closes_store_and_rejects_bad_credentials_or_index(config):
     with pytest.raises(IndexUnavailableError):
         with client_for(replace(config, corpus_path=config.corpus_path / "missing")):
             pass
+
+
+@pytest.mark.parametrize(("target", "cause", "component", "category", "detail"), [
+    (
+        "src.service.http.api.load_credentials",
+        PermissionError(errno.EACCES, "synthetic private detail", "/synthetic/private/credentials"),
+        "credentials", "permission_denied", ("os_error", "EACCES"),
+    ),
+    (
+        "src.service.http.api.LexicalStore.open_current",
+        FileNotFoundError(errno.ENOENT, "synthetic private detail", "/synthetic/private/index"),
+        "index", "not_found", ("os_error", "ENOENT"),
+    ),
+    (
+        "src.service.http.api.ExecutionLedgerStore.open",
+        sqlite3.OperationalError("synthetic private ledger detail"),
+        "ledger", "read_only_filesystem", ("sqlite_error", "SQLITE_READONLY"),
+    ),
+])
+def test_startup_failure_logs_safe_component_and_stable_error(
+    config, monkeypatch, caplog, target, cause, component, category, detail,
+):
+    if isinstance(cause, sqlite3.Error):
+        cause.sqlite_errorname = detail[1]
+
+    def fail(*_args, **_kwargs):
+        raise ValueError("synthetic private wrapper") from cause
+
+    monkeypatch.setattr(target, fail)
+    with caplog.at_level(logging.ERROR, logger="learn_corpus.service"):
+        with pytest.raises(ValueError, match="synthetic private wrapper"):
+            with client_for(config):
+                pass
+
+    events = [
+        json.loads(record.message) for record in caplog.records
+        if record.name == "learn_corpus.service"
+        and '"operation":"lifecycle"' in record.message
+    ]
+    assert events == [{
+        "operation": "lifecycle", "phase": "startup", "component": component,
+        "status": "failed", "error_category": category, detail[0]: detail[1],
+    }]
+    assert "synthetic private" not in caplog.text
+    assert "/synthetic/private" not in caplog.text
+    assert "Traceback" not in caplog.text
 
 
 def test_rotation_keys_share_client_and_revocation_uses_new_verifier():
