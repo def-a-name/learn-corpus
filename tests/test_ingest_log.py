@@ -10,7 +10,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from src.corpus.ingest_log import SourceChangeTracker, check_ingest_log  # noqa: E402
+from src.corpus.ingest_log import SourceChangeTracker, check_ingest_log, check_committed_ingest_log  # noqa: E402
 
 
 def git(repo: Path, *args: str) -> None:
@@ -18,6 +18,47 @@ def git(repo: Path, *args: str) -> None:
 
 
 class TestIngestLog:
+    def test_committed_checker_matches_push_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "sources" / "notes" / "synthetic-note.md"
+            source.parent.mkdir(parents=True)
+            git(root, "init", "-q")
+            git(root, "config", "user.name", "Synthetic Tester")
+            git(root, "config", "user.email", "synthetic@example.test")
+
+            first = SourceChangeTracker.for_output(source.parent)
+            first.observe(source)
+            source.write_text("Synthetic version one.\n", encoding="utf-8")
+            first.append("notes")
+            git(root, "add", "sources", "meta/ingest.log")
+            git(root, "commit", "-qm", "Add synthetic source")
+            baseline = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "HEAD"],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
+
+            update = SourceChangeTracker.for_output(source.parent)
+            update.observe(source)
+            source.write_text("Synthetic version two.\n", encoding="utf-8")
+            update.append("notes")
+            git(root, "add", "sources", "meta/ingest.log")
+            git(root, "commit", "-qm", "Update synthetic source")
+            head = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "HEAD"],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
+            assert check_committed_ingest_log(root, baseline, head) == []
+
+            source.write_text("Synthetic unlogged version.\n", encoding="utf-8")
+            git(root, "add", "sources")
+            git(root, "commit", "-qm", "Unlogged synthetic change")
+            bad_head = subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "HEAD"],
+                capture_output=True, text=True, check=True,
+            ).stdout.strip()
+            assert any("sha256 mismatch" in error for error in check_committed_ingest_log(root, baseline, bad_head))
+
     def test_tracker_appends_only_actual_source_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

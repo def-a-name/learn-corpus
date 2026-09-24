@@ -295,3 +295,74 @@ def check_ingest_log(repo_root: Path = REPO_ROOT) -> tuple[list[str], list[str]]
             if not actual_path.is_file() or sha256_file(actual_path) != final.get("sha256"):
                 errors.append(f"ingest log: sha256 differs from current file: {path}")
     return errors, warnings
+
+
+def check_committed_ingest_log(repo_root: Path, base_commit: str | None, head_commit: str) -> list[str]:
+    """按提交边界核对 sources 净变化和 append-only 日志，供干净 checkout 使用。"""
+
+    empty_tree = False
+    if base_commit is None:
+        parent = _git(repo_root, "rev-parse", f"{head_commit}^")
+        if parent.returncode == 0:
+            base_commit = parent.stdout.decode("ascii").strip()
+        else:
+            empty = subprocess.run(
+                ["git", "-C", str(repo_root), "hash-object", "-w", "-t", "tree", "--stdin"],
+                input=b"", capture_output=True, check=True,
+            )
+            base_commit = empty.stdout.decode("ascii").strip()
+            empty_tree = True
+    if _git(repo_root, "cat-file", "-e", f"{base_commit}^{{tree}}").returncode != 0:
+        return ["ingest log: base commit is unavailable"]
+    if _git(repo_root, "cat-file", "-e", f"{head_commit}^{{commit}}").returncode != 0:
+        return ["ingest log: head commit is unavailable"]
+    if not empty_tree and _git(repo_root, "merge-base", "--is-ancestor", base_commit, head_commit).returncode != 0:
+        return ["ingest log: base commit is not an ancestor of head"]
+    baseline_result = _git(repo_root, "show", f"{base_commit}:meta/ingest.log")
+    baseline = baseline_result.stdout if baseline_result.returncode == 0 else b""
+    head_result = _git(repo_root, "show", f"{head_commit}:meta/ingest.log")
+    if head_result.returncode != 0:
+        return ["meta/ingest.log does not exist in head commit"]
+    current = head_result.stdout
+    _, errors = _parse_events(baseline, "base:meta/ingest.log")
+    if not current.startswith(baseline):
+        return errors + ["meta/ingest.log is not append-only across commits"]
+    new_events, new_errors = _parse_events(current[len(baseline):], "head:meta/ingest.log:new")
+    errors.extend(new_errors)
+
+    changed = _git(
+        repo_root, "diff", "--no-renames", "--name-status", "-z",
+        base_commit, head_commit, "--", "sources",
+    )
+    if changed.returncode != 0:
+        return errors + ["ingest log: cannot read committed source changes"]
+    tokens = changed.stdout.rstrip(b"\0").split(b"\0") if changed.stdout else []
+    if len(tokens) % 2:
+        return errors + ["ingest log: cannot parse committed source changes"]
+    git_changes = {
+        tokens[index + 1].decode("utf-8", errors="surrogateescape"):
+        ("added" if tokens[index][:1] == b"A" else "deleted" if tokens[index][:1] == b"D" else "updated")
+        for index in range(0, len(tokens), 2)
+    }
+    logged_changes: dict[str, list[dict[str, Any]]] = {}
+    for event in new_events:
+        for change in event["changes"]:
+            logged_changes.setdefault(str(change["path"]), []).append(change)
+    for path in sorted(set(git_changes) - set(logged_changes)):
+        errors.append(f"ingest log: committed source change has no log entry: {path}")
+    for path in sorted(set(logged_changes) - set(git_changes)):
+        errors.append(f"ingest log: logged path has no committed source change: {path}")
+    for path in sorted(set(git_changes) & set(logged_changes)):
+        sequence = logged_changes[path]
+        final = sequence[-1]
+        logged_action = (
+            "added" if sequence[0].get("action") == "added" and final.get("action") != "deleted"
+            else "deleted" if final.get("action") == "deleted" else "updated"
+        )
+        if logged_action != git_changes[path]:
+            errors.append(f"ingest log: committed action mismatch: {path}")
+        elif git_changes[path] != "deleted":
+            actual = repo_root / path
+            if not actual.is_file() or sha256_file(actual) != final.get("sha256"):
+                errors.append(f"ingest log: committed sha256 mismatch: {path}")
+    return errors
