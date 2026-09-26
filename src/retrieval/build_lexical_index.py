@@ -26,14 +26,14 @@ from src.retrieval.contracts import (
     Item,
     ProjectionResult,
 )
-from src.retrieval.generation import (
+from src.retrieval.index_artifact import (
     SCOPES,
     SQLITE_USER_VERSION,
     LexicalBuildError,
-    generation_id,
+    index_id_from_digest,
     sha256_file,
     validate_built_at,
-    validate_generation_artifact,
+    validate_index_artifact,
     validate_immutable_database,
 )
 from src.retrieval.project_items import project_corpus
@@ -97,9 +97,9 @@ class DatabaseBuildResult:
 
 
 @dataclass(frozen=True)
-class GenerationBuildResult:
-    generation: str
-    generation_path: Path
+class IndexBuildResult:
+    index_id: str
+    index_path: Path
     database_path: Path
     manifest_path: Path
     database_sha256: str
@@ -113,8 +113,8 @@ class GenerationBuildResult:
 
 @dataclass(frozen=True)
 class PublicationResult:
-    current_generation: str
-    previous_generation: str | None
+    current_index_id: str
+    previous_index_id: str | None
     changed: bool
 
 
@@ -306,12 +306,12 @@ def build_database(projection: ProjectionResult, database_path: Path) -> Databas
 
 def _manifest_payload(
     projection: ProjectionResult,
-    generation: str,
+    index_id: str,
     database: DatabaseBuildResult,
     built_at: str,
 ) -> dict[str, Any]:
     return {
-        "generation": generation,
+        "index_id": index_id,
         "source_digest": projection.source_digest,
         "database_sha256": database.database_sha256,
         "built_at": built_at,
@@ -328,13 +328,13 @@ def _manifest_payload(
 
 
 def _result_from_existing(
-    projection: ProjectionResult, generation_path: Path
-) -> GenerationBuildResult:
-    manifest_path = generation_path / "generation.json"
-    database_path = generation_path / "corpus.sqlite"
-    manifest = validate_generation_artifact(generation_path)
+    projection: ProjectionResult, index_path: Path
+) -> IndexBuildResult:
+    manifest_path = index_path / "index.json"
+    database_path = index_path / "corpus.sqlite"
+    manifest = validate_index_artifact(index_path)
     expected_versions = {
-        "generation": generation_id(projection.source_digest),
+        "index_id": index_id_from_digest(projection.source_digest),
         "source_digest": projection.source_digest,
         "source_count": len(projection.sources),
         "item_count": len(projection.items),
@@ -351,10 +351,10 @@ def _result_from_existing(
     }
     for key, expected in expected_versions.items():
         if manifest.get(key) != expected:
-            raise LexicalBuildError(f"existing generation {key} mismatch")
-    return GenerationBuildResult(
-        generation=manifest["generation"],
-        generation_path=generation_path,
+            raise LexicalBuildError(f"existing index {key} mismatch")
+    return IndexBuildResult(
+        index_id=manifest["index_id"],
+        index_path=index_path,
         database_path=database_path,
         manifest_path=manifest_path,
         database_sha256=manifest["database_sha256"],
@@ -367,87 +367,89 @@ def _result_from_existing(
     )
 
 
-def build_generation(
+def build_index(
     projection: ProjectionResult,
     retrieval_root: Path,
     *,
     built_at: str | None = None,
-) -> GenerationBuildResult:
-    """构建或验证一个按内容寻址的 generation，不发布。"""
+) -> IndexBuildResult:
+    """构建或验证一个按内容寻址的检索索引，不发布。"""
 
-    generation = generation_id(projection.source_digest)
+    index_id = index_id_from_digest(projection.source_digest)
     retrieval_root = retrieval_root.resolve()
-    generations_root = retrieval_root / "generations"
-    generations_root.mkdir(parents=True, exist_ok=True)
-    generation_path = generations_root / generation
-    if generation_path.exists() or generation_path.is_symlink():
-        return _result_from_existing(projection, generation_path)
+    retrieval_root.mkdir(parents=True, exist_ok=True)
+    index_path = retrieval_root / index_id
+    if index_path.exists() or index_path.is_symlink():
+        return _result_from_existing(projection, index_path)
 
     built_at = validate_built_at(built_at or _utc_now())
-    staging_path = Path(tempfile.mkdtemp(prefix=f".{generation}.", dir=generations_root))
+    staging_path = Path(tempfile.mkdtemp(prefix=f".{index_id}.", dir=retrieval_root))
     try:
         database = build_database(projection, staging_path / "corpus.sqlite")
-        manifest = _manifest_payload(projection, generation, database, built_at)
-        (staging_path / "generation.json").write_text(
+        manifest = _manifest_payload(projection, index_id, database, built_at)
+        (staging_path / "index.json").write_text(
             json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
             encoding="utf-8",
         )
-        validate_generation_artifact(staging_path, expected_generation=generation)
-        os.replace(staging_path, generation_path)
+        validate_index_artifact(staging_path, expected_index_id=index_id)
+        os.replace(staging_path, index_path)
     except Exception:
         if staging_path.exists():
             shutil.rmtree(staging_path)
         raise
-    return replace(_result_from_existing(projection, generation_path), reused=False)
+    return replace(_result_from_existing(projection, index_path), reused=False)
 
 
-def _read_generation_link(retrieval_root: Path, name: str) -> str | None:
+def _read_index_link(retrieval_root: Path, name: str) -> str | None:
     path = retrieval_root / name
     if not os.path.lexists(path):
         return None
     if not path.is_symlink():
         raise LexicalBuildError(f"{name} is not a symlink")
     resolved = path.resolve(strict=True)
-    generations_root = (retrieval_root / "generations").resolve(strict=True)
     try:
-        relative = resolved.relative_to(generations_root)
+        relative = resolved.relative_to(retrieval_root)
     except ValueError as exc:
-        raise LexicalBuildError(f"{name} escapes generations root") from exc
-    if len(relative.parts) != 1 or not resolved.is_dir():
-        raise LexicalBuildError(f"{name} does not target one generation")
+        raise LexicalBuildError(f"{name} escapes retrieval root") from exc
+    if (
+        len(relative.parts) != 1
+        or re.fullmatch(r"idx_[0-9a-f]{20}", relative.name) is None
+        or not resolved.is_dir()
+    ):
+        raise LexicalBuildError(f"{name} does not target one index")
     return relative.name
 
 
-def _atomic_generation_link(retrieval_root: Path, name: str, generation: str) -> None:
+def _atomic_index_link(retrieval_root: Path, name: str, index_id: str) -> None:
     file_descriptor, temporary_name = tempfile.mkstemp(prefix=f".{name}.", dir=retrieval_root)
     os.close(file_descriptor)
     temporary_path = Path(temporary_name)
     temporary_path.unlink()
     try:
-        temporary_path.symlink_to(Path("generations") / generation)
+        temporary_path.symlink_to(Path(index_id))
         os.replace(temporary_path, retrieval_root / name)
     finally:
         if os.path.lexists(temporary_path):
             temporary_path.unlink()
 
 
-def publish_generation(retrieval_root: Path, generation: str) -> PublicationResult:
+def publish_index(retrieval_root: Path, index_id: str) -> PublicationResult:
     """原子切换 current，并将旧 current 保留为 previous。"""
 
     retrieval_root = retrieval_root.resolve(strict=True)
-    target = retrieval_root / "generations" / generation
-    manifest = validate_generation_artifact(target)
-    if manifest["generation"] != generation:
-        raise LexicalBuildError("publish target generation mismatch")
-    old_current = _read_generation_link(retrieval_root, "current")
-    if old_current == generation:
-        return PublicationResult(generation, _read_generation_link(retrieval_root, "previous"), False)
+    target = retrieval_root / index_id
+    manifest = validate_index_artifact(target)
+    if manifest["index_id"] != index_id:
+        raise LexicalBuildError("publish target index mismatch")
+    old_current = _read_index_link(retrieval_root, "current")
+    if old_current == index_id:
+        return PublicationResult(index_id, _read_index_link(retrieval_root, "previous"), False)
     if os.path.lexists(retrieval_root / "previous") and not (retrieval_root / "previous").is_symlink():
         raise LexicalBuildError("previous is not a symlink")
     if old_current is not None:
-        _atomic_generation_link(retrieval_root, "previous", old_current)
-    _atomic_generation_link(retrieval_root, "current", generation)
-    return PublicationResult(generation, old_current, True)
+        _atomic_index_link(retrieval_root, "previous", old_current)
+    _atomic_index_link(retrieval_root, "current", index_id)
+    return PublicationResult(index_id, old_current, True)
 
 
 def main() -> None:
@@ -460,22 +462,22 @@ def main() -> None:
     repo_root = args.repo_root.resolve()
     retrieval_root = args.retrieval_root or (repo_root / "meta" / "corpus")
     projection = project_corpus(repo_root, args.manifest)
-    generation = build_generation(projection, retrieval_root)
-    publication = publish_generation(retrieval_root, generation.generation) if args.publish else None
+    index_result = build_index(projection, retrieval_root)
+    publication = publish_index(retrieval_root, index_result.index_id) if args.publish else None
     print(
         json.dumps(
             {
-                "generation": generation.generation,
-                "source_digest": generation.source_digest,
-                "database_sha256": generation.database_sha256,
-                "sources": generation.source_count,
-                "items": generation.item_count,
-                "item_counts": generation.item_counts,
-                "built_at": generation.built_at,
-                "reused": generation.reused,
+                "index_id": index_result.index_id,
+                "source_digest": index_result.source_digest,
+                "database_sha256": index_result.database_sha256,
+                "sources": index_result.source_count,
+                "items": index_result.item_count,
+                "item_counts": index_result.item_counts,
+                "built_at": index_result.built_at,
+                "reused": index_result.reused,
                 "published": publication.changed if publication else False,
-                "previous_generation": (
-                    publication.previous_generation if publication is not None else None
+                "previous_index_id": (
+                    publication.previous_index_id if publication is not None else None
                 ),
             },
             ensure_ascii=False,

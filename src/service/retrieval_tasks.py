@@ -93,7 +93,7 @@ class RetrievalTaskService:
             task_id = self._task_id(request["task_id"])
             core_request = self.core.validate_request("read_bundle", {
                 "seed_item_id": request["seed_item_id"],
-                "generation": self.core.store.generation,
+                "index_id": self.core.store.index_id,
                 "max_estimated_tokens": request["max_estimated_tokens"],
             })
             return PreparedTaskRequest(
@@ -186,7 +186,7 @@ class RetrievalTaskService:
         return self._encode(payload)
 
     def _fail_after_admission(self, call_id: str, code: str) -> None:
-        block = code in {"generation_mismatch", "item_not_found", "index_unavailable", "internal_error"}
+        block = code in {"index_mismatch", "item_not_found", "index_unavailable", "internal_error"}
         self.ledger.finalize_failure(call_id, code, block=block)
 
     def search(
@@ -200,7 +200,7 @@ class RetrievalTaskService:
             queries=tuple(value.normalized_query for value in values.compiled),
             query_keys=tuple(value.dedupe_key for value in values.compiled),
             scopes=scopes, result_limit=values.limit, cap=values.max_tokens,
-            current_generation=self.core.store.generation,
+            current_index_id=self.core.store.index_id,
         )
         try:
             response = self.core.search(
@@ -227,12 +227,12 @@ class RetrievalTaskService:
         admission = self.ledger.admit_read(
             owner_key, prepared.task_id, request_id,
             seed_item_id=values.seed_item_id, cap=values.max_tokens,
-            current_generation=self.core.store.generation,
+            current_index_id=self.core.store.index_id,
         )
-        # generation 由任务固定；初版不接受客户端搬运或覆盖。
+        # 索引版本由任务固定；初版不接受客户端搬运或覆盖。
         values = self.core.validate_request("read_bundle", {
             "seed_item_id": values.seed_item_id,
-            "generation": admission["generation"],
+            "index_id": admission["index_id"],
             "max_estimated_tokens": values.max_tokens,
         })
         try:

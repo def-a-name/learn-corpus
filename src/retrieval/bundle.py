@@ -94,7 +94,7 @@ def read_members(store: LexicalStore, seed: Item, deadline: float) -> tuple[Item
         item_id = pending.popleft()
         try:
             item = seed if item_id == seed.item_id else store.read_canonical_item(
-                item_id, store.generation, deadline=deadline
+                item_id, store.index_id, deadline=deadline
             )
         except (ItemNotFoundError, InvalidRequestError) as exc:
             raise IndexUnavailableError("indexed bundle relation is unavailable") from exc

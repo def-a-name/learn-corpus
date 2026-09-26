@@ -1,4 +1,4 @@
-"""从指定或最新成功的 GitHub Actions run 下载并发布一个 generation。"""
+"""从指定或最新成功的 GitHub Actions run 下载并发布一个检索索引。"""
 
 from __future__ import annotations
 
@@ -25,8 +25,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from src.retrieval.build_lexical_index import publish_generation
-from src.retrieval.generation import LexicalBuildError, validate_generation_artifact
+from src.retrieval.build_lexical_index import publish_index
+from src.retrieval.index_artifact import LexicalBuildError, validate_index_artifact
 from src.service.config import load_service_config, read_config_object
 from src.service.errors import HTTPFailure
 
@@ -35,7 +35,7 @@ REPOSITORY = "def-a-name/learn-corpus"
 REF = "refs/heads/main"
 SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 API_ROOT = f"https://api.github.com/repos/{REPOSITORY}"
-GENERATION_PATTERN = re.compile(r"gen_[0-9a-f]{20}")
+INDEX_ID_PATTERN = re.compile(r"idx_[0-9a-f]{20}")
 MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
 RUNS_PER_PAGE = 100
 MAX_RUN_PAGES = 10
@@ -145,7 +145,7 @@ def _request(url: str, token: str, *, binary: bool = False) -> bytes | dict:
             "Authorization": f"Bearer {token}",
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "learn-corpus-generation-deployer",
+            "User-Agent": "learn-corpus-index-deployer",
         },
     )
     with urllib.request.build_opener(_SafeRedirect()).open(request, timeout=30) as response:
@@ -167,7 +167,7 @@ def _check_run(run: dict, run_id: int) -> tuple[str, int]:
         run.get("id") != run_id
         or run.get("repository", {}).get("full_name") != REPOSITORY
         or run.get("head_branch") != "main"
-        or str(run.get("path", "")).split("@")[0] != ".github/workflows/build-generation.yml"
+        or str(run.get("path", "")).split("@")[0] != ".github/workflows/build-index.yml"
         or run.get("status") != "completed"
         or run.get("conclusion") != "success"
         or not isinstance(commit, str)
@@ -186,7 +186,7 @@ def _latest_run_id(token: str) -> int:
     for page in range(1, MAX_RUN_PAGES + 1):
         _progress(f"Checking successful workflow runs (page {page}).")
         url = (
-            f"{API_ROOT}/actions/workflows/build-generation.yml/runs"
+            f"{API_ROOT}/actions/workflows/build-index.yml/runs"
             f"?branch=main&status=success&per_page={RUNS_PER_PAGE}&page={page}"
         )
         payload = _request(url, token)
@@ -214,17 +214,17 @@ def _latest_run_id(token: str) -> int:
     else:
         raise ValueError("workflow run search limit reached; set run_id in deployment configuration")
     if latest is None:
-        raise ValueError("no successful main generation workflow run was found")
+        raise ValueError("no successful main index workflow run was found")
     return latest[1]
 
 
 def _check_artifacts(payload: dict, run_id: int, run_attempt: int, commit: str) -> tuple[int, str]:
     if not isinstance(payload, dict) or not isinstance(payload.get("artifacts"), list):
         raise ValueError("artifact list response is invalid")
-    expected = f"learn-corpus-generation-{run_id}-{run_attempt}"
+    expected = f"learn-corpus-index-{run_id}-{run_attempt}"
     matches = [item for item in payload.get("artifacts", []) if item.get("name") == expected]
     if len(matches) != 1 or matches[0].get("expired") is not False:
-        raise ValueError("expected generation artifact is missing, duplicated, or expired")
+        raise ValueError("expected index artifact is missing, duplicated, or expired")
     artifact_id = matches[0].get("id")
     digest = matches[0].get("digest")
     source_run = matches[0].get("workflow_run")
@@ -255,24 +255,24 @@ def _extract_release(data: bytes, target: Path, run_id: int, run_attempt: int, c
             raise ValueError("artifact release metadata exceeds size limit")
         release = json.loads(archive.read(release_name))
         if not isinstance(release, dict) or set(release) != {
-            "version", "repository", "ref", "commit", "run_id", "run_attempt", "generation",
+            "version", "repository", "ref", "commit", "run_id", "run_attempt", "index_id",
             "source_digest", "database_sha256",
         }:
             raise ValueError("artifact release metadata schema is invalid")
-        generation = release.get("generation")
-        if not isinstance(generation, str) or GENERATION_PATTERN.fullmatch(generation) is None:
-            raise ValueError("artifact generation ID is invalid")
+        index_id = release.get("index_id")
+        if not isinstance(index_id, str) or INDEX_ID_PATTERN.fullmatch(index_id) is None:
+            raise ValueError("artifact index ID is invalid")
         expected = {
             release_name,
-            f"generations/{generation}/generation.json",
-            f"generations/{generation}/corpus.sqlite",
+            f"{index_id}/index.json",
+            f"{index_id}/corpus.sqlite",
         }
         files = {name for name in names if not name.endswith("/")}
         directories = {name for name in names if name.endswith("/")}
-        if files != expected or not directories.issubset({"generations/", f"generations/{generation}/"}):
+        if files != expected or not directories.issubset({f"{index_id}/"}):
             raise ValueError("artifact archive contains unexpected paths")
         if (
-            release.get("version") != 1
+            release.get("version") != 2
             or release.get("repository") != REPOSITORY
             or release.get("ref") != REF
             or release.get("run_id") != run_id
@@ -280,19 +280,19 @@ def _extract_release(data: bytes, target: Path, run_id: int, run_attempt: int, c
             or release.get("commit") != commit
         ):
             raise ValueError("artifact release metadata does not match workflow run")
-        generation_path = target / generation
-        generation_path.mkdir()
+        index_path = target / index_id
+        index_path.mkdir()
         for name in sorted(expected - {release_name}):
             member = archive.getinfo(name)
             if member.file_size > MAX_ARCHIVE_BYTES or (member.external_attr >> 16) & 0o170000 == 0o120000:
                 raise ValueError("artifact member type or size is invalid")
-            destination = generation_path / Path(name).name
+            destination = index_path / Path(name).name
             with archive.open(member) as source, destination.open("wb") as output:
                 shutil.copyfileobj(source, output)
-    manifest = validate_generation_artifact(generation_path)
+    manifest = validate_index_artifact(index_path)
     if manifest["source_digest"] != release.get("source_digest") or manifest["database_sha256"] != release.get("database_sha256"):
-        raise ValueError("artifact release metadata does not match generation")
-    return release, generation_path
+        raise ValueError("artifact release metadata does not match index")
+    return release, index_path
 
 
 def _status_token(credentials_path: Path) -> str:
@@ -343,19 +343,19 @@ def _status(target: LocalStatusTarget, token: str) -> dict:
         connection.close()
 
 
-def _restart_and_wait(service: str, target: LocalStatusTarget, token: str, generation: str) -> None:
+def _restart_and_wait(service: str, target: LocalStatusTarget, token: str, index_id: str) -> None:
     _progress("Restarting the HTTP service.")
     subprocess.run(["systemctl", "restart", service], check=True)
-    _progress("Waiting for the service to report the new generation.")
+    _progress("Waiting for the service to report the new index.")
     for _ in range(12):
         try:
             response = _status(target, token)
-            if response.get("generation") == generation:
+            if response.get("index_id") == index_id:
                 return
         except (OSError, ValueError, RuntimeError, http.client.HTTPException):
             pass
         time.sleep(2)
-    raise RuntimeError("service did not report the expected generation")
+    raise RuntimeError("service did not report the expected index")
 
 
 def deploy(config_path: Path) -> str:
@@ -379,7 +379,7 @@ def deploy(config_path: Path) -> str:
     run = _request(f"{API_ROOT}/actions/runs/{run_id}", token)
     commit, run_attempt = _check_run(run, run_id)
     _progress(f"Workflow run verified: run {run_id}, attempt {run_attempt}, commit {commit}.")
-    _progress("Checking generation artifact metadata.")
+    _progress("Checking index artifact metadata.")
     artifacts = _request(f"{API_ROOT}/actions/runs/{run_id}/artifacts?per_page=100", token)
     artifact_id, artifact_digest = _check_artifacts(artifacts, run_id, run_attempt, commit)
     _progress(f"Downloading artifact {artifact_id}.")
@@ -388,31 +388,31 @@ def deploy(config_path: Path) -> str:
         raise ValueError("downloaded artifact archive hash mismatch")
     _progress(f"Archive downloaded and SHA-256 verified ({len(archive)} bytes).")
     with tempfile.TemporaryDirectory(prefix=".release-", dir=retrieval_root) as temporary:
-        _progress("Extracting and validating release metadata and generation files.")
+        _progress("Extracting and validating release metadata and index files.")
         release, staged = _extract_release(archive, Path(temporary), run_id, run_attempt, commit)
-        generation = release["generation"]
-        target = retrieval_root / "generations" / generation
+        index_id = release["index_id"]
+        target = retrieval_root / index_id
         # 本机版本验证必须在触碰 current/previous 前完成。
-        _progress(f"Checking generation {generation} against local code.")
-        validate_generation_artifact(staged, expected_generation=generation)
+        _progress(f"Checking index {index_id} against local code.")
+        validate_index_artifact(staged, expected_index_id=index_id)
         old_current_link = retrieval_root / "current"
         old_previous_link = retrieval_root / "previous"
         if not old_current_link.is_symlink() or not old_previous_link.is_symlink():
-            raise ValueError("current and previous must both be generation symlinks")
+            raise ValueError("current and previous must both be index symlinks")
         old_current = old_current_link.readlink()
         old_previous = old_previous_link.readlink()
         status_token = _status_token(selected.runtime.credentials_file)
-        if old_current.name == generation:
-            _progress("Generation is already current; verifying installed files and running service.")
-            validate_generation_artifact(old_current_link.resolve(strict=True), expected_generation=generation)
-            if _status(status_target, status_token).get("generation") != generation:
-                raise RuntimeError("current link matches but running service has a different generation")
-            return f"Generation {generation} is already current (run {run_id}, attempt {run_attempt}, commit {commit})"
+        if old_current.name == index_id:
+            _progress("Retrieval index is already current; verifying installed files and running service.")
+            validate_index_artifact(old_current_link.resolve(strict=True), expected_index_id=index_id)
+            if _status(status_target, status_token).get("index_id") != index_id:
+                raise RuntimeError("current link matches but running service has a different index")
+            return f"Retrieval index {index_id} is already current (run {run_id}, attempt {run_attempt}, commit {commit})"
         if target.exists() or target.is_symlink():
-            _progress("Generation is already installed; validating existing files.")
-            validate_generation_artifact(target, expected_generation=generation)
+            _progress("Retrieval index is already installed; validating existing files.")
+            validate_index_artifact(target, expected_index_id=index_id)
         else:
-            _progress("Installing generation files and setting service account permissions.")
+            _progress("Installing index files and setting service account permissions.")
             identity = pwd.getpwnam(deployment.service_user)
             group = grp.getgrgid(identity.pw_gid)
             os.chown(staged, identity.pw_uid, group.gr_gid)
@@ -422,15 +422,15 @@ def deploy(config_path: Path) -> str:
                 os.chmod(child, 0o440)
             os.replace(staged, target)
         # 先确保现有入口可验收，避免在不可观测状态下切换。
-        _progress("Checking current service generation before switching.")
+        _progress("Checking current service index before switching.")
         current_status = _status(status_target, status_token)
-        if current_status.get("generation") != old_current.name:
-            raise RuntimeError("running service generation does not match current link")
+        if current_status.get("index_id") != old_current.name:
+            raise RuntimeError("running service index does not match current link")
         try:
-            _progress(f"Switching current to {generation} and preserving the previous generation.")
-            publish_generation(retrieval_root, generation)
-            _restart_and_wait(deployment.service, status_target, status_token, generation)
-            _progress("New generation verified through authenticated local service status.")
+            _progress(f"Switching current to {index_id} and preserving the previous index.")
+            publish_index(retrieval_root, index_id)
+            _restart_and_wait(deployment.service, status_target, status_token, index_id)
+            _progress("New index verified through authenticated local service status.")
         except Exception as exc:
             _progress("Deployment failed; restoring the original current and previous links.")
             _replace_link(old_current_link, old_current)
@@ -438,14 +438,14 @@ def deploy(config_path: Path) -> str:
             try:
                 _progress("Restarting the HTTP service after rollback.")
                 subprocess.run(["systemctl", "restart", deployment.service], check=True)
-                _progress("Waiting for the service to report the restored generation.")
+                _progress("Waiting for the service to report the restored index.")
                 _restart_status_check(status_target, status_token, old_current.name)
             except Exception as rollback_exc:
                 _progress("Rollback verification failed.")
                 raise RuntimeError("deployment failed and rollback verification failed") from rollback_exc
-            _progress("Rollback verified; the original generation is active.")
-            raise RuntimeError("deployment failed; previous generation restored") from exc
-    return f"Generation {generation} is current (run {run_id}, attempt {run_attempt}, commit {commit})"
+            _progress("Rollback verified; the original index is active.")
+            raise RuntimeError("deployment failed; previous index restored") from exc
+    return f"Retrieval index {index_id} is current (run {run_id}, attempt {run_attempt}, commit {commit})"
 
 
 def _replace_link(path: Path, target: Path) -> None:
@@ -455,20 +455,20 @@ def _replace_link(path: Path, target: Path) -> None:
         os.replace(replacement, path)
 
 
-def _restart_status_check(target: LocalStatusTarget, token: str, generation: str) -> None:
+def _restart_status_check(target: LocalStatusTarget, token: str, index_id: str) -> None:
     for _ in range(12):
         try:
-            if _status(target, token).get("generation") == generation:
+            if _status(target, token).get("index_id") == index_id:
                 return
         except (OSError, ValueError, RuntimeError, http.client.HTTPException):
             pass
         time.sleep(2)
-    raise RuntimeError("rollback generation did not become ready")
+    raise RuntimeError("rollback index did not become ready")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Deploy a generation from the latest successful or configured GitHub Actions run.",
+        description="Deploy a retrieval index from the latest successful or configured GitHub Actions run.",
         allow_abbrev=False,
     )
     parser.add_argument("--config", type=Path, required=True, help="Deployment configuration JSON file")

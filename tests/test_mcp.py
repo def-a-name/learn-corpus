@@ -44,7 +44,7 @@ def without_source_locations(payload):
 def assert_mcp_redacted_view(value, rest, item_key):
     """MCP 可因省略定位字段而在同一预算下返回更多项。"""
 
-    assert value['generation'] == rest['generation']
+    assert value['index_id'] == rest['index_id']
     if item_key == 'items':
         assert value['seed_item_id'] == rest['seed_item_id']
         assert value['bundle_key'] == rest['bundle_key']
@@ -112,7 +112,7 @@ def test_rest_mcp_search_read_deep_parity(config, query):
         request = {'task_id': task_id, 'seed_item_id': value['results'][0]['item_id'],
                    'max_estimated_tokens': 450}
         result = call(client, 'read_bundle', request).json()['result']
-        rest_request = {'generation': value['generation'], 'seed_item_id': request['seed_item_id'],
+        rest_request = {'index_id': value['index_id'], 'seed_item_id': request['seed_item_id'],
                         'max_estimated_tokens': request['max_estimated_tokens']}
         rest = client.post('/v1/read-bundle', json=rest_request, headers=HEADERS).json()
         if result['isError']:
@@ -227,7 +227,7 @@ def test_tool_errors_preserve_stable_codes(config):
             ('search_sources', {'task_id': task_id, 'queries': ['quasar', 'QUASAR'],
                                 'max_estimated_tokens': 500}, 'invalid_request'),
             ('search_sources', {'task_id': task_id, 'queries': ['quasar'],
-                                'generation': 'gen_'+'0'*20,
+                                'index_id': 'idx_'+'0'*20,
                                 'max_estimated_tokens': 500}, 'invalid_request'),
             ('search_sources', {'task_id': task_id, 'queries': ['quasar'],
                                 'max_estimated_tokens': 1}, 'budget_exceeded'),
@@ -314,7 +314,7 @@ def test_mcp_blocked_task_returns_fixed_block_category(config):
         task_id = start_task(client)
         with client.app.state.tasks.ledger._connect() as connection:
             connection.execute(
-                "UPDATE tasks SET state = 'blocked', blocked_category = 'generation_mismatch' "
+                "UPDATE tasks SET state = 'blocked', blocked_category = 'index_mismatch' "
                 "WHERE task_id = ?",
                 (task_id,),
             )
@@ -324,7 +324,7 @@ def test_mcp_blocked_task_returns_fixed_block_category(config):
         error = json.loads(result['content'][0]['text'])['error']
         assert error['code'] == 'task_blocked'
         assert error['details'] == {
-            'blocked_category': 'generation_mismatch', 'retryable': False,
+            'blocked_category': 'index_mismatch', 'retryable': False,
         }
 
 
@@ -396,7 +396,7 @@ def test_errors_logs_and_shared_admission(config, monkeypatch, caplog):
 def test_tools_list_contract_snapshot():
     import hashlib
     encoded = json.dumps(tool_definitions(), sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode()
-    assert hashlib.sha256(encoded).hexdigest() == '00a09e2e425035b348b939dd64737ccd4b0e2189f919eb538afe4f657e8c86a8'
+    assert hashlib.sha256(encoded).hexdigest() == '46b8f1a6cdaf38c77cfc2175e5cdf4b2316f291c9c2867bfa26c7a2edcd02792'
 
 
 @pytest.mark.parametrize('scope', ['note', 'article'])
@@ -404,7 +404,7 @@ def test_section_unicode_body_parity(config, open_core, scope):
     from dataclasses import replace
     from test_public_core import parts
     core = open_core(parts(scope, 'Synthetic section', ('# Synthetic section\nquasar 虚构正文 "example"', 'quasar synthetic continuation')))
-    config = replace(config, corpus_path=core.store._generation_path.parent.parent)
+    config = replace(config, corpus_path=core.store._index_path.parent)
     with client_for(config) as client:
         task_id = start_task(client)
         search = call(client, 'search_sources', {
@@ -415,7 +415,7 @@ def test_section_unicode_body_parity(config, open_core, scope):
                 'max_estimated_tokens': 4000}
         bundle = call(client, 'read_bundle', args).json()['result']['structuredContent']
         rest = client.post('/v1/read-bundle', json={
-            'generation': search['generation'], 'seed_item_id': args['seed_item_id'],
+            'index_id': search['index_id'], 'seed_item_id': args['seed_item_id'],
             'max_estimated_tokens': args['max_estimated_tokens'],
         }, headers=HEADERS).json()
         rest['request_id'] = bundle['request_id']

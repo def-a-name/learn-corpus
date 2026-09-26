@@ -40,7 +40,7 @@ class _DetailLedger:
         return {
             "task_id": TASK_ID,
             "task_state": "active",
-            "generation": "gen_" + "1" * 20,
+            "index_id": "idx_" + "1" * 20,
             "blocked_category": None,
             "limits": {
                 "search_calls": 500, "read_calls": 500,
@@ -48,7 +48,7 @@ class _DetailLedger:
             },
             "execution": {
                 "task_id": TASK_ID, "call_id": None, "task_state": "active",
-                "generation": "gen_" + "1" * 20, "search_calls": 500,
+                "index_id": "idx_" + "1" * 20, "search_calls": 500,
                 "read_calls": 0, "estimated_evidence_tokens": 500,
                 "reserved_estimated_tokens": 0, "available_estimated_tokens": 999_500,
                 "partial_windows": 0, "unresolved_calls": 0,

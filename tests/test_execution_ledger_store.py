@@ -10,7 +10,7 @@ from src.service.execution_ledger_store import _DDL, ExecutionLedgerStore, Ledge
 from src.service.ledger_config import LedgerConfig, TaskLimitsConfig
 
 
-GENERATION = "gen_" + "1" * 20
+INDEX_ID = "idx_" + "1" * 20
 ITEM_A = "itm_" + "a" * 32
 ITEM_B = "itm_" + "b" * 32
 BUNDLE = "bnd_" + "1" * 40
@@ -46,7 +46,7 @@ def item(item_id=ITEM_A, role="human"):
 def search_response(call_id, *, usage=300, items=(ITEM_A,)):
     return {
         "request_id": call_id,
-        "generation": GENERATION,
+        "index_id": INDEX_ID,
         "is_truncated": False,
         "results": [{**item(value, "human" if value == ITEM_A else "assistant"),
                      "bundle_key": BUNDLE, "rank": rank,
@@ -61,7 +61,7 @@ def search_response(call_id, *, usage=300, items=(ITEM_A,)):
 def read_response(call_id, *, usage=500, seed=ITEM_A, items=(ITEM_A,), missing=()):
     return {
         "request_id": call_id,
-        "generation": GENERATION,
+        "index_id": INDEX_ID,
         "seed_item_id": seed,
         "bundle_key": BUNDLE,
         "bundle_status": "partial_budget" if missing else "complete",
@@ -82,7 +82,7 @@ def admit_search(store, task_id, call_id="req_synthetic_search", cap=1000):
         "synthetic_owner", task_id, call_id,
         queries=("Synthetic Anchor",), query_keys=("synthetic anchor",),
         scopes=("conversation",), result_limit=8, cap=cap,
-        current_generation=GENERATION,
+        current_index_id=INDEX_ID,
     )
 
 
@@ -91,7 +91,7 @@ def test_schema_permissions_and_unknown_version_fail_closed(ledger_config):
     assert ledger_config.path.stat().st_mode & 0o777 == 0o600
     with store._connect() as connection:
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
         assert connection.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
     ledger_config.path.unlink()
     connection = sqlite3.connect(ledger_config.path)
@@ -102,24 +102,32 @@ def test_schema_permissions_and_unknown_version_fail_closed(ledger_config):
         ExecutionLedgerStore.open(ledger_config)
 
 
-def test_schema_v1_is_migrated_without_rebuilding_tasks(ledger_config):
+@pytest.mark.parametrize("version", [1, 2])
+def test_old_ledger_versions_are_rejected_without_modification(ledger_config, version):
     connection = sqlite3.connect(ledger_config.path)
-    legacy = _DDL.replace(
-        "    source_title TEXT,\n    heading_path_json TEXT,\n", "",
-    )
+    legacy = _DDL.replace("    index_id TEXT,", "    generation TEXT,")
+    if version == 1:
+        legacy = legacy.replace("    source_title TEXT,\n    heading_path_json TEXT,\n", "")
     for statement in legacy.split(";"):
         if statement.strip():
             connection.execute(statement)
-    connection.execute("PRAGMA user_version = 1")
+    connection.execute(f"PRAGMA user_version = {version}")
+    connection.execute(
+        "INSERT INTO tasks (task_id, owner_key, state, generation, search_limit, read_limit, "
+        "evidence_token_limit, created_at) VALUES (?, ?, 'active', ?, 2, 4, 8000, ?)",
+        ("tsk_" + "f" * 32, "synthetic_owner", "gen_" + "1" * 20, "2026-01-01T00:00:00Z"),
+    )
     connection.commit()
     connection.close()
     ledger_config.path.chmod(0o600)
 
-    migrated = ExecutionLedgerStore.open(ledger_config)
-    with migrated._connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
-        columns = {row[1] for row in connection.execute("PRAGMA table_info(task_items)")}
-    assert {"source_title", "heading_path_json"} <= columns
+    before = ledger_config.path.read_bytes()
+    with pytest.raises(ValueError, match="schema version is unsupported"):
+        ExecutionLedgerStore.open(ledger_config)
+    assert ledger_config.path.read_bytes() == before
+    with sqlite3.connect(ledger_config.path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == version
+        assert connection.execute("SELECT generation FROM tasks").fetchone()[0] == "gen_" + "1" * 20
 
 
 def test_note_source_title_and_heading_path_are_retained_for_citations(store):
@@ -128,7 +136,7 @@ def test_note_source_title_and_heading_path_are_retained_for_citations(store):
     store.admit_search(
         "synthetic_owner", task_id, call_id,
         queries=("Synthetic",), query_keys=("synthetic",), scopes=("note",),
-        result_limit=8, cap=1000, current_generation=GENERATION,
+        result_limit=8, cap=1000, current_index_id=INDEX_ID,
     )
     note = {
         "item_id": ITEM_A,
@@ -151,7 +159,7 @@ def test_note_source_title_and_heading_path_are_retained_for_citations(store):
     read_id = "req_note_read"
     store.admit_read(
         "synthetic_owner", task_id, read_id, seed_item_id=ITEM_A,
-        cap=1000, current_generation=GENERATION,
+        cap=1000, current_index_id=INDEX_ID,
     )
     read = read_response(read_id)
     read["items"] = [{
@@ -173,15 +181,15 @@ def test_successful_calls_derive_usage_and_store_no_evidence_text(store, ledger_
     search_id = "req_synthetic_search"
     admit_search(store, task_id, search_id)
     summary = store.finalize_success(search_id, search_response(search_id, items=(ITEM_A, ITEM_B)))
-    assert summary["generation"] == GENERATION
+    assert summary["index_id"] == INDEX_ID
     assert summary["search_calls"] == 1 and summary["estimated_evidence_tokens"] == 300
 
     read_id = "req_synthetic_read"
     admission = store.admit_read(
         "synthetic_owner", task_id, read_id, seed_item_id=ITEM_A,
-        cap=1000, current_generation=GENERATION,
+        cap=1000, current_index_id=INDEX_ID,
     )
-    assert admission == {"generation": GENERATION, "bundle_key": BUNDLE}
+    assert admission == {"index_id": INDEX_ID, "bundle_key": BUNDLE}
     summary = store.finalize_success(
         read_id, read_response(read_id, items=(ITEM_A, ITEM_B)),
     )
@@ -215,7 +223,7 @@ def test_task_detail_reports_complete_counts_before_response_truncation(store):
     store.finalize_success("req_synthetic_search", search_response("req_synthetic_search"))
     store.admit_read(
         "synthetic_owner", task_id, "req_many_items", seed_item_id=ITEM_A,
-        cap=7000, current_generation=GENERATION,
+        cap=7000, current_index_id=INDEX_ID,
     )
     alphabet = "bcdefghijklmnopqrstuv"
     item_ids = (ITEM_A, *("itm_" + "a" * 31 + value for value in alphabet))
@@ -247,14 +255,14 @@ def test_task_limits_are_snapshotted_and_enforced(store):
         store.admit_search(
             "synthetic_owner", task_id, "req_over_call_limit",
             queries=("Other",), query_keys=("other",), scopes=("note",),
-            result_limit=8, cap=100, current_generation=GENERATION,
+            result_limit=8, cap=100, current_index_id=INDEX_ID,
         )
     assert failure.value.code == "task_call_limit_exceeded"
     assert failure.value.details == {"operation": "search", "used": 1, "limit": 1}
     with pytest.raises(LedgerFailure) as failure:
         store.admit_read(
             "synthetic_owner", task_id, "req_over_task_budget", seed_item_id=ITEM_A,
-            cap=201, current_generation=GENERATION,
+            cap=201, current_index_id=INDEX_ID,
         )
     assert failure.value.code == "task_budget_exceeded"
     assert failure.value.details == {
@@ -276,7 +284,7 @@ def test_owner_duplicate_pending_seed_and_budget_rules(store):
         store.admit_search(
             "synthetic_owner", task_id, "req_second", queries=("Other",),
             query_keys=("other",), scopes=("conversation",), result_limit=8,
-            cap=1000, current_generation=GENERATION,
+            cap=1000, current_index_id=INDEX_ID,
         )
     assert failure.value.code == "task_busy"
     store.finalize_success("req_synthetic_search", search_response("req_synthetic_search"))
@@ -286,20 +294,20 @@ def test_owner_duplicate_pending_seed_and_budget_rules(store):
 
     store.admit_read(
         "synthetic_owner", task_id, "req_read", seed_item_id=ITEM_A,
-        cap=1000, current_generation=GENERATION,
+        cap=1000, current_index_id=INDEX_ID,
     )
     store.finalize_failure("req_read", "budget_exceeded")
     with pytest.raises(LedgerFailure) as failure:
         store.admit_read(
             "synthetic_owner", task_id, "req_read_again", seed_item_id=ITEM_A,
-            cap=1000, current_generation=GENERATION,
+            cap=1000, current_index_id=INDEX_ID,
         )
     assert failure.value.code == "seed_already_attempted"
     with pytest.raises(LedgerFailure) as failure:
         store.admit_search(
             "synthetic_owner", task_id, "req_over_budget", queries=("Different",),
             query_keys=("different",), scopes=("conversation",), result_limit=8,
-            cap=7701, current_generation=GENERATION,
+            cap=7701, current_index_id=INDEX_ID,
         )
     assert failure.value.code == "task_budget_exceeded"
 
@@ -313,7 +321,7 @@ def test_same_task_concurrency_allows_only_one_pending(store):
                 "synthetic_owner", task_id, f"req_parallel_{index}",
                 queries=(f"Synthetic {index}",), query_keys=(f"synthetic {index}",),
                 scopes=("note",), result_limit=8, cap=500,
-                current_generation=GENERATION,
+                current_index_id=INDEX_ID,
             )
             return "ok"
         except LedgerFailure as exc:
@@ -332,7 +340,7 @@ def test_second_store_process_can_use_existing_task(ledger_config):
     summary = first.finalize_success(
         "req_synthetic_search", search_response("req_synthetic_search"),
     )
-    assert summary["search_calls"] == 1 and summary["generation"] == GENERATION
+    assert summary["search_calls"] == 1 and summary["index_id"] == INDEX_ID
 
 
 def test_uncertain_preserves_reservation_and_blocks_task(store):
@@ -346,7 +354,7 @@ def test_uncertain_preserves_reservation_and_blocks_task(store):
         store.admit_search(
             "synthetic_owner", task_id, "req_after_uncertain", queries=("Other",),
             query_keys=("other",), scopes=("note",), result_limit=8, cap=100,
-            current_generation=GENERATION,
+            current_index_id=INDEX_ID,
         )
     assert failure.value.code == "task_busy"
 
@@ -357,7 +365,7 @@ def test_metadata_conflict_records_usage_and_blocks(store):
     store.finalize_success("req_synthetic_search", search_response("req_synthetic_search"))
     store.admit_read(
         "synthetic_owner", task_id, "req_conflict", seed_item_id=ITEM_A,
-        cap=1000, current_generation=GENERATION,
+        cap=1000, current_index_id=INDEX_ID,
     )
     response = read_response("req_conflict")
     response["items"][0]["locator"] = "synthetic/conflicting-locator"
@@ -373,28 +381,28 @@ def test_metadata_conflict_records_usage_and_blocks(store):
     assert detail["calls"][-1]["error_category"] == "ledger_integrity_error"
 
 
-def test_empty_search_pins_generation_and_generation_change_blocks(store):
+def test_empty_search_pins_index_and_index_change_blocks(store):
     task_id = store.create_task("synthetic_owner")["task_id"]
     admit_search(store, task_id)
     store.finalize_success(
         "req_synthetic_search", search_response("req_synthetic_search", items=()),
     )
     detail = store.get_task("synthetic_owner", task_id)
-    assert detail["generation"] == GENERATION
+    assert detail["index_id"] == INDEX_ID
 
     with pytest.raises(LedgerFailure) as failure:
         store.admit_search(
-            "synthetic_owner", task_id, "req_new_generation",
+            "synthetic_owner", task_id, "req_new_index",
             queries=("Other",), query_keys=("other",), scopes=("note",),
-            result_limit=8, cap=500, current_generation="gen_" + "2" * 20,
+            result_limit=8, cap=500, current_index_id="idx_" + "2" * 20,
         )
     assert failure.value.code == "task_blocked"
     assert failure.value.details == {
-        "blocked_category": "generation_mismatch", "retryable": False,
+        "blocked_category": "index_mismatch", "retryable": False,
     }
     detail = store.get_task("synthetic_owner", task_id)
     assert detail["task_state"] == "blocked"
-    assert detail["generation"] == GENERATION
+    assert detail["index_id"] == INDEX_ID
     assert detail["execution"]["search_calls"] == 1
 
 

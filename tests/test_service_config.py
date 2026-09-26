@@ -51,8 +51,12 @@ def test_deployment_examples_share_loopback_http_baseline():
     assert f"server_name {http['allowed_hosts'][0]};" in nginx
 
     systemd = (root / "config/systemd.service.example").read_text()
-    assert "--config /opt/learn-corpus/config/config.json" in systemd
+    service_config = "/opt/learn-corpus/config/config.json"
+    assert f"--config {service_config}" in systemd
     assert " --host " not in systemd and " --port " not in systemd
+
+    deployment = json.loads((root / "config/deploy-index.json.example").read_text())
+    assert deployment["service_config"] == service_config
 
 
 def test_unified_http_keeps_auth_and_shared_mcp_core(unified, config, tmp_path):
@@ -255,7 +259,7 @@ raise SystemExit(main())
             search = client.tool("search_sources", {
                 "task_id": task_id, "queries": ["quasar"], "max_estimated_tokens": 2000,
             })["structuredContent"]
-            assert search["generation"] == status["generation"]
+            assert search["index_id"] == status["index_id"]
             read = client.tool("read_bundle", {
                 "task_id": task_id, "seed_item_id": search["results"][0]["item_id"],
                 "max_estimated_tokens": 4000,

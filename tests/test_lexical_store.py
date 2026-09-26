@@ -14,8 +14,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from src.retrieval.build_lexical_index import (  # noqa: E402
-    build_generation,
-    publish_generation,
+    build_index,
+    publish_index,
 )
 from src.retrieval.contracts import (  # noqa: E402
     Item,
@@ -23,9 +23,10 @@ from src.retrieval.contracts import (  # noqa: E402
     ProjectionResult,
     SourceSnapshot,
 )
+from src.retrieval.index_artifact import LexicalBuildError  # noqa: E402
 from src.retrieval.lexical_store import (  # noqa: E402
     BudgetExceededError,
-    GenerationMismatchError,
+    IndexMismatchError,
     IndexUnavailableError,
     InvalidRequestError,
     ItemNotFoundError,
@@ -83,8 +84,8 @@ def projection(digest_character: str, *items: Item) -> ProjectionResult:
 
 
 def published_store(root: Path, digest_character: str, *items: Item) -> LexicalStore:
-    generation = build_generation(projection(digest_character, *items), root)
-    publish_generation(root, generation.generation)
+    index_id = build_index(projection(digest_character, *items), root)
+    publish_index(root, index_id.index_id)
     return LexicalStore.open_current(root)
 
 
@@ -178,7 +179,7 @@ class TestLexicalStore:
         )
         with tempfile.TemporaryDirectory() as temp:
             with published_store(Path(temp), "e", primary, related) as store:
-                result = store.read_item(primary.item_id, store.generation, 20)
+                result = store.read_item(primary.item_id, store.index_id, 20)
 
         assert body.startswith(result.body)
         assert result.estimated_evidence_tokens <= 20
@@ -191,7 +192,7 @@ class TestLexicalStore:
         item = make_item("exact", "article", body, title="Heading")
         with tempfile.TemporaryDirectory() as temp:
             with published_store(Path(temp), "f", item) as store:
-                result = store.read_item(item.item_id, store.generation)
+                result = store.read_item(item.item_id, store.index_id)
 
         assert result.body == body
         assert not result.is_truncated
@@ -211,32 +212,32 @@ class TestLexicalStore:
                         call()
                     assert caught.value.code == "invalid_request"
 
-    def test_generation_mismatch_precedes_lookup_and_missing_item_is_distinct(self) -> None:
-        item = make_item("generation", "note", "alpha", title="Alpha")
+    def test_index_mismatch_precedes_lookup_and_missing_item_is_distinct(self) -> None:
+        item = make_item("index_id", "note", "alpha", title="Alpha")
         missing = stable_item_id("sources/notes/missing.md", "missing", "heading", 1)
         with tempfile.TemporaryDirectory() as temp:
             with published_store(Path(temp), "2", item) as store:
-                with pytest.raises(GenerationMismatchError) as mismatch:
-                    store.read_item(missing, "gen_" + "0" * 20)
+                with pytest.raises(IndexMismatchError) as mismatch:
+                    store.read_item(missing, "idx_" + "0" * 20)
                 with pytest.raises(ItemNotFoundError) as not_found:
-                    store.read_item(missing, store.generation)
+                    store.read_item(missing, store.index_id)
 
-        assert mismatch.value.code == "generation_mismatch"
+        assert mismatch.value.code == "index_mismatch"
         assert not_found.value.code == "item_not_found"
 
-    def test_store_pins_generation_when_current_changes(self) -> None:
+    def test_store_pins_index_when_current_changes(self) -> None:
         old_item = make_item("old", "note", "old alpha", title="Old")
         new_item = make_item("new", "note", "new beta", title="New")
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             store = published_store(root, "3", old_item)
             try:
-                old_generation = store.generation
-                newer = build_generation(projection("4", new_item), root)
-                publish_generation(root, newer.generation)
-                result = store.read_item(old_item.item_id, old_generation)
-                with pytest.raises(GenerationMismatchError):
-                    store.read_item(new_item.item_id, newer.generation)
+                old_index = store.index_id
+                newer = build_index(projection("4", new_item), root)
+                publish_index(root, newer.index_id)
+                result = store.read_item(old_item.item_id, old_index)
+                with pytest.raises(IndexMismatchError):
+                    store.read_item(new_item.item_id, newer.index_id)
             finally:
                 store.close()
 
@@ -245,8 +246,7 @@ class TestLexicalStore:
     def test_invalid_current_and_impossibly_small_budget_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            (root / "generations").mkdir()
-            (root / "current").symlink_to(Path("generations") / ("gen_" + "0" * 20))
+            (root / "current").symlink_to("idx_" + "0" * 20)
             with pytest.raises(IndexUnavailableError) as unavailable:
                 LexicalStore.open_current(root)
         assert unavailable.value.code == "index_unavailable"
@@ -255,27 +255,55 @@ class TestLexicalStore:
         with tempfile.TemporaryDirectory() as temp:
             with published_store(Path(temp), "5", item) as store:
                 with pytest.raises(BudgetExceededError) as budget:
-                    store.read_item(item.item_id, store.generation, 1)
+                    store.read_item(item.item_id, store.index_id, 1)
         assert budget.value.code == "budget_exceeded"
 
-    def test_status_exposes_only_versioned_generation_metadata(self) -> None:
+    @pytest.mark.parametrize("layout", ["nested", "outside", "invalid_name", "root"])
+    def test_current_must_target_a_direct_index_directory(self, tmp_path: Path, layout: str) -> None:
+        root = tmp_path / "synthetic-retrieval"
+        item = make_item("layout", "note", "Synthetic layout body", title="Synthetic layout")
+        first = build_index(projection("8", item), root)
+        second = build_index(projection("9", item), root)
+        targets = {
+            "nested": root / "indexes" / first.index_id,
+            "outside": tmp_path / "synthetic-outside" / first.index_id,
+            "invalid_name": root / "synthetic-unrelated",
+            "root": root,
+        }
+        target = targets[layout]
+        if layout != "root":
+            target.parent.mkdir(parents=True, exist_ok=True)
+            first.index_path.rename(target)
+        current = root / "current"
+        previous = root / "previous"
+        current.symlink_to(target)
+        previous.symlink_to(second.index_id)
+        before = (current.readlink(), previous.readlink())
+
+        with pytest.raises(IndexUnavailableError):
+            LexicalStore.open_current(root)
+        with pytest.raises(LexicalBuildError, match="escapes retrieval root|does not target one index"):
+            publish_index(root, second.index_id)
+        assert (current.readlink(), previous.readlink()) == before
+
+    def test_status_exposes_only_versioned_index_metadata(self) -> None:
         item = make_item("status", "article", "status body", title="Status")
         with tempfile.TemporaryDirectory() as temp:
             with published_store(Path(temp), "6", item) as store:
                 status = store.status()
 
-        assert status.generation == "gen_" + "6" * 20
+        assert status.index_id == "idx_" + "6" * 20
         assert status.item_counts == {"article": 1, "conversation": 0, "note": 0}
         assert status.ranking_policy_version == "bm25-rrf-v2"
         assert not status.semantic_search
         assert status.supported_scopes == ("conversation", "note", "article")
 
 
-    def test_old_ranking_policy_generation_is_rejected(self, tmp_path) -> None:
+    def test_old_ranking_policy_index_is_rejected(self, tmp_path) -> None:
         item = make_item("old-policy", "note", "synthetic ranking policy body")
         with published_store(tmp_path, "7", item):
             pass
-        manifest_path = tmp_path / "current" / "generation.json"
+        manifest_path = tmp_path / "current" / "index.json"
         manifest = json.loads(manifest_path.read_text())
         manifest["ranking_policy_version"] = "bm25-rrf-v1"
         manifest_path.write_text(json.dumps(manifest))

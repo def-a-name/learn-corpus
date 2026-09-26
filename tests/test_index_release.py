@@ -15,7 +15,7 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from src.maintenance import deploy_generation as deployment  # noqa: E402
+from src.maintenance import deploy_index as deployment  # noqa: E402
 from src.maintenance.build_release import _validate_assets, build_release  # noqa: E402
 from src.corpus.document import yaml_document  # noqa: E402
 
@@ -23,7 +23,9 @@ from src.corpus.document import yaml_document  # noqa: E402
 COMMIT = "a" * 40
 RUN_ID = 12345
 RUN_ATTEMPT = 2
-GENERATION = "gen_" + "b" * 20
+INDEX_ID = "idx_" + "b" * 20
+CURRENT_INDEX_ID = "idx_" + "d" * 20
+PREVIOUS_INDEX_ID = "idx_" + "e" * 20
 DIGEST = "sha256:" + "b" * 64
 DATABASE_HASH = "sha256:" + "c" * 64
 
@@ -33,7 +35,7 @@ def run_record(run_id: int, created_at: str = "2026-01-02T00:00:00Z") -> dict:
         "id": run_id,
         "repository": {"full_name": deployment.REPOSITORY},
         "head_branch": "main",
-        "path": ".github/workflows/build-generation.yml@refs/heads/main",
+        "path": ".github/workflows/build-index.yml@refs/heads/main",
         "status": "completed",
         "conclusion": "success",
         "head_sha": COMMIT,
@@ -42,23 +44,23 @@ def run_record(run_id: int, created_at: str = "2026-01-02T00:00:00Z") -> dict:
     }
 
 
-def archive_bytes(*, extra: str | None = None) -> bytes:
+def archive_bytes(*, extra: str | None = None, version: int = 2, index_prefix: str = "") -> bytes:
     metadata = {
-        "version": 1,
+        "version": version,
         "repository": deployment.REPOSITORY,
         "ref": deployment.REF,
         "commit": COMMIT,
         "run_id": RUN_ID,
         "run_attempt": RUN_ATTEMPT,
-        "generation": GENERATION,
+        "index_id": INDEX_ID,
         "source_digest": DIGEST,
         "database_sha256": DATABASE_HASH,
     }
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w") as archive:
         archive.writestr("release.json", json.dumps(metadata))
-        archive.writestr(f"generations/{GENERATION}/generation.json", "{}")
-        archive.writestr(f"generations/{GENERATION}/corpus.sqlite", b"synthetic database fixture")
+        archive.writestr(f"{index_prefix}{INDEX_ID}/index.json", "{}")
+        archive.writestr(f"{index_prefix}{INDEX_ID}/corpus.sqlite", b"synthetic database fixture")
         if extra is not None:
             archive.writestr(extra, b"unwanted")
     return output.getvalue()
@@ -69,7 +71,7 @@ def test_accepts_matching_run_and_artifact_metadata() -> None:
     assert deployment._check_run(run, RUN_ID) == (COMMIT, RUN_ATTEMPT)
     artifact = {
         "artifacts": [{
-            "name": f"learn-corpus-generation-{RUN_ID}-{RUN_ATTEMPT}",
+            "name": f"learn-corpus-index-{RUN_ID}-{RUN_ATTEMPT}",
             "expired": False,
             "id": 987,
             "digest": "sha256:" + hashlib.sha256(b"fixture").hexdigest(),
@@ -77,7 +79,7 @@ def test_accepts_matching_run_and_artifact_metadata() -> None:
         }]
     }
     assert deployment._check_artifacts(artifact, RUN_ID, RUN_ATTEMPT, COMMIT)[0] == 987
-    with pytest.raises(ValueError, match="expected generation artifact"):
+    with pytest.raises(ValueError, match="expected index artifact"):
         deployment._check_artifacts({"artifacts": []}, RUN_ID, RUN_ATTEMPT, COMMIT)
     run["head_branch"] = "test"
     with pytest.raises(ValueError, match="workflow run"):
@@ -95,7 +97,7 @@ def test_latest_run_selects_newest_successful_main_build(monkeypatch) -> None:
     })
     assert deployment._latest_run_id("synthetic-token") == 103
     assert urls == [
-        f"{deployment.API_ROOT}/actions/workflows/build-generation.yml/runs"
+        f"{deployment.API_ROOT}/actions/workflows/build-index.yml/runs"
         "?branch=main&status=success&per_page=100&page=1"
     ]
 
@@ -146,7 +148,7 @@ def test_cli_only_accepts_required_config(monkeypatch, capsys, tmp_path: Path) -
     selected = []
     config_path = tmp_path / "deploy.json"
     monkeypatch.setattr(deployment, "deploy", lambda path: selected.append(path) or "Synthetic deployment")
-    monkeypatch.setattr(sys, "argv", ["deploy_generation", "--config", str(config_path)])
+    monkeypatch.setattr(sys, "argv", ["deploy_index", "--config", str(config_path)])
     deployment.main()
     assert selected == [config_path]
     assert "Synthetic deployment" in capsys.readouterr().out
@@ -156,7 +158,7 @@ def test_cli_only_accepts_required_config(monkeypatch, capsys, tmp_path: Path) -
         ["--config", str(config_path), "--service", "synthetic-service"],
         ["--conf", str(config_path)],
     ):
-        monkeypatch.setattr(sys, "argv", ["deploy_generation", *arguments])
+        monkeypatch.setattr(sys, "argv", ["deploy_index", *arguments])
         with pytest.raises(SystemExit, match="2"):
             deployment.main()
 
@@ -183,7 +185,7 @@ def test_deployment_config_selects_run_and_resolves_paths(tmp_path: Path, run_id
 
 
 def test_deployment_example_points_to_unusable_header_example(tmp_path: Path) -> None:
-    config = deployment.load_deployment_config(REPO_ROOT / "config" / "deploy-generation.json.example")
+    config = deployment.load_deployment_config(REPO_ROOT / "config" / "deploy-index.json.example")
     assert config.github_header_file == REPO_ROOT / "config" / "github.header.example"
     assert config.github_header_file.is_file()
     example_copy = tmp_path / "github-artifact.header"
@@ -253,14 +255,14 @@ def test_status_connects_directly_to_loopback_with_allowed_host(monkeypatch) -> 
             calls.append((method, path, headers))
 
         def getresponse(self):
-            return SimpleNamespace(status=200, read=lambda limit: b'{"generation":"gen_synthetic"}')
+            return SimpleNamespace(status=200, read=lambda limit: b'{"index_id":"idx_synthetic"}')
 
         def close(self):
             calls.append("closed")
 
     monkeypatch.setattr(deployment.http.client, "HTTPConnection", FakeConnection)
     target = deployment.LocalStatusTarget("127.0.0.1", 2699, "service.example.test")
-    assert deployment._status(target, "synthetic-status-token") == {"generation": "gen_synthetic"}
+    assert deployment._status(target, "synthetic-status-token") == {"index_id": "idx_synthetic"}
     assert calls[0] == ("127.0.0.1", 2699, 10)
     assert calls[1] == ("GET", "/v1/status", {
         "Host": "service.example.test",
@@ -273,7 +275,7 @@ def test_status_connects_directly_to_loopback_with_allowed_host(monkeypatch) -> 
 def test_latest_missing_artifact_does_not_fall_back(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "retrieval"
     root.mkdir()
-    (root / "current").symlink_to("generations/gen_current")
+    (root / "current").symlink_to(CURRENT_INDEX_ID)
     monkeypatch.setattr(deployment.os, "geteuid", lambda: 0)
     monkeypatch.setattr(deployment, "load_deployment_config", lambda path: deployment.DeploymentConfig(
         service_config=tmp_path / "service.json",
@@ -298,7 +300,7 @@ def test_latest_missing_artifact_does_not_fall_back(tmp_path: Path, monkeypatch)
 
     def request(url, token, *, binary=False):
         urls.append(url)
-        if "/workflows/build-generation.yml/runs?" in url:
+        if "/workflows/build-index.yml/runs?" in url:
             return {"workflow_runs": [older, latest]}
         if url.endswith(f"/actions/runs/{RUN_ID + 1}"):
             return latest
@@ -307,10 +309,10 @@ def test_latest_missing_artifact_does_not_fall_back(tmp_path: Path, monkeypatch)
         raise AssertionError("unexpected GitHub request")
 
     monkeypatch.setattr(deployment, "_request", request)
-    with pytest.raises(ValueError, match="expected generation artifact"):
+    with pytest.raises(ValueError, match="expected index artifact"):
         deployment.deploy(tmp_path / "deploy.json")
     assert all(f"/actions/runs/{RUN_ID}/" not in url for url in urls)
-    assert (root / "current").readlink().name == "gen_current"
+    assert (root / "current").readlink() == Path(CURRENT_INDEX_ID)
 
 
 def test_extract_rejects_extra_archive_member(tmp_path: Path) -> None:
@@ -321,17 +323,32 @@ def test_extract_rejects_extra_archive_member(tmp_path: Path) -> None:
     assert not (tmp_path.parent / "escape.txt").exists()
 
 
-def test_extract_checks_release_binding_before_generation_validation(tmp_path: Path, monkeypatch) -> None:
+def test_extract_rejects_old_release_version_before_writing(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="release metadata does not match workflow run"):
+        deployment._extract_release(archive_bytes(version=1), tmp_path, RUN_ID, RUN_ATTEMPT, COMMIT)
+    assert not list(tmp_path.iterdir())
+
+
+def test_extract_rejects_nested_index_layout_before_writing(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="unexpected paths"):
+        deployment._extract_release(
+            archive_bytes(index_prefix="indexes/"), tmp_path, RUN_ID, RUN_ATTEMPT, COMMIT
+        )
+    assert not list(tmp_path.iterdir())
+
+
+def test_extract_checks_release_binding_before_index_validation(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr(
         deployment,
-        "validate_generation_artifact",
+        "validate_index_artifact",
         lambda path: {"source_digest": DIGEST, "database_sha256": DATABASE_HASH},
     )
-    release, generation_path = deployment._extract_release(
+    release, index_path = deployment._extract_release(
         archive_bytes(), tmp_path, RUN_ID, RUN_ATTEMPT, COMMIT
     )
-    assert release["generation"] == GENERATION
-    assert {path.name for path in generation_path.iterdir()} == {"generation.json", "corpus.sqlite"}
+    assert release["index_id"] == INDEX_ID
+    assert index_path == tmp_path / INDEX_ID
+    assert {path.name for path in index_path.iterdir()} == {"index.json", "corpus.sqlite"}
 
 
 def test_cross_domain_redirect_drops_github_token() -> None:
@@ -420,9 +437,22 @@ def test_build_release_from_synthetic_committed_note(tmp_path: Path) -> None:
         run_id=str(RUN_ID),
         run_attempt=str(RUN_ATTEMPT),
     )
-    generation = output / "generations" / release["generation"]
-    assert {path.name for path in generation.iterdir()} == {"generation.json", "corpus.sqlite"}
+    index_path = output / release["index_id"]
+    assert {path.name for path in index_path.iterdir()} == {"index.json", "corpus.sqlite"}
+    assert {path.name for path in output.iterdir()} == {"release.json", release["index_id"]}
     assert json.loads((output / "release.json").read_text()) == release
+    archive_output = io.BytesIO()
+    with zipfile.ZipFile(archive_output, "w") as archive:
+        for path in output.rglob("*"):
+            if path.is_file():
+                archive.write(path, path.relative_to(output).as_posix())
+    extracted = tmp_path / "synthetic-extracted"
+    extracted.mkdir()
+    extracted_release, extracted_index = deployment._extract_release(
+        archive_output.getvalue(), extracted, RUN_ID, RUN_ATTEMPT, commit
+    )
+    assert extracted_release == release
+    assert (extracted_index / "corpus.sqlite").read_bytes() == (index_path / "corpus.sqlite").read_bytes()
     asset.write_bytes(b"tampered synthetic image fixture")
     with pytest.raises(ValueError, match="asset hash mismatch"):
         _validate_assets(repo)
@@ -458,33 +488,33 @@ def _stub_deployment(monkeypatch, retrieval_root: Path, *, run_id: int | None = 
 
 
 @pytest.mark.parametrize("selected_run", [RUN_ID, None])
-def test_incompatible_generation_leaves_links_unchanged(tmp_path: Path, monkeypatch, selected_run, capsys) -> None:
+def test_incompatible_index_leaves_links_unchanged(tmp_path: Path, monkeypatch, selected_run, capsys) -> None:
     root = tmp_path / "retrieval"
-    (root / "generations").mkdir(parents=True)
-    for name in ("current", "previous"):
-        (root / name).symlink_to(f"generations/gen_{name}")
+    root.mkdir(parents=True)
+    for name, index_id in (("current", CURRENT_INDEX_ID), ("previous", PREVIOUS_INDEX_ID)):
+        (root / name).symlink_to(index_id)
     _stub_deployment(monkeypatch, root, run_id=selected_run)
     selected = []
     monkeypatch.setattr(deployment, "_latest_run_id", lambda token: selected.append(token) or RUN_ID)
 
     def extract(_archive, temporary, _run_id, _run_attempt, _commit):
-        staged = temporary / GENERATION
+        staged = temporary / INDEX_ID
         staged.mkdir()
-        return {"generation": GENERATION}, staged
+        return {"index_id": INDEX_ID}, staged
 
     monkeypatch.setattr(deployment, "_extract_release", extract)
     monkeypatch.setattr(
         deployment,
-        "validate_generation_artifact",
-        lambda *args, **kwargs: (_ for _ in ()).throw(deployment.LexicalBuildError("generation schema_version mismatch")),
+        "validate_index_artifact",
+        lambda *args, **kwargs: (_ for _ in ()).throw(deployment.LexicalBuildError("index schema_version mismatch")),
     )
     with pytest.raises(deployment.LexicalBuildError, match="schema_version"):
         deployment.deploy(tmp_path / "deploy.json")
-    assert (root / "current").readlink().name == "gen_current"
-    assert (root / "previous").readlink().name == "gen_previous"
+    assert (root / "current").readlink() == Path(CURRENT_INDEX_ID)
+    assert (root / "previous").readlink() == Path(PREVIOUS_INDEX_ID)
     assert selected == (["synthetic-token"] if selected_run is None else [])
     output = capsys.readouterr().out
-    assert "Checking generation" in output
+    assert "Checking index" in output
     assert "Switching current" not in output
     assert "Restarting" not in output
 
@@ -492,61 +522,60 @@ def test_incompatible_generation_leaves_links_unchanged(tmp_path: Path, monkeypa
 @pytest.mark.parametrize("installation", ["new", "existing", "current"])
 def test_deployment_reports_progress_without_credentials(tmp_path: Path, monkeypatch, capsys, installation) -> None:
     root = tmp_path / "retrieval"
-    generations = root / "generations"
-    generations.mkdir(parents=True)
-    current = GENERATION if installation == "current" else "gen_current"
-    for name in (current, "gen_previous"):
-        (generations / name).mkdir(exist_ok=True)
+    root.mkdir(parents=True)
+    current = INDEX_ID if installation == "current" else CURRENT_INDEX_ID
+    for name in (current, PREVIOUS_INDEX_ID):
+        (root / name).mkdir(exist_ok=True)
     if installation == "existing":
-        (generations / GENERATION).mkdir()
-    (root / "current").symlink_to(f"generations/{current}")
-    (root / "previous").symlink_to("generations/gen_previous")
+        (root / INDEX_ID).mkdir()
+    (root / "current").symlink_to(current)
+    (root / "previous").symlink_to(PREVIOUS_INDEX_ID)
     _stub_deployment(monkeypatch, root)
 
     def extract(_archive, temporary, _run_id, _run_attempt, _commit):
-        staged = temporary / GENERATION
+        staged = temporary / INDEX_ID
         staged.mkdir()
-        (staged / "generation.json").write_text("{}")
-        return {"generation": GENERATION}, staged
+        (staged / "index.json").write_text("{}")
+        return {"index_id": INDEX_ID}, staged
 
     monkeypatch.setattr(deployment, "_extract_release", extract)
-    monkeypatch.setattr(deployment, "validate_generation_artifact", lambda *args, **kwargs: {})
+    monkeypatch.setattr(deployment, "validate_index_artifact", lambda *args, **kwargs: {})
     monkeypatch.setattr(deployment, "_status_token", lambda path: "synthetic-status-token")
     monkeypatch.setattr(deployment.pwd, "getpwnam", lambda name: SimpleNamespace(pw_uid=12345, pw_gid=12345))
     monkeypatch.setattr(deployment.grp, "getgrgid", lambda gid: SimpleNamespace(gr_gid=gid))
     monkeypatch.setattr(deployment.os, "chown", lambda *args: None)
     monkeypatch.setattr(deployment.os, "chmod", lambda *args: None)
     monkeypatch.setattr(deployment.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=0))
-    monkeypatch.setattr(deployment, "_status", lambda *args: {"generation": (root / "current").readlink().name})
+    monkeypatch.setattr(deployment, "_status", lambda *args: {"index_id": (root / "current").readlink().name})
 
-    def publish(retrieval_root, generation):
+    def publish(retrieval_root, index_id):
         deployment._replace_link(retrieval_root / "previous", (retrieval_root / "current").readlink())
-        deployment._replace_link(retrieval_root / "current", Path("generations") / generation)
+        deployment._replace_link(retrieval_root / "current", Path(index_id))
 
-    monkeypatch.setattr(deployment, "publish_generation", publish)
+    monkeypatch.setattr(deployment, "publish_index", publish)
     result = deployment.deploy(tmp_path / "deploy.json")
-    assert (root / "current").readlink().name == GENERATION
+    assert (root / "current").readlink() == Path(INDEX_ID)
     output = capsys.readouterr().out
     assert "synthetic-token" not in output
     assert "synthetic-status-token" not in output
     assert str(tmp_path) not in output
     assert f"run {RUN_ID}, attempt {RUN_ATTEMPT}, commit {COMMIT}" in output
     stages = [
-        "Loading deployment", "Checking workflow run", "Checking generation artifact", "Downloading artifact",
-        "SHA-256 verified", "Extracting and validating", f"Checking generation {GENERATION}",
+        "Loading deployment", "Checking workflow run", "Checking index artifact", "Downloading artifact",
+        "SHA-256 verified", "Extracting and validating", f"Checking index {INDEX_ID}",
     ]
     if installation == "current":
-        stages.append("Generation is already current")
+        stages.append("Retrieval index is already current")
         assert "already current" in result
         assert "Switching current" not in output
         assert "Restarting" not in output
     else:
         stages.extend([
-            "Installing generation" if installation == "new" else "Generation is already installed",
+            "Installing index" if installation == "new" else "Retrieval index is already installed",
             "Checking current service", "Switching current", "Restarting the HTTP service",
-            "Waiting for the service", "New generation verified",
+            "Waiting for the service", "New index verified",
         ])
-        assert (root / "previous").readlink().name == "gen_current"
+        assert (root / "previous").readlink() == Path(CURRENT_INDEX_ID)
     positions = [output.index(stage) for stage in stages]
     assert positions == sorted(positions)
 
@@ -554,42 +583,50 @@ def test_deployment_reports_progress_without_credentials(tmp_path: Path, monkeyp
 @pytest.mark.parametrize("rollback_fails", [False, True])
 def test_failed_restart_restores_previous_links(tmp_path: Path, monkeypatch, capsys, rollback_fails) -> None:
     root = tmp_path / "retrieval"
-    generations = root / "generations"
-    generations.mkdir(parents=True)
-    for name in ("gen_current", "gen_previous", GENERATION):
-        (generations / name).mkdir()
-    (root / "current").symlink_to("generations/gen_current")
-    (root / "previous").symlink_to("generations/gen_previous")
+    root.mkdir(parents=True)
+    for name in (CURRENT_INDEX_ID, PREVIOUS_INDEX_ID, INDEX_ID):
+        (root / name).mkdir()
+    (root / "current").symlink_to(CURRENT_INDEX_ID)
+    (root / "previous").symlink_to(PREVIOUS_INDEX_ID)
     _stub_deployment(monkeypatch, root)
 
     def extract(_archive, temporary, _run_id, _run_attempt, _commit):
-        staged = temporary / GENERATION
+        staged = temporary / INDEX_ID
         staged.mkdir()
-        return {"generation": GENERATION}, staged
+        return {"index_id": INDEX_ID}, staged
 
     monkeypatch.setattr(deployment, "_extract_release", extract)
-    monkeypatch.setattr(deployment, "validate_generation_artifact", lambda *args, **kwargs: {})
+    monkeypatch.setattr(deployment, "validate_index_artifact", lambda *args, **kwargs: {})
     monkeypatch.setattr(deployment, "_status_token", lambda path: "synthetic-status-token")
-    monkeypatch.setattr(deployment, "_status", lambda *args: {"generation": "gen_current"})
+    monkeypatch.setattr(deployment, "_status", lambda *args: {"index_id": CURRENT_INDEX_ID})
     monkeypatch.setattr(
-        deployment, "_restart_and_wait", lambda *args: (_ for _ in ()).throw(RuntimeError("synthetic restart failure"))
+        "src.retrieval.build_lexical_index.validate_index_artifact",
+        lambda path: {"index_id": path.name},
     )
+    restarted = []
+
+    def fail_restart(*args):
+        restarted.append((root / "current").readlink())
+        raise RuntimeError("synthetic restart failure")
+
+    monkeypatch.setattr(deployment, "_restart_and_wait", fail_restart)
     monkeypatch.setattr(deployment.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=0))
     def rollback_check(*args):
         if rollback_fails:
             raise RuntimeError("synthetic rollback failure")
 
     monkeypatch.setattr(deployment, "_restart_status_check", rollback_check)
-    expected = "rollback verification failed" if rollback_fails else "previous generation restored"
+    expected = "rollback verification failed" if rollback_fails else "previous index restored"
     with pytest.raises(RuntimeError, match=expected):
         deployment.deploy(tmp_path / "deploy.json")
-    assert (root / "current").readlink().name == "gen_current"
-    assert (root / "previous").readlink().name == "gen_previous"
+    assert restarted == [Path(INDEX_ID)]
+    assert (root / "current").readlink() == Path(CURRENT_INDEX_ID)
+    assert (root / "previous").readlink() == Path(PREVIOUS_INDEX_ID)
     output = capsys.readouterr().out
     assert "Deployment failed; restoring" in output
     assert "Restarting the HTTP service after rollback" in output
-    assert "Waiting for the service to report the restored generation" in output
-    assert "New generation verified" not in output
+    assert "Waiting for the service to report the restored index" in output
+    assert "New index verified" not in output
     assert ("Rollback verified" in output) is not rollback_fails
     assert ("Rollback verification failed" in output) is rollback_fails
     assert "synthetic-token" not in output

@@ -69,7 +69,7 @@ class _PreparedRequest:
     scopes: tuple[str, ...] | None = None
     limit: int = 8
     seed_item_id: str | None = None
-    generation: str | None = None
+    index_id: str | None = None
 
 
 def _request(request: object, allowed: set[str], required: set[str]) -> dict[str, Any]:
@@ -168,7 +168,7 @@ def _validate_response(
 ) -> None:
     """序列化之前验证公开结果的字段白名单与完整性不变量。"""
 
-    common = {"request_id", "generation", "usage"}
+    common = {"request_id", "index_id", "usage"}
     if operation == "search":
         if set(payload) != common | {"results", "is_truncated"}:
             raise IndexUnavailableError("public search response schema is invalid")
@@ -286,7 +286,7 @@ class RetrievalCore:
         candidate_items = []
         for hit in result.results:
             check_deadline(deadline)
-            item = self.store.read_canonical_item(hit.item_id, result.generation, deadline=deadline)
+            item = self.store.read_canonical_item(hit.item_id, result.index_id, deadline=deadline)
             candidate_items.append(item)
             candidates.append({
                 **_metadata(item, include_source_location=include_source_location),
@@ -297,7 +297,7 @@ class RetrievalCore:
         # 从完整结果向下缩短，始终保留同一排名的完整前缀。
         for count in range(len(candidates), -1, -1):
             response = self._encode({
-                "request_id": request_id, "generation": result.generation,
+                "request_id": request_id, "index_id": result.index_id,
                 "is_truncated": count < len(candidates), "results": candidates[:count],
             }, "search", max_tokens, deadline, max_response_bytes,
                 include_source_location=include_source_location)
@@ -318,7 +318,7 @@ class RetrievalCore:
         deadline, request_id = self._start(request_id)
         values = self.validate_request("read_bundle", request)
         max_tokens = values.max_tokens
-        seed = self.store.read_canonical_item(values.seed_item_id, values.generation, deadline=deadline)
+        seed = self.store.read_canonical_item(values.seed_item_id, values.index_id, deadline=deadline)
         key = bundle_key(seed)
         members = read_members(self.store, seed, deadline)
         item_payloads = {}
@@ -333,7 +333,7 @@ class RetrievalCore:
         def encode(selected: set[str]) -> PublicResponse | None:
             complete = len(selected) == len(members)
             response = self._encode({
-                "request_id": request_id, "generation": self.store.generation,
+                "request_id": request_id, "index_id": self.store.index_id,
                 "seed_item_id": seed.item_id, "bundle_key": key,
                 "bundle_status": "complete" if complete else "partial_budget",
                 "membership_complete": True,
@@ -378,35 +378,35 @@ class RetrievalCore:
 
         if operation == "search":
             values = _request(request, {
-                "queries", "scopes", "limit", "generation", "max_estimated_tokens",
+                "queries", "scopes", "limit", "index_id", "max_estimated_tokens",
             }, {"queries"})
             max_tokens = _tokens(values)
             if type(values["queries"]) is not list or (
                 "scopes" in values and type(values["scopes"]) is not list
             ):
                 raise InvalidRequestError("queries and scopes must be arrays")
-            if "generation" in values:
-                self.store.validate_generation(values["generation"])
+            if "index_id" in values:
+                self.store.validate_index_id(values["index_id"])
             compiled = self.store._validate_search_request(
                 values["queries"], values.get("scopes"), values.get("limit", 8),
             )
             return _PreparedRequest(
                 self._request_owner, operation, max_tokens, compiled,
                 None if "scopes" not in values else tuple(values["scopes"]),
-                values.get("limit", 8), generation=values.get("generation"),
+                values.get("limit", 8), index_id=values.get("index_id"),
             )
         if operation == "read_bundle":
             values = _request(request, {
-                "seed_item_id", "generation", "max_estimated_tokens",
-            }, {"seed_item_id", "generation"})
+                "seed_item_id", "index_id", "max_estimated_tokens",
+            }, {"seed_item_id", "index_id"})
             max_tokens = _tokens(values)
-            self.store.validate_generation(values["generation"])
+            self.store.validate_index_id(values["index_id"])
             seed = values["seed_item_id"]
             if not isinstance(seed, str) or _ITEM_ID.fullmatch(seed) is None:
                 raise InvalidRequestError("item_id has an invalid format")
             return _PreparedRequest(
                 self._request_owner, operation, max_tokens,
-                seed_item_id=seed, generation=values["generation"],
+                seed_item_id=seed, index_id=values["index_id"],
             )
         raise InvalidRequestError("operation is invalid")
 

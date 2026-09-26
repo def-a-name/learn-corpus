@@ -1,4 +1,4 @@
-"""搜索并读取一个已锁定的不可变词法 generation。"""
+"""搜索并读取一个已锁定的不可变词法检索索引。"""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from time import monotonic
 from typing import Any, Sequence
 
 from src.retrieval.contracts import (
-    GenerationStatus,
+    IndexStatus,
     Item,
     ItemRelations,
     ReadResult,
@@ -24,10 +24,10 @@ from src.retrieval.contracts import (
     SearchResult,
     SUPPORTED_SCOPES,
 )
-from src.retrieval.generation import (
+from src.retrieval.index_artifact import (
     LexicalBuildError,
     open_immutable_database,
-    validate_generation_artifact,
+    validate_index_artifact,
 )
 from src.retrieval.lexical_query import (
     CompiledQuery,
@@ -49,7 +49,7 @@ MAX_READ_TOKENS = 800
 
 _SCOPE_SET = frozenset(SUPPORTED_SCOPES)
 _ITEM_ID = re.compile(r"^itm_[a-z2-7]{32}$")
-_GENERATION = re.compile(r"^gen_[0-9a-f]{20}$")
+_INDEX_ID = re.compile(r"^idx_[0-9a-f]{20}$")
 _FENCE_START = re.compile(r"^ {0,3}(?P<marker>`{3,}|~{3,})")
 _LIST_START = re.compile(r"^\s*(?:[-+*]|\d+[.)])[ \t]+")
 _TABLE_DELIMITER = re.compile(
@@ -79,8 +79,8 @@ class InvalidRequestError(LexicalStoreError):
     code = "invalid_request"
 
 
-class GenerationMismatchError(LexicalStoreError):
-    code = "generation_mismatch"
+class IndexMismatchError(LexicalStoreError):
+    code = "index_mismatch"
 
 
 class ItemNotFoundError(LexicalStoreError):
@@ -505,15 +505,15 @@ def _relations(value: str) -> ItemRelations:
 
 
 class LexicalStore:
-    """对一个启动时锁定的不可变 generation 提供线程安全门面。"""
+    """对一个启动时锁定的不可变检索索引提供线程安全门面。"""
 
     def __init__(
         self,
-        generation_path: Path,
+        index_path: Path,
         manifest: dict[str, Any],
         connection: sqlite3.Connection,
     ) -> None:
-        self._generation_path = generation_path
+        self._index_path = index_path
         self._manifest = dict(manifest)
         self._connection: sqlite3.Connection | None = connection
         self._connection.row_factory = sqlite3.Row
@@ -528,24 +528,23 @@ class LexicalStore:
             current = root / "current"
             if not os.path.lexists(current) or not current.is_symlink():
                 raise LexicalBuildError("current is not a symlink")
-            generation_path = current.resolve(strict=True)
-            generations_root = (root / "generations").resolve(strict=True)
-            relative = generation_path.relative_to(generations_root)
-            if len(relative.parts) != 1 or _GENERATION.fullmatch(relative.name) is None:
-                raise LexicalBuildError("current does not target one generation")
-            manifest = validate_generation_artifact(
-                generation_path, expected_generation=relative.name
+            index_path = current.resolve(strict=True)
+            relative = index_path.relative_to(root)
+            if len(relative.parts) != 1 or _INDEX_ID.fullmatch(relative.name) is None:
+                raise LexicalBuildError("current does not target one index")
+            manifest = validate_index_artifact(
+                index_path, expected_index_id=relative.name
             )
             connection = open_immutable_database(
-                generation_path / "corpus.sqlite", check_same_thread=False
+                index_path / "corpus.sqlite", check_same_thread=False
             )
         except (LexicalBuildError, OSError, sqlite3.Error, ValueError) as exc:
             raise IndexUnavailableError("lexical index is unavailable") from exc
-        return cls(generation_path, manifest, connection)
+        return cls(index_path, manifest, connection)
 
     @property
-    def generation(self) -> str:
-        return str(self._manifest["generation"])
+    def index_id(self) -> str:
+        return str(self._manifest["index_id"])
 
     def __enter__(self) -> "LexicalStore":
         return self
@@ -564,9 +563,9 @@ class LexicalStore:
             raise IndexUnavailableError("lexical store is closed")
         return self._connection
 
-    def status(self) -> GenerationStatus:
-        return GenerationStatus(
-            generation=self.generation,
+    def status(self) -> IndexStatus:
+        return IndexStatus(
+            index_id=self.index_id,
             source_digest=self._manifest["source_digest"],
             built_at=self._manifest["built_at"],
             item_counts=dict(self._manifest["item_counts"]),
@@ -616,10 +615,10 @@ class LexicalStore:
 
         return self._lock if deadline is None else self.request_deadline(deadline)
 
-    def read_canonical_item(self, item_id: str, generation: str, *, deadline: float | None = None) -> Item:
+    def read_canonical_item(self, item_id: str, index_id: str, *, deadline: float | None = None) -> Item:
         """内部精确读取完整投影字段，供 bundle 校验使用，不截断正文。"""
 
-        self.validate_generation(generation)
+        self.validate_index_id(index_id)
         if not isinstance(item_id, str) or _ITEM_ID.fullmatch(item_id) is None:
             raise InvalidRequestError("item_id has an invalid format")
         with self._read_guard(deadline):
@@ -630,7 +629,7 @@ class LexicalStore:
             except sqlite3.Error as exc:
                 raise IndexUnavailableError("item read failed") from exc
         if row is None:
-            raise ItemNotFoundError("item was not found in the pinned generation")
+            raise ItemNotFoundError("item was not found in the pinned index")
         try:
             fields = dict(row)
             fields.pop("rowid")
@@ -667,13 +666,13 @@ class LexicalStore:
                 raise IndexUnavailableError("bundle membership query failed") from exc
         return tuple(row["item_id"] for row in rows)
 
-    def validate_generation(self, generation: str) -> None:
+    def validate_index_id(self, index_id: str) -> None:
         """在读取或公开搜索前校验调用方绑定的快照。"""
 
-        if not isinstance(generation, str) or _GENERATION.fullmatch(generation) is None:
-            raise InvalidRequestError("generation has an invalid format")
-        if generation != self.generation:
-            raise GenerationMismatchError("requested generation is not pinned")
+        if not isinstance(index_id, str) or _INDEX_ID.fullmatch(index_id) is None:
+            raise InvalidRequestError("index has an invalid format")
+        if index_id != self.index_id:
+            raise IndexMismatchError("requested index is not pinned")
 
     def search_lex(
         self,
@@ -753,7 +752,7 @@ class LexicalStore:
                     truncated_after=snippet.truncated_after,
                 )
             )
-        return SearchResponse(self.generation, tuple(results), total_tokens)
+        return SearchResponse(self.index_id, tuple(results), total_tokens)
 
     @staticmethod
     def _validate_search_request(
@@ -821,10 +820,10 @@ class LexicalStore:
     def read_item(
         self,
         item_id: str,
-        generation: str,
+        index_id: str,
         max_estimated_tokens: int = DEFAULT_READ_MAX_TOKENS,
     ) -> ReadResult:
-        self.validate_generation(generation)
+        self.validate_index_id(index_id)
         if not isinstance(item_id, str) or _ITEM_ID.fullmatch(item_id) is None:
             raise InvalidRequestError("item_id has an invalid format")
         if (
@@ -841,10 +840,10 @@ class LexicalStore:
             except sqlite3.Error as exc:
                 raise IndexUnavailableError("item read failed") from exc
         if row is None:
-            raise ItemNotFoundError("item was not found in the pinned generation")
+            raise ItemNotFoundError("item was not found in the pinned index")
         body, is_truncated = _truncate_read_body(row["body"], max_estimated_tokens)
         return ReadResult(
-            generation=self.generation,
+            index_id=self.index_id,
             item_id=row["item_id"],
             title=row["title"],
             source_title=row["source_title"],

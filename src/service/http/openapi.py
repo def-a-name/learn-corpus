@@ -27,7 +27,7 @@ def build_openapi() -> dict:
     boolean = {"type": "boolean"}
     nullable_string = {"type": ["string", "null"]}
     integer = {"type": "integer", "minimum": 0}
-    generation = {"type": "string", "pattern": "^gen_[0-9a-f]{20}$"}
+    index_id = {"type": "string", "pattern": "^idx_[0-9a-f]{20}$"}
     item_id = {"type": "string", "pattern": "^itm_[a-z2-7]{32}$"}
     bundle_key = {"type": "string", "pattern": "^bnd_[0-9a-f]{40}$"}
     scope = {"type": "string", "enum": list(SUPPORTED_SCOPES)}
@@ -54,7 +54,7 @@ def build_openapi() -> dict:
     }
     common = {
         "request_id": {**string, "description": "本次请求的追踪标识，可用于关联服务日志。"},
-        "generation": generation, "usage": _ref("Usage"),
+        "index_id": index_id, "usage": _ref("Usage"),
     }
     schemas = {
         "SearchRequest": _object({
@@ -65,14 +65,14 @@ def build_openapi() -> dict:
                              description="省略表示所有来源；conversation=会话，note=笔记，article=文章。传入时不能为空或重复。"),
             "limit": {"type": "integer", "minimum": 1, "maximum": MAX_RESULT_LIMIT, "default": 8,
                       "description": "合并去重后的总条数上限，不是每条 query 的条数；预算可能进一步减少结果。"},
-            "generation": {**generation, "description": "首次查询建议省略。后续可传回响应中的 generation 固定索引版本；格式正确但与服务当前版本不同返回 409。"},
+            "index_id": {**index_id, "description": "首次查询建议省略。后续可传回响应中的 index_id 字段固定索引版本；格式正确但与服务当前版本不同返回 409。"},
             "max_estimated_tokens": budget,
         }, ["queries"]),
         "ReadBundleRequest": _object({
             "seed_item_id": {**item_id, "description": "复制搜索响应 results 中某项的 item_id；不要使用示例占位值。"},
-            "generation": {**generation, "description": "复制产生该搜索结果的响应顶层 generation；必须与服务当前版本一致。"},
+            "index_id": {**index_id, "description": "复制产生该搜索结果的响应顶层 index_id 字段；必须与服务当前版本一致。"},
             "max_estimated_tokens": budget,
-        }, ["seed_item_id", "generation"]),
+        }, ["seed_item_id", "index_id"]),
         "Usage": _object({"estimated_evidence_tokens": {**integer, "description": "响应的估算 token 用量，按 estimator_version 计算。"}, "estimator_version": string}),
         "SearchResult": _object({
             **metadata, "bundle_key": bundle_key, "rank": {"type": "integer", "minimum": 1},
@@ -104,7 +104,7 @@ def build_openapi() -> dict:
                             description="以 seed 为中心选择、按来源规范顺序输出的完整条目；不截断单条正文。"),
         }),
         "StatusResponse": _object({
-            "generation": generation, "source_digest": string, "built_at": string,
+            "index_id": index_id, "source_digest": string, "built_at": string,
             "item_counts": _object({name: integer for name in SUPPORTED_SCOPES}),
             **{name: string for name in (
                 "schema_version", "projection_schema_version", "chunk_policy_version",
@@ -133,7 +133,7 @@ def build_openapi() -> dict:
         404: "路由不存在，或指定的证据条目不存在。",
         405: "请求方法不支持；按 Allow 响应头改用正确方法。",
         408: "接收请求体超时。",
-        409: "索引版本不匹配；重新搜索，并使用同一响应中的 generation 和 item_id。",
+        409: "索引版本不匹配；重新搜索，并使用同一响应中的 index_id 和 item_id。",
         413: "请求体超过大小限制；Nginx 也可能提前拒绝并返回 HTML。",
         415: "POST 应使用 Content-Type: application/json，不支持压缩的 Content-Encoding。",
         422: "响应预算不足或处理超过时间预算；可提高 token 预算、减少查询或缩小范围。",
@@ -183,7 +183,7 @@ def build_openapi() -> dict:
         "/healthz": {"get": operation("health", "检查进程健康", "HealthResponse", authenticated=False,
                                     description="无需认证，仍检查来源与 Host/Origin；不是每次重新校验索引的深度检查。")},
         "/v1/status": {"get": operation("status", "查看当前索引版本与服务能力", "StatusResponse",
-                                       description="返回当前固定的 generation、各类来源条目数和响应限制。服务重启才会加载新 generation；当前不支持语义检索。")},
+                                       description="返回当前固定的检索索引版本、各类来源条目数和响应限制。服务重启才会加载新检索索引；当前不支持语义检索。")},
         "/v1/search": {"post": operation("search", "检索来源片段", "SearchResponse", "SearchRequest",
             description=f"一条 query 的多个关键词用空格分隔，通常使用 1～3 个、最多 {MAX_ANCHORS} 个，按 AND 同时匹配同一条目。"
                         "例如 `queries: [\"SQLite 索引\"]`；`queries: [\"SQLite\", \"索引\"]` 则是两条独立查询，合并去重后排序。\n\n"
@@ -192,9 +192,9 @@ def build_openapi() -> dict:
                         "每条查询按 BM25 取前 20 个候选，按 item_id 去重，以等权 RRF（分数为各查询 1/(60+排名) 之和）排序，取总共 limit 条。"
                         "同分依次比较首条查询排名、任意查询最佳排名、item_id；不保证每条查询均有结果入选。"
                         "片段优先围绕首条查询生成，未入选首条查询候选时使用该条目排名最好的查询。\n\n"
-                        "无命中返回 200 和空 results。首次请求省略 generation；读取证据时复制响应的 generation 和 results 中的 item_id。")},
+                        "无命中返回 200 和空 results。首次请求省略 index_id；读取证据时复制响应的 index_id 和 results 中的 item_id。")},
         "/v1/read-bundle": {"post": operation("read_bundle", "读取搜索命中项的相关证据", "ReadBundleResponse", "ReadBundleRequest",
-            description="先执行 search，再替换示例中的 seed_item_id 和 generation；示例 ID 仅演示格式，不指向真实条目。"
+            description="先执行 search，再替换示例中的 seed_item_id 和 index_id；示例 ID 仅演示格式，不指向真实条目。"
                         "返回种子条目所在证据组。先保证种子完整返回，再按距离扩展，同距离优先后项；最终按来源顺序输出。预算不足会省略完整条目，不截断单条正文；检查 bundle_status 和 missing_item_ids。")},
     }
     paths["/v1/search"]["post"]["requestBody"]["content"]["application/json"]["examples"] = {
@@ -207,8 +207,8 @@ def build_openapi() -> dict:
         }},
     }
     paths["/v1/read-bundle"]["post"]["requestBody"]["content"]["application/json"]["examples"] = {
-        "replace_with_search_result": {"summary": "替换为 search 返回的 item_id 和 generation 后执行", "value": {
-            "seed_item_id": "itm_" + "a" * 32, "generation": "gen_" + "0" * 20,
+        "replace_with_search_result": {"summary": "替换为 search 返回的 item_id 和 index_id 后执行", "value": {
+            "seed_item_id": "itm_" + "a" * 32, "index_id": "idx_" + "0" * 20,
             "max_estimated_tokens": MAX_RESPONSE_TOKENS,
         }},
     }

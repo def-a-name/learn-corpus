@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 
 PROJECTION_SCHEMA_VERSION = "item-projection-v3"
-# item ID 是跨 generation 的引用身份；投影新增非身份元数据时不改变既有 ID。
+# item ID 是跨索引版本的引用身份；投影新增非身份元数据时不改变既有 ID。
 STABLE_ITEM_ID_VERSION = "item-projection-v1"
 CHUNK_POLICY_VERSION = "evidence-chunk-v2"
 LEXICAL_SCHEMA_VERSION = "lexical-schema-v2"
@@ -87,7 +87,7 @@ class SearchResult:
 
 @dataclass(frozen=True)
 class SearchResponse:
-    generation: str
+    index_id: str
     results: tuple[SearchResult, ...]
     estimated_evidence_tokens: int
     estimator_version: str = ESTIMATOR_VERSION
@@ -95,7 +95,7 @@ class SearchResponse:
 
 @dataclass(frozen=True)
 class ReadResult:
-    generation: str
+    index_id: str
     item_id: str
     title: str | None
     source_title: str | None
@@ -117,8 +117,8 @@ class ReadResult:
 
 
 @dataclass(frozen=True)
-class GenerationStatus:
-    generation: str
+class IndexStatus:
+    index_id: str
     source_digest: str
     built_at: str
     item_counts: dict[str, int]

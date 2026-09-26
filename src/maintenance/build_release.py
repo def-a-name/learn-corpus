@@ -1,4 +1,4 @@
-"""验证已提交来源并打包一个可手动部署的 generation。"""
+"""验证已提交来源并打包一个可手动部署的检索索引。"""
 
 from __future__ import annotations
 
@@ -13,8 +13,8 @@ from src.corpus.ingest_log import check_committed_ingest_log
 from src.corpus.paths import REPO_ROOT
 from src.corpus.storage import sha256_file
 from src.maintenance.scan_secrets import git_candidate_files, scan_paths
-from src.retrieval.build_lexical_index import build_generation
-from src.retrieval.generation import validate_generation_artifact
+from src.retrieval.build_lexical_index import build_index
+from src.retrieval.index_artifact import validate_index_artifact
 from src.retrieval.project_items import project_corpus
 
 
@@ -97,17 +97,17 @@ def build_release(repo_root: Path, output_root: Path, *, repository: str, ref: s
         raise ValueError(f"source secrets scan failed: findings={len(findings)}")
 
     projection = project_corpus(repo_root)
-    result = build_generation(projection, output_root)
-    generation_path = output_root / "generations" / result.generation
-    manifest = validate_generation_artifact(generation_path)
+    result = build_index(projection, output_root)
+    index_path = result.index_path
+    manifest = validate_index_artifact(index_path)
     release = {
-        "version": 1,
+        "version": 2,
         "repository": repository,
         "ref": ref,
         "commit": commit,
         "run_id": int(run_id),
         "run_attempt": int(run_attempt),
-        "generation": result.generation,
+        "index_id": result.index_id,
         "source_digest": manifest["source_digest"],
         "database_sha256": manifest["database_sha256"],
     }
@@ -119,7 +119,7 @@ def build_release(repo_root: Path, output_root: Path, *, repository: str, ref: s
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Validate sources and package a generation release.")
+    parser = argparse.ArgumentParser(description="Validate sources and package a retrieval index release.")
     parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()

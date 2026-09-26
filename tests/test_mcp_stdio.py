@@ -175,7 +175,7 @@ def test_rest_http_stdio_parity(launch, config, query):
         assert status == http.get("/v1/status", headers=HEADERS).json()
         if not payload["results"]:
             return
-        rest_args = {"generation": payload["generation"],
+        rest_args = {"index_id": payload["index_id"],
                      "seed_item_id": payload["results"][0]["item_id"],
                      "max_estimated_tokens": 450}
         stdio = pipe.tool("read_bundle", {"task_id": stdio_task,
@@ -200,7 +200,7 @@ def test_rest_http_stdio_parity(launch, config, query):
 @pytest.mark.parametrize("scope", ["note", "article"])
 def test_unicode_sections_and_byte_budget(launch, config, open_core, scope):
     core = open_core(parts(scope, "Synthetic", ('# Synthetic\nquasar 虚构正文 "quoted"', 'quasar 中文续篇')))
-    selected = replace(config, corpus_path=core.store._generation_path.parent.parent)
+    selected = replace(config, corpus_path=core.store._index_path.parent)
     with launch(service_config=selected) as (pipe, _), client_for(selected) as http:
         task_id = start_task(pipe)
         query = {"task_id": task_id, "queries": ["虚构正文"], "scopes": [scope],
@@ -210,7 +210,7 @@ def test_unicode_sections_and_byte_budget(launch, config, open_core, scope):
                 "max_estimated_tokens": 4000}
         result = pipe.tool("read_bundle", args)["structuredContent"]
         rest = http.post("/v1/read-bundle", json={
-            "generation": payload["generation"], "seed_item_id": args["seed_item_id"],
+            "index_id": payload["index_id"], "seed_item_id": args["seed_item_id"],
             "max_estimated_tokens": args["max_estimated_tokens"],
         }, headers=HEADERS).json()
         rest["request_id"] = result["request_id"]
@@ -429,8 +429,8 @@ def test_stdio_config_relative_paths_and_shutdown_default(config, tmp_path):
         load_stdio_config(path)
 
 
-def test_generation_is_pinned_until_process_restart(launch, config):
-    from src.retrieval.build_lexical_index import build_generation, publish_generation
+def test_index_is_pinned_until_process_restart(launch, config):
+    from src.retrieval.build_lexical_index import build_index, publish_index
     from src.retrieval.contracts import ProjectionResult, SourceSnapshot
 
     items = parts("note", "Synthetic replacement", ("quasar newer synthetic body",))
@@ -438,22 +438,22 @@ def test_generation_is_pinned_until_process_restart(launch, config):
     projection = ProjectionResult(items, (SourceSnapshot(item.source_path, "b" * 64, item.source_id, item.scope, 1),),
                                   "sha256:" + "b" * 64)
     with launch() as (old, _):
-        first = old.tool("status")["structuredContent"]["generation"]
+        first = old.tool("status")["structuredContent"]["index_id"]
         old_task = start_task(old)
         old_search = old.tool("search_sources", {
             "task_id": old_task, "queries": ["quasar"], "max_estimated_tokens": 1000,
         })["structuredContent"]
-        assert old_search["generation"] == first
-        newer = build_generation(projection, config.corpus_path)
-        publish_generation(config.corpus_path, newer.generation)
-        assert old.tool("status")["structuredContent"]["generation"] == first
+        assert old_search["index_id"] == first
+        newer = build_index(projection, config.corpus_path)
+        publish_index(config.corpus_path, newer.index_id)
+        assert old.tool("status")["structuredContent"]["index_id"] == first
         with launch() as (new, _):
-            assert new.tool("status")["structuredContent"]["generation"] == newer.generation
+            assert new.tool("status")["structuredContent"]["index_id"] == newer.index_id
             new_task = start_task(new)
             result = new.tool("search_sources", {
                 "task_id": new_task, "queries": ["quasar"], "max_estimated_tokens": 1000,
             })["structuredContent"]
-            assert result["generation"] == newer.generation
+            assert result["index_id"] == newer.index_id
 
 
 @pytest.mark.parametrize("method", ["resources/list", "prompts/list", "admin/rebuild"])

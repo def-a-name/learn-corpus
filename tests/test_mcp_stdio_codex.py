@@ -87,7 +87,7 @@ def test_native_codex_stdio_five_tools(config, tmp_path):
             search = tool(6, "search_sources", {
                 "task_id": task_id, "queries": ["quasar"], "max_estimated_tokens": 2000,
             })
-            assert status["generation"] == search["generation"]
+            assert status["index_id"] == search["index_id"]
             read = tool(7, "read_bundle", {
                 "task_id": task_id, "seed_item_id": search["results"][0]["item_id"],
                 "max_estimated_tokens": 4000,

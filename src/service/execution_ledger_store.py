@@ -16,7 +16,7 @@ from src.retrieval.contracts import SUPPORTED_SCOPES
 from src.service.ledger_config import LedgerConfig, TaskLimitsConfig
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 # 固定响应最多 65,536 bytes；任何 call/item 对象都远大于 16 bytes，
 # 因而取最近 4,096+1 条足以覆盖所有可能进入单次响应的完整条目。
 DETAIL_CANDIDATE_LIMIT = 4096
@@ -25,7 +25,7 @@ _TASK_ID = re.compile(r"tsk_[0-9a-f]{32}")
 _CALL_ID = re.compile(r"req_[A-Za-z0-9_-]{1,64}")
 _ITEM_ID = re.compile(r"itm_[a-z2-7]{32}")
 _BUNDLE_KEY = re.compile(r"bnd_[0-9a-f]{40}")
-_GENERATION = re.compile(r"gen_[0-9a-f]{20}")
+_INDEX_ID = re.compile(r"idx_[0-9a-f]{20}")
 _OWNER_KEY = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
 _DDL = """
@@ -33,7 +33,7 @@ CREATE TABLE tasks (
     task_id TEXT PRIMARY KEY,
     owner_key TEXT NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('active', 'blocked')),
-    generation TEXT,
+    index_id TEXT,
     search_limit INTEGER NOT NULL CHECK (search_limit > 0),
     read_limit INTEGER NOT NULL CHECK (read_limit > 0),
     evidence_token_limit INTEGER NOT NULL CHECK (evidence_token_limit > 0),
@@ -260,10 +260,6 @@ class ExecutionLedgerStore:
                         if statement.strip():
                             connection.execute(statement)
                     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-                elif version == 1:
-                    connection.execute("ALTER TABLE task_items ADD COLUMN source_title TEXT")
-                    connection.execute("ALTER TABLE task_items ADD COLUMN heading_path_json TEXT")
-                    connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 elif version != SCHEMA_VERSION:
                     raise ValueError("ledger schema version is unsupported")
                 connection.commit()
@@ -323,7 +319,7 @@ class ExecutionLedgerStore:
             "task_id": task["task_id"],
             "call_id": call_id,
             "task_state": task["state"],
-            "generation": task["generation"],
+            "index_id": task["index_id"],
             "search_calls": values["search_calls"],
             "read_calls": values["read_calls"],
             "estimated_evidence_tokens": known,
@@ -380,7 +376,7 @@ class ExecutionLedgerStore:
 
     def _admission_common(
         self, connection: sqlite3.Connection, owner_key: str, task_id: str,
-        operation: str, cap: int, current_generation: str,
+        operation: str, cap: int, current_index_id: str,
     ) -> tuple[sqlite3.Row, int]:
         task = self._task(connection, owner_key, task_id)
         if task["state"] != "active":
@@ -397,15 +393,15 @@ class ExecutionLedgerStore:
         ).fetchone()
         if unresolved:
             raise LedgerFailure("task_busy")
-        if task["generation"] is not None and task["generation"] != current_generation:
+        if task["index_id"] is not None and task["index_id"] != current_index_id:
             connection.execute(
-                "UPDATE tasks SET state = 'blocked', blocked_category = 'generation_mismatch' WHERE task_id = ?",
+                "UPDATE tasks SET state = 'blocked', blocked_category = 'index_mismatch' WHERE task_id = ?",
                 (task_id,),
             )
             connection.commit()
             raise LedgerFailure(
                 "task_blocked",
-                details={"blocked_category": "generation_mismatch", "retryable": False},
+                details={"blocked_category": "index_mismatch", "retryable": False},
             )
         count = connection.execute(
             "SELECT COUNT(*) FROM calls WHERE task_id = ? AND operation = ?",
@@ -432,7 +428,7 @@ class ExecutionLedgerStore:
     def admit_search(
         self, owner_key: str, task_id: str, call_id: str, *, queries: tuple[str, ...],
         query_keys: tuple[str, ...], scopes: tuple[str, ...], result_limit: int,
-        cap: int, current_generation: str,
+        cap: int, current_index_id: str,
     ) -> dict:
         if not isinstance(call_id, str) or _CALL_ID.fullmatch(call_id) is None:
             raise LedgerFailure("ledger_unavailable")
@@ -441,7 +437,7 @@ class ExecutionLedgerStore:
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 task, _ = self._admission_common(
-                    connection, owner_key, task_id, "search", cap, current_generation,
+                    connection, owner_key, task_id, "search", cap, current_index_id,
                 )
                 if connection.execute(
                     "SELECT 1 FROM calls WHERE task_id = ? AND operation = 'search' AND search_key = ?",
@@ -463,7 +459,7 @@ class ExecutionLedgerStore:
                      result_limit, search_key, cap, _now()),
                 )
                 connection.commit()
-                return {"generation": task["generation"]}
+                return {"index_id": task["index_id"]}
         except LedgerFailure:
             raise
         except sqlite3.IntegrityError as exc:
@@ -473,7 +469,7 @@ class ExecutionLedgerStore:
 
     def admit_read(
         self, owner_key: str, task_id: str, call_id: str, *, seed_item_id: str,
-        cap: int, current_generation: str,
+        cap: int, current_index_id: str,
     ) -> dict:
         if not isinstance(call_id, str) or _CALL_ID.fullmatch(call_id) is None:
             raise LedgerFailure("ledger_unavailable")
@@ -481,7 +477,7 @@ class ExecutionLedgerStore:
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 task, _ = self._admission_common(
-                    connection, owner_key, task_id, "read_bundle", cap, current_generation,
+                    connection, owner_key, task_id, "read_bundle", cap, current_index_id,
                 )
                 candidate = connection.execute(
                     """
@@ -496,7 +492,7 @@ class ExecutionLedgerStore:
                     """,
                     (task_id, seed_item_id),
                 ).fetchone()
-                if candidate is None or task["generation"] is None:
+                if candidate is None or task["index_id"] is None:
                     raise LedgerFailure("seed_not_available")
                 if connection.execute(
                     "SELECT 1 FROM calls WHERE task_id = ? AND operation = 'read_bundle' AND seed_item_id = ?",
@@ -517,7 +513,7 @@ class ExecutionLedgerStore:
                     (call_id, task_id, sequence, cap, _now(), seed_item_id, candidate["bundle_key"]),
                 )
                 connection.commit()
-                return {"generation": task["generation"], "bundle_key": candidate["bundle_key"]}
+                return {"index_id": task["index_id"], "bundle_key": candidate["bundle_key"]}
         except LedgerFailure:
             raise
         except sqlite3.IntegrityError as exc:
@@ -575,11 +571,11 @@ class ExecutionLedgerStore:
                 task = connection.execute(
                     "SELECT * FROM tasks WHERE task_id = ?", (call["task_id"],),
                 ).fetchone()
-                generation = response.get("generation")
+                index_id = response.get("index_id")
                 if (
                     response.get("request_id") != call_id
-                    or not isinstance(generation, str) or _GENERATION.fullmatch(generation) is None
-                    or task["generation"] is not None and task["generation"] != generation
+                    or not isinstance(index_id, str) or _INDEX_ID.fullmatch(index_id) is None
+                    or task["index_id"] is not None and task["index_id"] != index_id
                 ):
                     raise _IntegrityFailure
                 if call["operation"] == "search":
@@ -626,8 +622,8 @@ class ExecutionLedgerStore:
                          _compact(missing), call_id),
                     )
                 connection.execute(
-                    "UPDATE tasks SET generation = COALESCE(generation, ?) WHERE task_id = ?",
-                    (generation, call["task_id"]),
+                    "UPDATE tasks SET index_id = COALESCE(index_id, ?) WHERE task_id = ?",
+                    (index_id, call["task_id"]),
                 )
                 connection.execute(
                     """
@@ -818,7 +814,7 @@ class ExecutionLedgerStore:
                 result = {
                     "task_id": task_id,
                     "task_state": task["state"],
-                    "generation": task["generation"],
+                    "index_id": task["index_id"],
                     "blocked_category": task["blocked_category"],
                     "limits": {
                         "search_calls": task["search_limit"],

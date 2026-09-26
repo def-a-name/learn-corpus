@@ -17,8 +17,8 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from src.retrieval.build_lexical_index import (  # noqa: E402
     build_database,
-    build_generation,
-    publish_generation,
+    build_index,
+    publish_index,
 )
 from src.retrieval.contracts import (  # noqa: E402
     CHUNK_POLICY_VERSION,
@@ -27,10 +27,11 @@ from src.retrieval.contracts import (  # noqa: E402
     ProjectionResult,
     SourceSnapshot,
 )
-from src.retrieval.generation import (  # noqa: E402
+from src.retrieval.index_artifact import (  # noqa: E402
     LexicalBuildError,
-    generation_id,
+    index_id_from_digest,
     open_immutable_database,
+    validate_index_artifact,
 )
 from src.retrieval.lexical_query import compile_lexical_query  # noqa: E402
 from src.retrieval.project_items import (  # noqa: E402
@@ -213,28 +214,30 @@ class TestLexicalIndexBuilder:
             finally:
                 connection.close()
 
-    def test_content_addressed_generation_is_idempotently_reused(self) -> None:
+    def test_content_addressed_index_is_idempotently_reused(self) -> None:
         item = make_item("note", "note", "body", title="Title")
         projection = fixture_projection(item)
-        expected_generation = "gen_" + "b" * 20
+        expected_index_id = "idx_" + "b" * 20
         with tempfile.TemporaryDirectory() as temp:
             retrieval_root = Path(temp) / "retrieval"
-            first = build_generation(
+            first = build_index(
                 projection,
                 retrieval_root,
                 built_at="2026-09-02T01:02:03Z",
             )
             manifest_before = first.manifest_path.read_bytes()
-            second = build_generation(
+            second = build_index(
                 projection,
                 retrieval_root,
                 built_at="2026-09-02T09:09:09Z",
             )
             manifest_after = second.manifest_path.read_bytes()
             manifest = json.loads(manifest_after.decode("utf-8"))
+            assert first.index_path == retrieval_root / expected_index_id
+            assert {path.name for path in retrieval_root.iterdir()} == {expected_index_id}
 
-        assert generation_id(projection.source_digest) == expected_generation
-        assert first.generation == expected_generation
+        assert index_id_from_digest(projection.source_digest) == expected_index_id
+        assert first.index_id == expected_index_id
         assert not first.reused
         assert second.reused
         assert second.built_at == "2026-09-02T01:02:03Z"
@@ -244,7 +247,7 @@ class TestLexicalIndexBuilder:
         assert manifest["source_digest"] == projection.source_digest
         assert set(manifest) == \
             {
-                "generation",
+                "index_id",
                 "source_digest",
                 "database_sha256",
                 "built_at",
@@ -259,18 +262,38 @@ class TestLexicalIndexBuilder:
                 "estimator_version",
             }
 
-    def test_existing_generation_with_changed_database_fails_closed(self) -> None:
+    def test_existing_index_with_changed_database_fails_closed(self) -> None:
         item = make_item("note", "note", "body", title="Title")
         projection = fixture_projection(item)
         with tempfile.TemporaryDirectory() as temp:
             retrieval_root = Path(temp) / "retrieval"
-            result = build_generation(projection, retrieval_root)
+            result = build_index(projection, retrieval_root)
             with result.database_path.open("ab") as handle:
                 handle.write(b"changed")
             with pytest.raises(LexicalBuildError, match="database hash mismatch"):
-                build_generation(projection, retrieval_root)
+                build_index(projection, retrieval_root)
 
-    def test_publish_preserves_previous_and_same_generation_is_noop(self) -> None:
+    @pytest.mark.parametrize("legacy_part, error", [
+        ("filename", "unexpected files"),
+        ("field", "manifest schema mismatch"),
+        ("id", "identity mismatch"),
+    ])
+    def test_old_artifact_formats_are_rejected(self, tmp_path: Path, legacy_part: str, error: str) -> None:
+        item = make_item("note", "note", "Synthetic calibration body", title="Synthetic title")
+        result = build_index(fixture_projection(item), tmp_path)
+        path = result.index_path
+        if legacy_part == "filename":
+            result.manifest_path.rename(path / "generation.json")
+        elif legacy_part == "field":
+            manifest = json.loads(result.manifest_path.read_text())
+            manifest["generation"] = manifest.pop("index_id")
+            result.manifest_path.write_text(json.dumps(manifest))
+        else:
+            path = path.rename(path.with_name("gen_" + result.index_id.removeprefix("idx_")))
+        with pytest.raises(LexicalBuildError, match=error):
+            validate_index_artifact(path)
+
+    def test_publish_preserves_previous_and_same_index_is_noop(self) -> None:
         first_projection = fixture_projection(
             make_item("one", "note", "first body", title="First", source_id="first")
         )
@@ -282,18 +305,18 @@ class TestLexicalIndexBuilder:
         )
         with tempfile.TemporaryDirectory() as temp:
             retrieval_root = Path(temp) / "retrieval"
-            first = build_generation(first_projection, retrieval_root)
-            second = build_generation(second_projection, retrieval_root)
-            initial = publish_generation(retrieval_root, first.generation)
-            switched = publish_generation(retrieval_root, second.generation)
-            repeated = publish_generation(retrieval_root, second.generation)
+            first = build_index(first_projection, retrieval_root)
+            second = build_index(second_projection, retrieval_root)
+            initial = publish_index(retrieval_root, first.index_id)
+            switched = publish_index(retrieval_root, second.index_id)
+            repeated = publish_index(retrieval_root, second.index_id)
             current_target = (retrieval_root / "current").readlink()
             previous_target = (retrieval_root / "previous").readlink()
 
         assert initial.changed
-        assert initial.previous_generation is None
+        assert initial.previous_index_id is None
         assert switched.changed
-        assert switched.previous_generation == first.generation
+        assert switched.previous_index_id == first.index_id
         assert not repeated.changed
-        assert current_target == Path("generations") / second.generation
-        assert previous_target == Path("generations") / first.generation
+        assert current_target == Path(second.index_id)
+        assert previous_target == Path(first.index_id)

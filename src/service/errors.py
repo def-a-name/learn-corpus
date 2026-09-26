@@ -13,7 +13,7 @@ ERRORS = {
     "rate_limited": (429, "Request limit exceeded"),
     "internal_error": (500, "Internal server error"),
     "item_not_found": (404, "Item not found"),
-    "generation_mismatch": (409, "Requested generation does not match"),
+    "index_mismatch": (409, "Requested index does not match"),
     "index_unavailable": (503, "Index unavailable"),
     "budget_exceeded": (422, "Response budget exceeded"),
     "retrieval_timeout": (408, "Retrieval processing timed out"),

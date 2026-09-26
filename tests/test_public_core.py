@@ -9,10 +9,10 @@ from time import monotonic
 
 import pytest
 
-from src.retrieval.build_lexical_index import build_generation, publish_generation
+from src.retrieval.build_lexical_index import build_index, publish_index
 from src.retrieval.contracts import Item, ItemRelations, ProjectionResult, SourceSnapshot
 from src.retrieval.lexical_store import (
-    BudgetExceededError, GenerationMismatchError, IndexUnavailableError,
+    BudgetExceededError, IndexMismatchError, IndexUnavailableError,
     InvalidRequestError, ItemNotFoundError, LexicalStore,
 )
 from src.retrieval.project_items import stable_item_id
@@ -64,8 +64,8 @@ def open_core(tmp_path):
             item.source_path, "a" * 64, item.source_id, item.scope, 1,
         ) for item in items}
         projection = ProjectionResult(tuple(items), tuple(sources.values()), "sha256:" + "a" * 64)
-        generation = build_generation(projection, root)
-        publish_generation(root, generation.generation)
+        index_id = build_index(projection, root)
+        publish_index(root, index_id.index_id)
         store = LexicalStore.open_current(root)
         stores.append(store)
         return RetrievalCore(store, RequestLimits(timeout_ms))
@@ -77,7 +77,7 @@ def open_core(tmp_path):
 
 def read(core, item, **kwargs):
     return core.read_bundle({
-        "seed_item_id": item.item_id, "generation": core.store.generation, **kwargs,
+        "seed_item_id": item.item_id, "index_id": core.store.index_id, **kwargs,
     }, request_id="req_synthetic")
 
 
@@ -134,8 +134,8 @@ def test_public_whitelist_and_exact_serialized_usage(open_core):
             assert not {"provider", "session_id", "part", "source_id", "body_sha256"} & item.keys()
             assert item["source_title"] == "Codex 会话 · 2025-01-02"
             assert item["heading_path"] is None
-        payload["generation"] = "changed-local-copy"
-        assert response.payload["generation"] == core.store.generation
+        payload["index_id"] = "changed-local-copy"
+        assert response.payload["index_id"] == core.store.index_id
 
 
 @pytest.mark.parametrize("constraint", ["tokens", "bytes"])
@@ -217,10 +217,12 @@ def test_seed_must_fit_and_impossible_minimum_fails(open_core, monkeypatch):
 @pytest.mark.parametrize("values", [
     {"queries": ["quasar"], "extra": 1}, {"queries": "quasar"},
     {"queries": ["quasar"], "scopes": None}, {"queries": ["quasar"], "limit": True},
-    {"queries": ["Straße", "STRASSE"]}, {"queries": ["quasar"], "generation": None},
+    {"queries": ["Straße", "STRASSE"]}, {"queries": ["quasar"], "index_id": None},
     {"queries": ["quasar"], "max_estimated_tokens": 8001},
     {"queries": ["quasar"], "max_estimated_tokens": True},
     {"queries": ["quasar"], "max_estimated_tokens": "100"},
+    {"queries": ["quasar"], "generation": "gen_" + "a" * 20},
+    {"queries": ["quasar"], "index_id": "gen_" + "a" * 20},
 ])
 def test_public_search_strict_request_validation(open_core, values):
     core = open_core(parts("note", "A", ("quasar",)))
@@ -228,18 +230,20 @@ def test_public_search_strict_request_validation(open_core, values):
         core.search(values)
 
 
-def test_generation_and_exact_seed_validation_precede_lookup(open_core):
+def test_index_and_exact_seed_validation_precede_lookup(open_core):
     item = parts("note", "A", ("quasar",))[0]
     core = open_core((item,))
-    with pytest.raises(GenerationMismatchError):
-        core.search({"queries": ["quasar"], "generation": "gen_" + "b" * 20})
-    with pytest.raises(GenerationMismatchError):
-        core.read_bundle({"seed_item_id": "itm_" + "b" * 32, "generation": "gen_" + "b" * 20})
+    with pytest.raises(IndexMismatchError):
+        core.search({"queries": ["quasar"], "index_id": "idx_" + "b" * 20})
+    with pytest.raises(IndexMismatchError):
+        core.read_bundle({"seed_item_id": "itm_" + "b" * 32, "index_id": "idx_" + "b" * 20})
     with pytest.raises(ItemNotFoundError):
-        core.read_bundle({"seed_item_id": "itm_" + "b" * 32, "generation": core.store.generation})
+        core.read_bundle({"seed_item_id": "itm_" + "b" * 32, "index_id": core.store.index_id})
     for invalid in ({"seed_item_id": item.item_id}, {
-        "seed_item_id": item.item_id, "generation": core.store.generation, "path": item.source_path,
-    }, {"seed_item_id": item.source_path, "generation": core.store.generation}):
+        "seed_item_id": item.item_id, "index_id": core.store.index_id, "path": item.source_path,
+    }, {"seed_item_id": item.source_path, "index_id": core.store.index_id}, {
+        "seed_item_id": item.item_id, "generation": "gen_" + "a" * 20,
+    }):
         with pytest.raises(InvalidRequestError):
             core.read_bundle(invalid)
 
@@ -250,8 +254,8 @@ def test_corrupt_relations_or_body_fail_without_partial_evidence(open_core, monk
     core = open_core(items)
     original = core.store.read_canonical_item
 
-    def damaged(item_id, generation, **kwargs):
-        item = original(item_id, generation, **kwargs)
+    def damaged(item_id, index_id, **kwargs):
+        item = original(item_id, index_id, **kwargs)
         if item_id != items[0].item_id:
             return item
         if damage == "cycle":
@@ -420,7 +424,7 @@ def test_python_processing_allows_another_database_read(open_core, monkeypatch, 
         first = pool.submit(operation)
         try:
             assert entered.wait(1)
-            second = pool.submit(core.store.read_canonical_item, item.item_id, core.store.generation,
+            second = pool.submit(core.store.read_canonical_item, item.item_id, core.store.index_id,
                                  deadline=monotonic() + 0.5)
             assert second.result(timeout=1).item_id == item.item_id
         finally:
@@ -450,7 +454,7 @@ def test_bundle_reads_share_one_absolute_deadline(open_core, monkeypatch):
         read(core, items[0])
     assert len(deadlines) == 2
     assert deadlines[0] == deadlines[1] == 100.1
-    assert core.status().payload["generation"] == core.store.generation
+    assert core.status().payload["index_id"] == core.store.index_id
 
 
 def test_prepared_requests_copy_inputs_and_reject_other_core_or_operation(open_core):

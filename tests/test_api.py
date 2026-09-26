@@ -42,7 +42,7 @@ def config(open_core, tmp_path):
     }]))
     credentials.chmod(0o600)
     return HttpConfig(
-        corpus_path=core.store._generation_path.parent.parent, credentials_file=credentials,
+        corpus_path=core.store._index_path.parent, credentials_file=credentials,
         allowed_peers=("192.0.2.2", "127.0.0.1"),
         allowed_hosts=("service.test",), allowed_origins=("https://client.test",),
         corpus_timeout_ms=5000,
@@ -82,7 +82,7 @@ def test_search_bundle_status_and_core_json_match(config):
         expected = client.app.state.core.search(query, request_id=payload["request_id"])
         assert response.content == expected.json_bytes
         seed = payload["results"][0]
-        request = {"seed_item_id": seed["item_id"], "generation": payload["generation"]}
+        request = {"seed_item_id": seed["item_id"], "index_id": payload["index_id"]}
         bundle = client.post("/v1/read-bundle", json=request, headers=HEADERS)
         expected = client.app.state.core.read_bundle(request, request_id=bundle.json()["request_id"])
         assert bundle.content == expected.json_bytes
@@ -156,7 +156,7 @@ def test_swagger_schema_and_authenticated_browser_flow(config):
         assert schemas["SearchRequest"]["required"] == ["queries"]
         assert schemas["SearchRequest"]["additionalProperties"] is False
         assert schemas["SearchRequest"]["properties"]["queries"]["maxItems"] == 6
-        assert schemas["ReadBundleRequest"]["required"] == ["seed_item_id", "generation"]
+        assert schemas["ReadBundleRequest"]["required"] == ["seed_item_id", "index_id"]
         assert TOKEN not in response.text and str(config.corpus_path) not in response.text
         assert str(config.credentials_file) not in response.text
 
@@ -170,7 +170,7 @@ def test_swagger_schema_and_authenticated_browser_flow(config):
         seed = search.json()["results"][0]
         assert set(seed) == set(schemas["SearchResult"]["required"])
         bundle = client.post("/v1/read-bundle", headers=authorized, json={
-            "seed_item_id": seed["item_id"], "generation": search.json()["generation"],
+            "seed_item_id": seed["item_id"], "index_id": search.json()["index_id"],
         })
         assert bundle.status_code == 200
         assert set(bundle.json()) == set(schemas["ReadBundleResponse"]["required"])
@@ -248,10 +248,10 @@ def test_forwarded_for_is_ignored_and_connection_peer_controls_access(config):
 
 def test_core_errors_and_unexpected_errors_are_sanitized_and_logged(config, monkeypatch, caplog):
     with client_for(config) as client:
-        mismatch = client.post("/v1/search", json={"queries": ["quasar"], "generation": "gen_" + "b" * 20}, headers=HEADERS)
-        assert_error(mismatch, 409, "generation_mismatch")
+        mismatch = client.post("/v1/search", json={"queries": ["quasar"], "index_id": "idx_" + "b" * 20}, headers=HEADERS)
+        assert_error(mismatch, 409, "index_mismatch")
         missing = client.post("/v1/read-bundle", json={"seed_item_id": "itm_" + "b" * 32,
-                                                     "generation": "gen_" + "a" * 20}, headers=HEADERS)
+                                                     "index_id": "idx_" + "a" * 20}, headers=HEADERS)
         assert_error(missing, 404, "item_not_found")
         budget = client.post("/v1/search", json={"queries": ["quasar"], "max_estimated_tokens": 1}, headers=HEADERS)
         assert_error(budget, 422, "budget_exceeded")
@@ -303,7 +303,7 @@ def test_lifespan_closes_store_and_rejects_bad_credentials_or_index(config):
     with client_for(config) as client:
         store = client.app.state.core.store
     with pytest.raises(IndexUnavailableError):
-        store.read_item(exchange()[0].item_id, store.generation)
+        store.read_item(exchange()[0].item_id, store.index_id)
     config.credentials_file.chmod(0o644)
     with pytest.raises(ValueError, match="cannot load credential"):
         with client_for(config):
@@ -652,13 +652,13 @@ def test_search_compiles_each_query_once_across_entry_and_core(config, monkeypat
 def test_sequential_requests_have_no_rate_budget(config):
     with client_for(config) as client:
         seed = exchange()[0].item_id
-        generation = client.app.state.core.store.generation
+        index_id = client.app.state.core.store.index_id
         for _ in range(3):
             assert_error(client.get("/v1/status"),
                          401, "unauthorized")
             assert client.get("/healthz", headers=HEADERS).status_code == 200
             response = client.post("/v1/read-bundle", headers=HEADERS,
-                                   json={"seed_item_id": seed, "generation": generation})
+                                   json={"seed_item_id": seed, "index_id": index_id})
             assert response.status_code == 200
         assert client.app.state.admissions._total == 0
 
