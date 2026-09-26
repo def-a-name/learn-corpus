@@ -161,7 +161,10 @@ def test_cli_only_accepts_required_config(monkeypatch, capsys, tmp_path: Path) -
             deployment.main()
 
 
-@pytest.mark.parametrize("run_id, expected", [("latest", None), (RUN_ID, RUN_ID)])
+@pytest.mark.parametrize("run_id, expected", [
+    ("latest", None), (RUN_ID, RUN_ID), (str(RUN_ID), RUN_ID),
+    ("12345", 12345), ("0012345", 12345),
+])
 def test_deployment_config_selects_run_and_resolves_paths(tmp_path: Path, run_id, expected) -> None:
     config_path = tmp_path / "config" / "deploy.json"
     config_path.parent.mkdir()
@@ -176,6 +179,7 @@ def test_deployment_config_selects_run_and_resolves_paths(tmp_path: Path, run_id
     assert parsed.service_config == tmp_path / "service.json"
     assert parsed.github_header_file == config_path.parent / "header"
     assert parsed.run_id == expected
+    assert parsed.run_id is None or type(parsed.run_id) is int
 
 
 def test_deployment_example_points_to_unusable_header_example(tmp_path: Path) -> None:
@@ -192,7 +196,18 @@ def test_deployment_example_points_to_unusable_header_example(tmp_path: Path) ->
 @pytest.mark.parametrize("extra, message", [
     ({"run_id": True}, "run_id"),
     ({"run_id": 0}, "run_id"),
-    ({"run_id": "12345"}, "run_id"),
+    ({"run_id": -1}, "run_id"),
+    ({"run_id": 12345.0}, "run_id"),
+    ({"run_id": "0"}, "run_id"),
+    ({"run_id": "000"}, "run_id"),
+    ({"run_id": "-12345"}, "run_id"),
+    ({"run_id": "+12345"}, "run_id"),
+    ({"run_id": "12345.0"}, "run_id"),
+    ({"run_id": " 12345"}, "run_id"),
+    ({"run_id": "12345\n"}, "run_id"),
+    ({"run_id": "１２３４５"}, "run_id"),
+    ({"run_id": ""}, "run_id"),
+    ({"run_id": "invalid"}, "run_id"),
     ({"status_url": "https://service.example.test/v1/status"}, "unknown fields"),
     ({"unknown": "value"}, "unknown fields"),
 ])
@@ -443,7 +458,7 @@ def _stub_deployment(monkeypatch, retrieval_root: Path, *, run_id: int | None = 
 
 
 @pytest.mark.parametrize("selected_run", [RUN_ID, None])
-def test_incompatible_generation_leaves_links_unchanged(tmp_path: Path, monkeypatch, selected_run) -> None:
+def test_incompatible_generation_leaves_links_unchanged(tmp_path: Path, monkeypatch, selected_run, capsys) -> None:
     root = tmp_path / "retrieval"
     (root / "generations").mkdir(parents=True)
     for name in ("current", "previous"):
@@ -468,9 +483,76 @@ def test_incompatible_generation_leaves_links_unchanged(tmp_path: Path, monkeypa
     assert (root / "current").readlink().name == "gen_current"
     assert (root / "previous").readlink().name == "gen_previous"
     assert selected == (["synthetic-token"] if selected_run is None else [])
+    output = capsys.readouterr().out
+    assert "Checking generation" in output
+    assert "Switching current" not in output
+    assert "Restarting" not in output
 
 
-def test_failed_restart_restores_previous_links(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("installation", ["new", "existing", "current"])
+def test_deployment_reports_progress_without_credentials(tmp_path: Path, monkeypatch, capsys, installation) -> None:
+    root = tmp_path / "retrieval"
+    generations = root / "generations"
+    generations.mkdir(parents=True)
+    current = GENERATION if installation == "current" else "gen_current"
+    for name in (current, "gen_previous"):
+        (generations / name).mkdir(exist_ok=True)
+    if installation == "existing":
+        (generations / GENERATION).mkdir()
+    (root / "current").symlink_to(f"generations/{current}")
+    (root / "previous").symlink_to("generations/gen_previous")
+    _stub_deployment(monkeypatch, root)
+
+    def extract(_archive, temporary, _run_id, _run_attempt, _commit):
+        staged = temporary / GENERATION
+        staged.mkdir()
+        (staged / "generation.json").write_text("{}")
+        return {"generation": GENERATION}, staged
+
+    monkeypatch.setattr(deployment, "_extract_release", extract)
+    monkeypatch.setattr(deployment, "validate_generation_artifact", lambda *args, **kwargs: {})
+    monkeypatch.setattr(deployment, "_status_token", lambda path: "synthetic-status-token")
+    monkeypatch.setattr(deployment.pwd, "getpwnam", lambda name: SimpleNamespace(pw_uid=12345, pw_gid=12345))
+    monkeypatch.setattr(deployment.grp, "getgrgid", lambda gid: SimpleNamespace(gr_gid=gid))
+    monkeypatch.setattr(deployment.os, "chown", lambda *args: None)
+    monkeypatch.setattr(deployment.os, "chmod", lambda *args: None)
+    monkeypatch.setattr(deployment.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=0))
+    monkeypatch.setattr(deployment, "_status", lambda *args: {"generation": (root / "current").readlink().name})
+
+    def publish(retrieval_root, generation):
+        deployment._replace_link(retrieval_root / "previous", (retrieval_root / "current").readlink())
+        deployment._replace_link(retrieval_root / "current", Path("generations") / generation)
+
+    monkeypatch.setattr(deployment, "publish_generation", publish)
+    result = deployment.deploy(tmp_path / "deploy.json")
+    assert (root / "current").readlink().name == GENERATION
+    output = capsys.readouterr().out
+    assert "synthetic-token" not in output
+    assert "synthetic-status-token" not in output
+    assert str(tmp_path) not in output
+    assert f"run {RUN_ID}, attempt {RUN_ATTEMPT}, commit {COMMIT}" in output
+    stages = [
+        "Loading deployment", "Checking workflow run", "Checking generation artifact", "Downloading artifact",
+        "SHA-256 verified", "Extracting and validating", f"Checking generation {GENERATION}",
+    ]
+    if installation == "current":
+        stages.append("Generation is already current")
+        assert "already current" in result
+        assert "Switching current" not in output
+        assert "Restarting" not in output
+    else:
+        stages.extend([
+            "Installing generation" if installation == "new" else "Generation is already installed",
+            "Checking current service", "Switching current", "Restarting the HTTP service",
+            "Waiting for the service", "New generation verified",
+        ])
+        assert (root / "previous").readlink().name == "gen_current"
+    positions = [output.index(stage) for stage in stages]
+    assert positions == sorted(positions)
+
+
+@pytest.mark.parametrize("rollback_fails", [False, True])
+def test_failed_restart_restores_previous_links(tmp_path: Path, monkeypatch, capsys, rollback_fails) -> None:
     root = tmp_path / "retrieval"
     generations = root / "generations"
     generations.mkdir(parents=True)
@@ -493,8 +575,22 @@ def test_failed_restart_restores_previous_links(tmp_path: Path, monkeypatch) -> 
         deployment, "_restart_and_wait", lambda *args: (_ for _ in ()).throw(RuntimeError("synthetic restart failure"))
     )
     monkeypatch.setattr(deployment.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=0))
-    monkeypatch.setattr(deployment, "_restart_status_check", lambda *args: None)
-    with pytest.raises(RuntimeError, match="previous generation restored"):
+    def rollback_check(*args):
+        if rollback_fails:
+            raise RuntimeError("synthetic rollback failure")
+
+    monkeypatch.setattr(deployment, "_restart_status_check", rollback_check)
+    expected = "rollback verification failed" if rollback_fails else "previous generation restored"
+    with pytest.raises(RuntimeError, match=expected):
         deployment.deploy(tmp_path / "deploy.json")
     assert (root / "current").readlink().name == "gen_current"
     assert (root / "previous").readlink().name == "gen_previous"
+    output = capsys.readouterr().out
+    assert "Deployment failed; restoring" in output
+    assert "Restarting the HTTP service after rollback" in output
+    assert "Waiting for the service to report the restored generation" in output
+    assert "New generation verified" not in output
+    assert ("Rollback verified" in output) is not rollback_fails
+    assert ("Rollback verification failed" in output) is rollback_fails
+    assert "synthetic-token" not in output
+    assert "synthetic-status-token" not in output

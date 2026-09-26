@@ -67,6 +67,12 @@ class LocalStatusTarget:
     host_header: str
 
 
+def _progress(message: str) -> None:
+    """立即输出部署进度，重定向 stdout 时也不等待缓冲区刷新。"""
+
+    print(f"[deploy] {message}", flush=True)
+
+
 def load_deployment_config(path: Path) -> DeploymentConfig:
     """严格读取部署配置，相对路径以该文件所在目录为基准。"""
 
@@ -94,8 +100,11 @@ def load_deployment_config(path: Path) -> DeploymentConfig:
     run_id = value.get("run_id", "latest")
     if run_id == "latest":
         run_id = None
-    elif type(run_id) is not int or run_id < 1:
-        raise ValueError("deployment run_id must be a positive integer or latest")
+    else:
+        if isinstance(run_id, str) and re.fullmatch(r"[0-9]+", run_id):
+            run_id = int(run_id)
+        if type(run_id) is not int or run_id < 1:
+            raise ValueError("deployment run_id must be a positive integer, a positive integer digit string, or latest")
     return DeploymentConfig(
         service_config=config_path("service_config"),
         github_header_file=config_path("github_header_file"),
@@ -175,6 +184,7 @@ def _latest_run_id(token: str) -> int:
 
     latest: tuple[datetime, int] | None = None
     for page in range(1, MAX_RUN_PAGES + 1):
+        _progress(f"Checking successful workflow runs (page {page}).")
         url = (
             f"{API_ROOT}/actions/workflows/build-generation.yml/runs"
             f"?branch=main&status=success&per_page={RUNS_PER_PAGE}&page={page}"
@@ -334,7 +344,9 @@ def _status(target: LocalStatusTarget, token: str) -> dict:
 
 
 def _restart_and_wait(service: str, target: LocalStatusTarget, token: str, generation: str) -> None:
+    _progress("Restarting the HTTP service.")
     subprocess.run(["systemctl", "restart", service], check=True)
+    _progress("Waiting for the service to report the new generation.")
     for _ in range(12):
         try:
             response = _status(target, token)
@@ -351,6 +363,7 @@ def deploy(config_path: Path) -> str:
 
     if os.geteuid() != 0:
         raise ValueError("deployment must run as root")
+    _progress("Loading deployment configuration and checking local prerequisites.")
     deployment = load_deployment_config(config_path)
     selected = load_service_config(deployment.service_config)
     if selected.transport != "http":
@@ -360,19 +373,27 @@ def deploy(config_path: Path) -> str:
     token = _github_token(deployment.github_header_file)
     run_id = deployment.run_id
     if run_id is None:
+        _progress("Selecting the latest successful main workflow run.")
         run_id = _latest_run_id(token)
+    _progress(f"Checking workflow run {run_id}.")
     run = _request(f"{API_ROOT}/actions/runs/{run_id}", token)
     commit, run_attempt = _check_run(run, run_id)
+    _progress(f"Workflow run verified: run {run_id}, attempt {run_attempt}, commit {commit}.")
+    _progress("Checking generation artifact metadata.")
     artifacts = _request(f"{API_ROOT}/actions/runs/{run_id}/artifacts?per_page=100", token)
     artifact_id, artifact_digest = _check_artifacts(artifacts, run_id, run_attempt, commit)
+    _progress(f"Downloading artifact {artifact_id}.")
     archive = _request(f"{API_ROOT}/actions/artifacts/{artifact_id}/zip", token, binary=True)
     if f"sha256:{hashlib.sha256(archive).hexdigest()}" != artifact_digest:
         raise ValueError("downloaded artifact archive hash mismatch")
+    _progress(f"Archive downloaded and SHA-256 verified ({len(archive)} bytes).")
     with tempfile.TemporaryDirectory(prefix=".release-", dir=retrieval_root) as temporary:
+        _progress("Extracting and validating release metadata and generation files.")
         release, staged = _extract_release(archive, Path(temporary), run_id, run_attempt, commit)
         generation = release["generation"]
         target = retrieval_root / "generations" / generation
         # 本机版本验证必须在触碰 current/previous 前完成。
+        _progress(f"Checking generation {generation} against local code.")
         validate_generation_artifact(staged, expected_generation=generation)
         old_current_link = retrieval_root / "current"
         old_previous_link = retrieval_root / "previous"
@@ -382,13 +403,16 @@ def deploy(config_path: Path) -> str:
         old_previous = old_previous_link.readlink()
         status_token = _status_token(selected.runtime.credentials_file)
         if old_current.name == generation:
+            _progress("Generation is already current; verifying installed files and running service.")
             validate_generation_artifact(old_current_link.resolve(strict=True), expected_generation=generation)
             if _status(status_target, status_token).get("generation") != generation:
                 raise RuntimeError("current link matches but running service has a different generation")
             return f"Generation {generation} is already current (run {run_id}, attempt {run_attempt}, commit {commit})"
         if target.exists() or target.is_symlink():
+            _progress("Generation is already installed; validating existing files.")
             validate_generation_artifact(target, expected_generation=generation)
         else:
+            _progress("Installing generation files and setting service account permissions.")
             identity = pwd.getpwnam(deployment.service_user)
             group = grp.getgrgid(identity.pw_gid)
             os.chown(staged, identity.pw_uid, group.gr_gid)
@@ -398,20 +422,28 @@ def deploy(config_path: Path) -> str:
                 os.chmod(child, 0o440)
             os.replace(staged, target)
         # 先确保现有入口可验收，避免在不可观测状态下切换。
+        _progress("Checking current service generation before switching.")
         current_status = _status(status_target, status_token)
         if current_status.get("generation") != old_current.name:
             raise RuntimeError("running service generation does not match current link")
         try:
+            _progress(f"Switching current to {generation} and preserving the previous generation.")
             publish_generation(retrieval_root, generation)
             _restart_and_wait(deployment.service, status_target, status_token, generation)
+            _progress("New generation verified through authenticated local service status.")
         except Exception as exc:
+            _progress("Deployment failed; restoring the original current and previous links.")
             _replace_link(old_current_link, old_current)
             _replace_link(old_previous_link, old_previous)
             try:
+                _progress("Restarting the HTTP service after rollback.")
                 subprocess.run(["systemctl", "restart", deployment.service], check=True)
+                _progress("Waiting for the service to report the restored generation.")
                 _restart_status_check(status_target, status_token, old_current.name)
             except Exception as rollback_exc:
+                _progress("Rollback verification failed.")
                 raise RuntimeError("deployment failed and rollback verification failed") from rollback_exc
+            _progress("Rollback verified; the original generation is active.")
             raise RuntimeError("deployment failed; previous generation restored") from exc
     return f"Generation {generation} is current (run {run_id}, attempt {run_attempt}, commit {commit})"
 
