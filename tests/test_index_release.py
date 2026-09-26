@@ -3,9 +3,12 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
+import shutil
 import subprocess
 import sys
 import zipfile
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,6 +21,8 @@ sys.path.insert(0, str(REPO_ROOT))
 from src.maintenance import deploy_index as deployment  # noqa: E402
 from src.maintenance.build_release import _validate_assets, build_release  # noqa: E402
 from src.corpus.document import yaml_document  # noqa: E402
+from src.retrieval.build_lexical_index import build_index, publish_index  # noqa: E402
+from test_build_lexical_index import fixture_projection, make_item  # noqa: E402
 
 
 COMMIT = "a" * 40
@@ -275,6 +280,7 @@ def test_status_connects_directly_to_loopback_with_allowed_host(monkeypatch) -> 
 def test_latest_missing_artifact_does_not_fall_back(tmp_path: Path, monkeypatch) -> None:
     root = tmp_path / "retrieval"
     root.mkdir()
+    (root / CURRENT_INDEX_ID).mkdir()
     (root / "current").symlink_to(CURRENT_INDEX_ID)
     monkeypatch.setattr(deployment.os, "geteuid", lambda: 0)
     monkeypatch.setattr(deployment, "load_deployment_config", lambda path: deployment.DeploymentConfig(
@@ -492,6 +498,7 @@ def test_incompatible_index_leaves_links_unchanged(tmp_path: Path, monkeypatch, 
     root = tmp_path / "retrieval"
     root.mkdir(parents=True)
     for name, index_id in (("current", CURRENT_INDEX_ID), ("previous", PREVIOUS_INDEX_ID)):
+        (root / index_id).mkdir()
         (root / name).symlink_to(index_id)
     _stub_deployment(monkeypatch, root, run_id=selected_run)
     selected = []
@@ -544,7 +551,7 @@ def test_deployment_reports_progress_without_credentials(tmp_path: Path, monkeyp
     monkeypatch.setattr(deployment.pwd, "getpwnam", lambda name: SimpleNamespace(pw_uid=12345, pw_gid=12345))
     monkeypatch.setattr(deployment.grp, "getgrgid", lambda gid: SimpleNamespace(gr_gid=gid))
     monkeypatch.setattr(deployment.os, "chown", lambda *args: None)
-    monkeypatch.setattr(deployment.os, "chmod", lambda *args: None)
+    monkeypatch.setattr(deployment.os, "chmod", lambda *args, **kwargs: None)
     monkeypatch.setattr(deployment.subprocess, "run", lambda *args, **kwargs: SimpleNamespace(returncode=0))
     monkeypatch.setattr(deployment, "_status", lambda *args: {"index_id": (root / "current").readlink().name})
 
@@ -558,6 +565,7 @@ def test_deployment_reports_progress_without_credentials(tmp_path: Path, monkeyp
     output = capsys.readouterr().out
     assert "synthetic-token" not in output
     assert "synthetic-status-token" not in output
+
     assert str(tmp_path) not in output
     assert f"run {RUN_ID}, attempt {RUN_ATTEMPT}, commit {COMMIT}" in output
     stages = [
@@ -570,9 +578,13 @@ def test_deployment_reports_progress_without_credentials(tmp_path: Path, monkeyp
         assert "Switching current" not in output
         assert "Restarting" not in output
     else:
+        if installation == "existing":
+            stages.append("Retrieval index is already installed")
+        stages.append("Checking current service")
+        if installation == "new":
+            stages.append("Installing index")
         stages.extend([
-            "Installing index" if installation == "new" else "Retrieval index is already installed",
-            "Checking current service", "Switching current", "Restarting the HTTP service",
+            "Switching current", "Restarting the HTTP service",
             "Waiting for the service", "New index verified",
         ])
         assert (root / "previous").readlink() == Path(CURRENT_INDEX_ID)
@@ -580,14 +592,373 @@ def test_deployment_reports_progress_without_credentials(tmp_path: Path, monkeyp
     assert positions == sorted(positions)
 
 
+@pytest.fixture
+def ready_deployment(tmp_path: Path, monkeypatch):
+    root = tmp_path / "synthetic-corpus"
+    root.mkdir()
+    projection = fixture_projection(make_item(
+        "deployment", "note", "A fictional telescope uses a synthetic calibration index.",
+        title="Synthetic deployment",
+    ))
+    artifact = build_index(projection, tmp_path / "synthetic-artifact")
+    metadata = {
+        "version": 2, "repository": deployment.REPOSITORY, "ref": deployment.REF,
+        "commit": COMMIT, "run_id": RUN_ID, "run_attempt": RUN_ATTEMPT,
+        "index_id": artifact.index_id, "source_digest": artifact.source_digest,
+        "database_sha256": artifact.database_sha256,
+    }
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("release.json", json.dumps(metadata))
+        for path in artifact.index_path.iterdir():
+            archive.write(path, f"{artifact.index_id}/{path.name}")
+    data = buffer.getvalue()
+    _stub_deployment(monkeypatch, root)
+    monkeypatch.setattr(deployment, "_request", lambda url, token, binary=False: data if binary else {})
+    monkeypatch.setattr(deployment, "_check_artifacts", lambda *args: (
+        987, "sha256:" + hashlib.sha256(data).hexdigest(),
+    ))
+    monkeypatch.setattr(deployment, "_status_token", lambda path: "synthetic-status-token")
+    monkeypatch.setattr(deployment.pwd, "getpwnam", lambda name: SimpleNamespace(pw_uid=12345, pw_gid=12345))
+    monkeypatch.setattr(deployment.grp, "getgrgid", lambda gid: SimpleNamespace(gr_gid=gid))
+    monkeypatch.setattr(deployment.os, "chown", lambda *args: None)
+    monkeypatch.setattr(deployment.os, "chmod", lambda *args, **kwargs: None)
+    commands = []
+
+    def run(args, **kwargs):
+        commands.append(tuple(args))
+        return SimpleNamespace(returncode=0)
+
+    def status(*args):
+        assert (root / "current").is_symlink(), "Status was requested before initial publication"
+        return {"index_id": (root / "current").resolve(strict=True).name}
+
+    monkeypatch.setattr(deployment.subprocess, "run", run)
+    monkeypatch.setattr(deployment, "_status", status)
+    monkeypatch.setattr(deployment.time, "sleep", lambda seconds: None)
+    return SimpleNamespace(
+        root=root, artifact=artifact, projection=projection, commands=commands,
+        config=tmp_path / "synthetic-deploy.json",
+    )
+
+
+def test_empty_corpus_deployment_creates_only_current(ready_deployment, capsys) -> None:
+    ready = ready_deployment
+    result = deployment.deploy(ready.config)
+    assert {path.name for path in ready.root.iterdir()} == {INDEX_ID, "current"}
+    assert (ready.root / "current").readlink() == Path(INDEX_ID)
+    assert ready.commands == [("systemctl", "restart", "synthetic-service")]
+    assert (ready.root / INDEX_ID / "corpus.sqlite").read_bytes() == ready.artifact.database_path.read_bytes()
+    assert INDEX_ID in result
+    output = capsys.readouterr().out
+    assert "Preparing initial deployment" in output
+    assert "Creating current" in output
+    assert "Checking current service" not in output
+    assert "synthetic-status-token" not in output
+
+
+def test_current_only_deployment_creates_previous(ready_deployment) -> None:
+    ready = ready_deployment
+    original = build_index(replace(ready.projection, source_digest="sha256:" + "d" * 64), ready.root)
+    publish_index(ready.root, original.index_id)
+    deployment.deploy(ready.config)
+    assert (ready.root / "current").readlink() == Path(INDEX_ID)
+    assert (ready.root / "previous").readlink() == Path(original.index_id)
+    assert original.database_path.is_file()
+
+
+def test_current_only_same_index_keeps_previous_absent(ready_deployment) -> None:
+    ready = ready_deployment
+    shutil.copytree(ready.artifact.index_path, ready.root / INDEX_ID)
+    publish_index(ready.root, INDEX_ID)
+    result = deployment.deploy(ready.config)
+    assert "already current" in result
+    assert ready.commands == []
+    assert {path.name for path in ready.root.iterdir()} == {INDEX_ID, "current"}
+
+
+@pytest.mark.parametrize("phase", ["download", "digest", "extraction", "credentials"])
+def test_initial_preparation_failure_keeps_corpus_empty(ready_deployment, monkeypatch, phase) -> None:
+    ready = ready_deployment
+
+    def fail(*args, **kwargs):
+        raise ValueError("synthetic preparation failure")
+
+    if phase == "download":
+        monkeypatch.setattr(deployment, "_request", fail)
+    elif phase == "digest":
+        monkeypatch.setattr(deployment, "_check_artifacts", lambda *args: (987, "sha256:" + "0" * 64))
+    elif phase == "extraction":
+        def extract(data, target, *args):
+            (target / "synthetic-partial-file").write_text("Synthetic partial extraction")
+            fail()
+        monkeypatch.setattr(deployment, "_extract_release", extract)
+    else:
+        monkeypatch.setattr(deployment, "_status_token", fail)
+    with pytest.raises(ValueError):
+        deployment.deploy(ready.config)
+    assert list(ready.root.iterdir()) == []
+    assert ready.commands == []
+
+
+@pytest.mark.parametrize("phase", ["permissions", "installation", "publication", "restart", "verification"])
+def test_initial_mutation_failure_restores_empty_corpus(ready_deployment, monkeypatch, capsys, phase) -> None:
+    ready = ready_deployment
+
+    def fail(*args, **kwargs):
+        raise OSError("synthetic deployment failure")
+
+    if phase == "permissions":
+        monkeypatch.setattr(deployment.os, "chmod", fail)
+    elif phase == "installation":
+        real_replace = os.replace
+        def replace_path(source, destination):
+            if destination == ready.root / INDEX_ID:
+                fail()
+            return real_replace(source, destination)
+        monkeypatch.setattr(deployment.os, "replace", replace_path)
+    elif phase == "publication":
+        def publish(root, index_id):
+            publish_index(root, index_id)
+            fail()
+        monkeypatch.setattr(deployment, "publish_index", publish)
+    elif phase == "restart":
+        def run(args, **kwargs):
+            ready.commands.append(tuple(args))
+            if args[1] == "restart":
+                fail()
+            assert (ready.root / "current").is_symlink()
+            return SimpleNamespace(returncode=0)
+        monkeypatch.setattr(deployment.subprocess, "run", run)
+    else:
+        monkeypatch.setattr(deployment, "_status", fail)
+    with pytest.raises(RuntimeError, match="initial deployment failed; corpus directory restored to empty"):
+        deployment.deploy(ready.config)
+    assert list(ready.root.iterdir()) == []
+    expected = [] if phase in ("permissions", "installation", "publication") else [
+        ("systemctl", "restart", "synthetic-service"),
+        ("systemctl", "stop", "synthetic-service"),
+    ]
+    assert ready.commands == expected
+    output = capsys.readouterr().out
+    assert "cleanup complete; corpus directory is empty" in output
+    assert "synthetic-status-token" not in output
+
+
+@pytest.mark.parametrize("reuse_target", [False, True])
+def test_initial_failure_preserves_preexisting_corpus_contents(ready_deployment, monkeypatch, reuse_target) -> None:
+    ready = ready_deployment
+    preserved = ready.root / "synthetic-preserved.txt"
+    preserved.write_text("Synthetic preexisting corpus content")
+    if reuse_target:
+        shutil.copytree(ready.artifact.index_path, ready.root / INDEX_ID)
+    before = {path.name for path in ready.root.iterdir()}
+    monkeypatch.setattr(deployment, "_status", lambda *args: (_ for _ in ()).throw(RuntimeError("synthetic status failure")))
+    with pytest.raises(RuntimeError, match="original corpus contents preserved"):
+        deployment.deploy(ready.config)
+    assert {path.name for path in ready.root.iterdir()} == before
+    assert preserved.read_text() == "Synthetic preexisting corpus content"
+    if reuse_target:
+        assert (ready.root / INDEX_ID / "corpus.sqlite").read_bytes() == ready.artifact.database_path.read_bytes()
+
+
+def test_current_only_partial_publication_restores_missing_previous(ready_deployment, monkeypatch) -> None:
+    ready = ready_deployment
+    original = build_index(replace(ready.projection, source_digest="sha256:" + "d" * 64), ready.root)
+    publish_index(ready.root, original.index_id)
+    from src.retrieval import build_lexical_index as builder
+    atomic_link = builder._atomic_index_link
+
+    def link(root, name, index_id):
+        if name == "current":
+            raise OSError("synthetic current link failure")
+        atomic_link(root, name, index_id)
+
+    monkeypatch.setattr(builder, "_atomic_index_link", link)
+    with pytest.raises(RuntimeError, match="previous index restored"):
+        deployment.deploy(ready.config)
+    assert {path.name for path in ready.root.iterdir()} == {original.index_id, "current"}
+    assert (ready.root / "current").readlink() == Path(original.index_id)
+    assert ready.commands == []
+
+
+@pytest.mark.parametrize("phase", ["service_stop", "index_cleanup"])
+def test_initial_recovery_failure_is_reported(ready_deployment, monkeypatch, capsys, phase) -> None:
+    ready = ready_deployment
+    monkeypatch.setattr(deployment, "_status", lambda *args: (_ for _ in ()).throw(RuntimeError("synthetic status failure")))
+    if phase == "service_stop":
+        def run(args, **kwargs):
+            ready.commands.append(tuple(args))
+            if args[1] == "stop":
+                raise OSError("synthetic stop failure")
+            return SimpleNamespace(returncode=0)
+        monkeypatch.setattr(deployment.subprocess, "run", run)
+    else:
+        real_rmtree = shutil.rmtree
+        def remove(path, *args, **kwargs):
+            if Path(path) == ready.root / INDEX_ID:
+                raise OSError("synthetic cleanup failure")
+            return real_rmtree(path, *args, **kwargs)
+        monkeypatch.setattr(deployment.shutil, "rmtree", remove)
+    with pytest.raises(RuntimeError, match="rollback or cleanup failed: " + phase):
+        deployment.deploy(ready.config)
+    assert not os.path.lexists(ready.root / "current")
+    assert not os.path.lexists(ready.root / "previous")
+    assert {path.name for path in ready.root.iterdir()} == ({INDEX_ID} if phase == "index_cleanup" else set())
+    output = capsys.readouterr().out
+    assert "cleanup complete" not in output
+    assert "Rollback verified" not in output
+
+
+@pytest.mark.parametrize("state", ["previous_only", "regular", "dangling", "loop", "outside", "nested", "invalid_name"])
+def test_invalid_publication_state_is_rejected_before_download(ready_deployment, monkeypatch, state) -> None:
+    ready = ready_deployment
+    current = ready.root / "current"
+    if state == "previous_only":
+        (ready.root / INDEX_ID).mkdir()
+        (ready.root / "previous").symlink_to(INDEX_ID)
+    elif state == "regular":
+        current.write_text("Synthetic regular file")
+    elif state == "dangling":
+        current.symlink_to(INDEX_ID)
+    elif state == "loop":
+        current.symlink_to("current")
+    else:
+        target = {
+            "outside": ready.artifact.index_path,
+            "nested": ready.root / "synthetic-nested" / INDEX_ID,
+            "invalid_name": ready.root / "synthetic-unrelated",
+        }[state]
+        target.mkdir(parents=True, exist_ok=True)
+        current.symlink_to(target)
+    before = {path.name for path in ready.root.iterdir()}
+    raw_link = current.readlink() if current.is_symlink() else None
+    monkeypatch.setattr(deployment, "_request", lambda *args, **kwargs: pytest.fail("Unexpected download"))
+    with pytest.raises(ValueError, match="deployment"):
+        deployment.deploy(ready.config)
+    assert {path.name for path in ready.root.iterdir()} == before
+    if raw_link is not None:
+        assert current.readlink() == raw_link
+    assert ready.commands == []
+
+
+@pytest.mark.parametrize("with_previous", [False, True])
+@pytest.mark.parametrize("reuse_target", [False, True])
+def test_failed_update_restores_exact_links_and_preserves_existing_indexes(
+    ready_deployment, monkeypatch, with_previous, reuse_target,
+) -> None:
+    ready = ready_deployment
+    original = build_index(replace(ready.projection, source_digest="sha256:" + "d" * 64), ready.root)
+    (ready.root / "current").symlink_to(original.index_path)
+    if with_previous:
+        older = build_index(replace(ready.projection, source_digest="sha256:" + "e" * 64), ready.root)
+        (ready.root / "previous").symlink_to(older.index_path)
+    if reuse_target:
+        shutil.copytree(ready.artifact.index_path, ready.root / INDEX_ID)
+    before = {path.name for path in ready.root.iterdir()}
+    previous = (ready.root / "previous").readlink() if with_previous else None
+
+    def status(*args):
+        index_id = (ready.root / "current").resolve(strict=True).name
+        if index_id == INDEX_ID:
+            raise RuntimeError("synthetic new index status failure")
+        return {"index_id": index_id}
+
+    monkeypatch.setattr(deployment, "_status", status)
+    with pytest.raises(RuntimeError, match="previous index restored"):
+        deployment.deploy(ready.config)
+    assert {path.name for path in ready.root.iterdir()} == before
+    assert (ready.root / "current").readlink() == original.index_path
+    if with_previous:
+        assert (ready.root / "previous").readlink() == previous
+    else:
+        assert not os.path.lexists(ready.root / "previous")
+    assert ready.commands == [("systemctl", "restart", "synthetic-service")] * 2
+    if reuse_target:
+        assert (ready.root / INDEX_ID / "corpus.sqlite").read_bytes() == ready.artifact.database_path.read_bytes()
+
+
+@pytest.mark.parametrize("failure", ["unavailable", "mismatch"])
+def test_update_checks_current_service_before_installing(ready_deployment, monkeypatch, failure) -> None:
+    ready = ready_deployment
+    original = build_index(replace(ready.projection, source_digest="sha256:" + "d" * 64), ready.root)
+    publish_index(ready.root, original.index_id)
+
+    def status(*args):
+        if failure == "unavailable":
+            raise OSError("synthetic current service unavailable")
+        return {"index_id": INDEX_ID}
+
+    monkeypatch.setattr(deployment, "_status", status)
+    with pytest.raises((OSError, RuntimeError)):
+        deployment.deploy(ready.config)
+    assert {path.name for path in ready.root.iterdir()} == {original.index_id, "current"}
+    assert (ready.root / "current").readlink() == Path(original.index_id)
+    assert ready.commands == []
+
+
+def test_initial_failure_cli_reports_empty_corpus_and_nonzero_exit(ready_deployment, monkeypatch, capsys) -> None:
+    ready = ready_deployment
+    monkeypatch.setattr(deployment, "_status", lambda *args: (_ for _ in ()).throw(RuntimeError("synthetic status failure")))
+    monkeypatch.setattr(sys, "argv", ["deploy_index", "--config", str(ready.config)])
+    with pytest.raises(SystemExit) as exit_info:
+        deployment.main()
+    assert exit_info.value.code == 1
+    assert list(ready.root.iterdir()) == []
+    output = capsys.readouterr()
+    assert "Deployment failed: initial deployment failed; corpus directory restored to empty" in output.err
+    assert "synthetic-status-token" not in output.out + output.err
+
+
+@pytest.mark.parametrize("phase", ["current_restore", "previous_restore", "service_restart"])
+def test_update_recovery_failure_retains_installed_index(ready_deployment, monkeypatch, capsys, phase) -> None:
+    ready = ready_deployment
+    original = build_index(replace(ready.projection, source_digest="sha256:" + "d" * 64), ready.root)
+    publish_index(ready.root, original.index_id)
+    restore_link = deployment._restore_link
+
+    def status(*args):
+        index_id = (ready.root / "current").resolve(strict=True).name
+        if index_id == INDEX_ID:
+            raise RuntimeError("synthetic new index status failure")
+        return {"index_id": index_id}
+
+    def restore(path, target):
+        if path.name + "_restore" == phase:
+            raise OSError("synthetic link restoration failure")
+        restore_link(path, target)
+
+    def run(args, **kwargs):
+        ready.commands.append(tuple(args))
+        if phase == "service_restart" and len(ready.commands) == 2:
+            raise OSError("synthetic rollback restart failure")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(deployment, "_status", status)
+    monkeypatch.setattr(deployment, "_restore_link", restore)
+    monkeypatch.setattr(deployment.subprocess, "run", run)
+    with pytest.raises(RuntimeError, match="rollback or cleanup failed: " + phase):
+        deployment.deploy(ready.config)
+    assert (ready.root / INDEX_ID / "corpus.sqlite").read_bytes() == ready.artifact.database_path.read_bytes()
+    assert original.database_path.is_file()
+    assert (ready.root / "current").readlink() == Path(INDEX_ID if phase == "current_restore" else original.index_id)
+    assert os.path.lexists(ready.root / "previous") is (phase == "previous_restore")
+    assert len(ready.commands) == (2 if phase == "service_restart" else 1)
+    output = capsys.readouterr().out
+    assert "Rollback incomplete; retaining newly installed index files" in output
+    assert "Rollback verified" not in output
+
+
 @pytest.mark.parametrize("rollback_fails", [False, True])
-def test_failed_restart_restores_previous_links(tmp_path: Path, monkeypatch, capsys, rollback_fails) -> None:
+@pytest.mark.parametrize("with_previous", [False, True])
+def test_failed_restart_restores_previous_links(tmp_path: Path, monkeypatch, capsys, rollback_fails, with_previous) -> None:
     root = tmp_path / "retrieval"
     root.mkdir(parents=True)
     for name in (CURRENT_INDEX_ID, PREVIOUS_INDEX_ID, INDEX_ID):
         (root / name).mkdir()
     (root / "current").symlink_to(CURRENT_INDEX_ID)
-    (root / "previous").symlink_to(PREVIOUS_INDEX_ID)
+    if with_previous:
+        (root / "previous").symlink_to(PREVIOUS_INDEX_ID)
     _stub_deployment(monkeypatch, root)
 
     def extract(_archive, temporary, _run_id, _run_attempt, _commit):
@@ -616,18 +987,21 @@ def test_failed_restart_restores_previous_links(tmp_path: Path, monkeypatch, cap
             raise RuntimeError("synthetic rollback failure")
 
     monkeypatch.setattr(deployment, "_restart_status_check", rollback_check)
-    expected = "rollback verification failed" if rollback_fails else "previous index restored"
+    expected = "rollback or cleanup failed: service_verification" if rollback_fails else "previous index restored"
     with pytest.raises(RuntimeError, match=expected):
         deployment.deploy(tmp_path / "deploy.json")
     assert restarted == [Path(INDEX_ID)]
     assert (root / "current").readlink() == Path(CURRENT_INDEX_ID)
-    assert (root / "previous").readlink() == Path(PREVIOUS_INDEX_ID)
+    if with_previous:
+        assert (root / "previous").readlink() == Path(PREVIOUS_INDEX_ID)
+    else:
+        assert not os.path.lexists(root / "previous")
     output = capsys.readouterr().out
     assert "Deployment failed; restoring" in output
     assert "Restarting the HTTP service after rollback" in output
     assert "Waiting for the service to report the restored index" in output
     assert "New index verified" not in output
     assert ("Rollback verified" in output) is not rollback_fails
-    assert ("Rollback verification failed" in output) is rollback_fails
+    assert ("Rollback or cleanup failed" in output) is rollback_fails
     assert "synthetic-token" not in output
     assert "synthetic-status-token" not in output

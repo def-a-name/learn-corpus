@@ -67,6 +67,46 @@ class LocalStatusTarget:
     host_header: str
 
 
+@dataclass(frozen=True)
+class PublicationState:
+    """保存发布前的链接原值、当前版本和目录是否为空。"""
+
+    current: Path | None
+    previous: Path | None
+    current_index_id: str | None
+    empty: bool
+
+
+def _publication_state(root: Path) -> PublicationState:
+    """区分首次发布与更新，拒绝损坏、越界或不完整的链接状态。"""
+
+    def read_link(name: str) -> tuple[Path, str] | None:
+        path = root / name
+        if not os.path.lexists(path):
+            return None
+        if not path.is_symlink():
+            raise ValueError(f"deployment {name} must be a symlink")
+        try:
+            resolved = path.resolve(strict=True)
+            relative = resolved.relative_to(root)
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ValueError(f"deployment {name} target is missing, invalid, or outside corpus root") from exc
+        if len(relative.parts) != 1 or INDEX_ID_PATTERN.fullmatch(relative.name) is None or not resolved.is_dir():
+            raise ValueError(f"deployment {name} must target one index directory")
+        return path.readlink(), relative.name
+
+    current = read_link("current")
+    previous = read_link("previous")
+    if current is None and previous is not None:
+        raise ValueError("deployment previous exists without current")
+    return PublicationState(
+        current[0] if current else None,
+        previous[0] if previous else None,
+        current[1] if current else None,
+        not any(root.iterdir()),
+    )
+
+
 def _progress(message: str) -> None:
     """立即输出部署进度，重定向 stdout 时也不等待缓冲区刷新。"""
 
@@ -359,7 +399,7 @@ def _restart_and_wait(service: str, target: LocalStatusTarget, token: str, index
 
 
 def deploy(config_path: Path) -> str:
-    """先验证完整产物与本机代码，再安装、切换并验收；失败恢复旧索引。"""
+    """支持首次发布和更新；失败恢复原链接并清理本次新增的索引。"""
 
     if os.geteuid() != 0:
         raise ValueError("deployment must run as root")
@@ -370,6 +410,9 @@ def deploy(config_path: Path) -> str:
         raise ValueError("deployment config must select HTTP transport")
     status_target = _local_status_target(selected)
     retrieval_root = selected.runtime.corpus_path.resolve(strict=True)
+    state = _publication_state(retrieval_root)
+    if state.current is None:
+        _progress("Preparing initial deployment; no current index exists.")
     token = _github_token(deployment.github_header_file)
     run_id = deployment.run_id
     if run_id is None:
@@ -387,6 +430,8 @@ def deploy(config_path: Path) -> str:
     if f"sha256:{hashlib.sha256(archive).hexdigest()}" != artifact_digest:
         raise ValueError("downloaded artifact archive hash mismatch")
     _progress(f"Archive downloaded and SHA-256 verified ({len(archive)} bytes).")
+    failure: Exception | None = None
+    recovery_failures: list[str] = []
     with tempfile.TemporaryDirectory(prefix=".release-", dir=retrieval_root) as temporary:
         _progress("Extracting and validating release metadata and index files.")
         release, staged = _extract_release(archive, Path(temporary), run_id, run_attempt, commit)
@@ -397,12 +442,8 @@ def deploy(config_path: Path) -> str:
         validate_index_artifact(staged, expected_index_id=index_id)
         old_current_link = retrieval_root / "current"
         old_previous_link = retrieval_root / "previous"
-        if not old_current_link.is_symlink() or not old_previous_link.is_symlink():
-            raise ValueError("current and previous must both be index symlinks")
-        old_current = old_current_link.readlink()
-        old_previous = old_previous_link.readlink()
         status_token = _status_token(selected.runtime.credentials_file)
-        if old_current.name == index_id:
+        if state.current_index_id == index_id:
             _progress("Retrieval index is already current; verifying installed files and running service.")
             validate_index_artifact(old_current_link.resolve(strict=True), expected_index_id=index_id)
             if _status(status_target, status_token).get("index_id") != index_id:
@@ -411,40 +452,77 @@ def deploy(config_path: Path) -> str:
         if target.exists() or target.is_symlink():
             _progress("Retrieval index is already installed; validating existing files.")
             validate_index_artifact(target, expected_index_id=index_id)
-        else:
-            _progress("Installing index files and setting service account permissions.")
-            identity = pwd.getpwnam(deployment.service_user)
-            group = grp.getgrgid(identity.pw_gid)
-            os.chown(staged, identity.pw_uid, group.gr_gid)
-            os.chmod(staged, 0o550)
-            for child in staged.iterdir():
-                os.chown(child, identity.pw_uid, group.gr_gid)
-                os.chmod(child, 0o440)
-            os.replace(staged, target)
-        # 先确保现有入口可验收，避免在不可观测状态下切换。
-        _progress("Checking current service index before switching.")
-        current_status = _status(status_target, status_token)
-        if current_status.get("index_id") != old_current.name:
-            raise RuntimeError("running service index does not match current link")
+        # 更新前验收旧入口；首次部署不要求已有运行中的服务。
+        if state.current is not None:
+            _progress("Checking current service index before switching.")
+            current_status = _status(status_target, status_token)
+            if current_status.get("index_id") != state.current_index_id:
+                raise RuntimeError("running service index does not match current link")
+        installed = False
+        publication_attempted = False
+        restart_attempted = False
         try:
-            _progress(f"Switching current to {index_id} and preserving the previous index.")
+            if not os.path.lexists(target):
+                _progress("Installing index files and setting service account permissions.")
+                identity = pwd.getpwnam(deployment.service_user)
+                group = grp.getgrgid(identity.pw_gid)
+                os.chown(staged, identity.pw_uid, group.gr_gid)
+                os.chmod(staged, 0o550)
+                for child in staged.iterdir():
+                    os.chown(child, identity.pw_uid, group.gr_gid)
+                    os.chmod(child, 0o440)
+                os.replace(staged, target)
+                installed = True
+            if state.current is None:
+                _progress(f"Creating current for index {index_id}.")
+            else:
+                _progress(f"Switching current to {index_id} and preserving the previous index.")
+            publication_attempted = True
             publish_index(retrieval_root, index_id)
+            restart_attempted = True
             _restart_and_wait(deployment.service, status_target, status_token, index_id)
             _progress("New index verified through authenticated local service status.")
         except Exception as exc:
-            _progress("Deployment failed; restoring the original current and previous links.")
-            _replace_link(old_current_link, old_current)
-            _replace_link(old_previous_link, old_previous)
-            try:
+            failure = exc
+
+            def recover(category: str, operation) -> None:
+                try:
+                    operation()
+                except Exception:
+                    recovery_failures.append(category)
+
+            if state.current is None and restart_attempted:
+                _progress("Initial deployment failed; stopping the service before cleanup.")
+                recover("service_stop", lambda: subprocess.run(["systemctl", "stop", deployment.service], check=True))
+            if publication_attempted:
+                _progress("Deployment failed; restoring the original current and previous links.")
+                recover("current_restore", lambda: _restore_link(old_current_link, state.current))
+                recover("previous_restore", lambda: _restore_link(old_previous_link, state.previous))
+            if state.current is not None and restart_attempted and not recovery_failures:
                 _progress("Restarting the HTTP service after rollback.")
-                subprocess.run(["systemctl", "restart", deployment.service], check=True)
-                _progress("Waiting for the service to report the restored index.")
-                _restart_status_check(status_target, status_token, old_current.name)
-            except Exception as rollback_exc:
-                _progress("Rollback verification failed.")
-                raise RuntimeError("deployment failed and rollback verification failed") from rollback_exc
+                recover("service_restart", lambda: subprocess.run(["systemctl", "restart", deployment.service], check=True))
+                if not recovery_failures:
+                    _progress("Waiting for the service to report the restored index.")
+                    recover("service_verification", lambda: _restart_status_check(status_target, status_token, state.current_index_id))
+            if installed:
+                if state.current is not None and recovery_failures:
+                    _progress("Rollback incomplete; retaining newly installed index files.")
+                else:
+                    _progress("Removing index files installed by this deployment.")
+                    recover("index_cleanup", lambda: shutil.rmtree(target))
+    # 临时目录清理完毕后才报告恢复结果，首次发布不得留下暂存文件。
+    if failure is not None:
+        if recovery_failures:
+            _progress("Rollback or cleanup failed.")
+            raise RuntimeError("deployment failed and rollback or cleanup failed: " + ", ".join(recovery_failures)) from failure
+        if state.current is not None:
             _progress("Rollback verified; the original index is active.")
-            raise RuntimeError("deployment failed; previous index restored") from exc
+            raise RuntimeError("deployment failed; previous index restored") from failure
+        if state.empty:
+            _progress("Initial deployment cleanup complete; corpus directory is empty.")
+            raise RuntimeError("initial deployment failed; corpus directory restored to empty") from failure
+        _progress("Initial deployment cleanup complete; original corpus contents preserved.")
+        raise RuntimeError("initial deployment failed; original corpus contents preserved") from failure
     return f"Retrieval index {index_id} is current (run {run_id}, attempt {run_attempt}, commit {commit})"
 
 
@@ -453,6 +531,15 @@ def _replace_link(path: Path, target: Path) -> None:
         replacement = Path(temporary) / "link"
         replacement.symlink_to(target)
         os.replace(replacement, path)
+
+
+def _restore_link(path: Path, target: Path | None) -> None:
+    """恢复原链接，原先不存在的链接在回滚时移除。"""
+
+    if target is None:
+        path.unlink(missing_ok=True)
+    else:
+        _replace_link(path, target)
 
 
 def _restart_status_check(target: LocalStatusTarget, token: str, index_id: str) -> None:
