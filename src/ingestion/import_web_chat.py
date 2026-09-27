@@ -589,13 +589,42 @@ def _build_unit(path: Path, input_root: Path) -> WebChatUnit:
     )
 
 
-def iter_web_chat_units(input_dir: Path) -> Iterable[WebChatUnit]:
+def _selected_markdown_paths(
+    input_dir: Path,
+    includes: Iterable[str] | None = None,
+) -> list[Path]:
+    """发现全部输入，或严格解析一批显式相对路径。"""
+
     if not input_dir.is_dir():
         raise FileNotFoundError(f"web chat export directory does not exist: {input_dir}")
-    for path in sorted(input_dir.rglob("*.md")):
-        if any(part.startswith(".") for part in path.relative_to(input_dir).parts):
-            continue
-        yield _build_unit(path, input_dir)
+    root = input_dir.resolve()
+    if includes:
+        paths: list[Path] = []
+        for value in includes:
+            path = (root / value).resolve()
+            try:
+                relative = path.relative_to(root)
+            except ValueError as exc:
+                raise ValueError(f"included path escapes the input directory: {value}") from exc
+            if not path.is_file() or path.suffix.lower() != ".md":
+                raise FileNotFoundError(f"included web chat file does not exist: {value}")
+            if any(part.startswith(".") for part in relative.parts):
+                raise ValueError(f"included web chat file is hidden: {value}")
+            paths.append(path)
+        return sorted(set(paths), key=lambda item: item.relative_to(root).as_posix())
+    return [
+        path.resolve()
+        for path in sorted(input_dir.rglob("*.md"))
+        if not any(part.startswith(".") for part in path.relative_to(input_dir).parts)
+    ]
+
+
+def iter_web_chat_units(
+    input_dir: Path,
+    includes: Iterable[str] | None = None,
+) -> Iterable[WebChatUnit]:
+    for path in _selected_markdown_paths(input_dir, includes):
+        yield _build_unit(path, input_dir.resolve())
 
 
 def unit_review_reasons(
@@ -902,9 +931,10 @@ def import_web_chats(
     *,
     asset_root: Path = DEFAULT_ASSETS,
     review_resolutions_path: Path = DEFAULT_REVIEW_RESOLUTIONS,
+    includes: Iterable[str] | None = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    units = list(iter_web_chat_units(input_dir))
+    units = list(iter_web_chat_units(input_dir, includes))
     review_resolutions = load_review_resolutions(review_resolutions_path)
     source_id_counts = Counter(unit.source_id for unit in units)
     manifest = load_manifest(manifest_path)
@@ -1038,6 +1068,11 @@ def main() -> None:
     parser.add_argument(
         "--review-resolutions", type=Path, default=DEFAULT_REVIEW_RESOLUTIONS
     )
+    parser.add_argument(
+        "--include",
+        action="append",
+        help="import only the specified relative path under input; repeatable",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     stats = import_web_chats(
@@ -1046,6 +1081,7 @@ def main() -> None:
         args.manifest,
         asset_root=args.assets,
         review_resolutions_path=args.review_resolutions,
+        includes=args.include,
         dry_run=args.dry_run,
     )
     print("Web chat import result:", ", ".join(f"{key}={value}" for key, value in stats.items()))

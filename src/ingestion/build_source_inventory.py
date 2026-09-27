@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import json
 from collections import Counter
 from datetime import datetime
@@ -36,6 +37,10 @@ from src.corpus.storage import sha256_file
 DEFAULT_NOTES_INPUT = REPO_ROOT.parent / "notes"
 DEFAULT_ARTICLES_INPUT = REPO_ROOT.parent / "articles"
 DEFAULT_OUTPUT = REPO_ROOT / "meta" / "source-inventory.json"
+WEB_CHAT_MISSING = [
+    "只盘点当前目录中的 Chrome 插件 Markdown 导出，不代表账号全部网页历史",
+    "插件未导出的模型、分支、message ID、assistant 时间和隐藏事件无法恢复",
+]
 
 
 def _display_path(path: Path) -> str:
@@ -134,6 +139,177 @@ def _markdown_units(
     return units, retained, skip_reasons
 
 
+def _web_chat_records(
+    units,
+    manifest_sources: dict[str, Any],
+    review_resolutions,
+) -> list[dict[str, Any]]:
+    """把一批已解析的 web-chat 单元投影为 inventory 记录。"""
+
+    records: list[dict[str, Any]] = []
+    for unit in units:
+        review_resolution = review_resolutions.get(unit.source_id)
+        reason = web_chat_unit_skip_reason(unit, review_resolution)
+        if reason in WEB_CHAT_REVIEW_SKIP_REASONS:
+            status = "review"
+        elif reason:
+            status = "excluded"
+        elif unit.source_id in manifest_sources:
+            status = "imported"
+        else:
+            status = "ready"
+        records.append(web_chat_unit_inventory_record(
+            unit, status, reason, review_resolution
+        ))
+    return records
+
+
+def _normalize_web_chat_collisions(
+    records: list[dict[str, Any]],
+    manifest_sources: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """合并局部记录后重新计算跨文件 source ID 冲突。"""
+
+    counts = Counter(str(record.get("source_id") or "") for record in records)
+    normalized: list[dict[str, Any]] = []
+    for original in records:
+        record = deepcopy(original)
+        reasons = [
+            str(reason)
+            for reason in record.get("review_reasons", [])
+            if reason != "source_id_collision_review"
+        ]
+        details = [
+            str(detail)
+            for detail in record.get("review_details", [])
+            if detail != "多个 Markdown 导出解析为同一 provider 会话身份"
+        ]
+        source_id = str(record.get("source_id") or "")
+        original_reason = record.get("skip_reason")
+        if counts[source_id] > 1:
+            reason = "source_id_collision_review"
+            reasons.insert(0, reason)
+            details.insert(0, "多个 Markdown 导出解析为同一 provider 会话身份")
+        elif original_reason == "source_id_collision_review":
+            reason = reasons[0] if reasons else None
+        else:
+            reason = original_reason
+        record["review_reasons"] = reasons
+        record["review_details"] = details
+        record["skip_reason"] = reason
+        record["parse_status"] = (
+            "review"
+            if reason in WEB_CHAT_REVIEW_SKIP_REASONS
+            else "excluded"
+            if reason
+            else "imported"
+            if source_id in manifest_sources
+            else "ready"
+        )
+        normalized.append(record)
+    return normalized
+
+
+def _web_chat_input_record(
+    web_chat_input: Path,
+    records: list[dict[str, Any]],
+    standardized: Counter[str],
+    *,
+    scanned_at: str | None = None,
+) -> dict[str, Any]:
+    """从合并后的单元记录重算 web-chat 汇总。"""
+
+    retained = sum(
+        record.get("parse_status") in {"ready", "imported"}
+        for record in records
+    )
+    provider_counts = Counter(str(record.get("provider") or "unknown") for record in records)
+    skip_reasons = Counter(
+        str(record["skip_reason"])
+        for record in records
+        if record.get("skip_reason")
+    )
+    result: dict[str, Any] = {
+        "provider": "web-chat",
+        "input_path": _display_path(web_chat_input),
+        "format": "browser-extension-markdown",
+        "available": True,
+        "date_range": _date_range(str(record.get("created") or "unknown") for record in records),
+        "discovered": len(records),
+        "retained": retained,
+        "skipped": len(records) - retained,
+        "provider_counts": dict(sorted(provider_counts.items())),
+        "skip_reasons": dict(sorted(skip_reasons.items())),
+        "currently_standardized": standardized["web-chat-export"],
+        "known_missing": WEB_CHAT_MISSING,
+        "units": sorted(
+            records,
+            key=lambda record: (
+                str(record.get("raw_source_path") or ""),
+                str(record.get("source_id") or ""),
+            ),
+        ),
+    }
+    if scanned_at is not None:
+        result["scanned_at"] = scanned_at
+    return result
+
+
+def update_web_chat_inventory(
+    existing: dict[str, Any],
+    web_chat_input: Path,
+    includes: Iterable[str],
+    manifest_path: Path = MANIFEST_PATH,
+    *,
+    review_resolutions: Path = WEB_CHAT_REVIEW_RESOLUTIONS,
+    scanned_at: str | None = None,
+) -> dict[str, Any]:
+    """只重新解析显式 web-chat 文件，并合并回现有全局快照。"""
+
+    if existing.get("version") != 3 or not isinstance(existing.get("inputs"), list):
+        raise ValueError("existing source inventory has an unsupported format")
+    values = tuple(includes)
+    if not values:
+        raise ValueError("at least one included web chat file is required")
+    inputs = existing["inputs"]
+    positions = [
+        index for index, item in enumerate(inputs)
+        if item.get("provider") == "web-chat"
+    ]
+    if len(positions) != 1:
+        raise ValueError("existing source inventory must contain one web-chat input")
+    position = positions[0]
+    current = inputs[position]
+    if not isinstance(current.get("units"), list):
+        raise ValueError("existing web-chat inventory is missing unit records")
+
+    selected_units = list(iter_web_chat_units(web_chat_input, values))
+    selected_paths = {str(unit.source_path.resolve()) for unit in selected_units}
+    manifest_sources = _manifest_sources(manifest_path)
+    resolutions = load_web_chat_review_resolutions(review_resolutions)
+    retained_records = [
+        deepcopy(record)
+        for record in current["units"]
+        if str(record.get("raw_source_path") or "") not in selected_paths
+    ]
+    updated_records = _web_chat_records(
+        selected_units, manifest_sources, resolutions
+    )
+    records = _normalize_web_chat_collisions(
+        [*retained_records, *updated_records], manifest_sources
+    )
+    timestamp = scanned_at or datetime.now(ZoneInfo("Asia/Hong_Kong")).isoformat(timespec="seconds")
+    result = deepcopy(existing)
+    result["updated_at"] = timestamp
+    result["inputs"][position] = _web_chat_input_record(
+        web_chat_input,
+        records,
+        _standardized_counts(manifest_path),
+        scanned_at=timestamp,
+    )
+    return result
+
+
 def build_inventory(
     claude_input: Path,
     codex_input: Path,
@@ -226,73 +402,29 @@ def build_inventory(
             }
         )
 
-    web_chat_missing = [
-        "只盘点当前目录中的 Chrome 插件 Markdown 导出，不代表账号全部网页历史",
-        "插件未导出的模型、分支、message ID、assistant 时间和隐藏事件无法恢复",
-    ]
     if not web_chat_input.is_dir():
         inputs.append(
             _missing_input(
                 "web-chat",
                 web_chat_input,
                 "browser-extension-markdown",
-                web_chat_missing,
+                WEB_CHAT_MISSING,
             )
         )
     else:
         web_chat_units = list(iter_web_chat_units(web_chat_input))
         web_chat_resolutions = load_web_chat_review_resolutions(web_chat_review_resolutions)
-        source_id_counts = Counter(unit.source_id for unit in web_chat_units)
-        provider_counts = Counter(unit.provider for unit in web_chat_units)
-        skip_reasons: Counter[str] = Counter()
-        unit_records: list[dict[str, Any]] = []
-        retained = 0
-        for unit in web_chat_units:
-            review_resolution = web_chat_resolutions.get(unit.source_id)
-            reason = (
-                "source_id_collision_review"
-                if source_id_counts[unit.source_id] > 1
-                else web_chat_unit_skip_reason(unit, review_resolution)
-            )
-            if reason:
-                skip_reasons[reason] += 1
-            else:
-                retained += 1
-            if reason in WEB_CHAT_REVIEW_SKIP_REASONS:
-                status = "review"
-            elif reason:
-                status = "excluded"
-            elif unit.source_id in manifest_sources:
-                status = "imported"
-            else:
-                status = "ready"
-            record = web_chat_unit_inventory_record(
-                unit, status, reason, review_resolution
-            )
-            if reason == "source_id_collision_review":
-                record["review_reasons"] = [reason, *record.get("review_reasons", [])]
-                record["review_details"] = [
-                    "多个 Markdown 导出解析为同一 provider 会话身份",
-                    *record.get("review_details", []),
-                ]
-            unit_records.append(record)
-        inputs.append(
-            {
-                "provider": "web-chat",
-                "input_path": _display_path(web_chat_input),
-                "format": "browser-extension-markdown",
-                "available": True,
-                "date_range": _date_range(unit.created for unit in web_chat_units),
-                "discovered": len(web_chat_units),
-                "retained": retained,
-                "skipped": len(web_chat_units) - retained,
-                "provider_counts": dict(sorted(provider_counts.items())),
-                "skip_reasons": dict(sorted(skip_reasons.items())),
-                "currently_standardized": standardized["web-chat-export"],
-                "known_missing": web_chat_missing,
-                "units": unit_records,
-            }
-        )
+        inputs.append(_web_chat_input_record(
+            web_chat_input,
+            _normalize_web_chat_collisions(
+                _web_chat_records(
+                    web_chat_units, manifest_sources, web_chat_resolutions
+                ),
+                manifest_sources,
+            ),
+            standardized,
+            scanned_at=scanned_at,
+        ))
 
     codex_missing = ["其他设备或账号的 Codex rollout 不在本次范围"]
     if not codex_input.is_dir():
@@ -412,11 +544,13 @@ def build_inventory(
         )
 
     for item in inputs:
+        item.setdefault("scanned_at", scanned_at)
         if item["discovered"] != item["retained"] + item["skipped"]:
             raise ValueError(f"{item['provider']} inventory counts are inconsistent")
     return {
         "version": 3,
         "scanned_at": scanned_at,
+        "updated_at": scanned_at,
         "coverage_boundary": (
             "只覆盖当前机器上可访问的五类已知输入位置，不代表所有历史会话已提供；"
             "Claude 和 web-chat 事件计数只表示现有有损 Markdown 导出中仍可见的内容。"
@@ -454,23 +588,55 @@ def main() -> None:
         type=Path,
         default=WEB_CHAT_REVIEW_RESOLUTIONS,
     )
+    parser.add_argument(
+        "--provider",
+        choices=("web-chat",),
+        help="update only one provider in the existing inventory",
+    )
+    parser.add_argument(
+        "--include",
+        action="append",
+        help="update only the specified relative raw input path; repeatable",
+    )
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
-    inventory = build_inventory(
-        args.claude_input,
-        args.codex_input,
-        args.notes_input,
-        args.manifest,
-        articles_input=args.articles_input,
-        web_chat_input=args.web_chat_input,
-        codex_review_resolutions=args.codex_review_resolutions,
-        web_chat_review_resolutions=args.web_chat_review_resolutions,
-    )
+    if bool(args.provider) != bool(args.include):
+        parser.error("--provider and at least one --include must be used together")
+    if args.provider == "web-chat":
+        if not args.output.is_file():
+            parser.error("scoped inventory update requires an existing output file")
+        try:
+            existing = json.loads(args.output.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            parser.error(f"cannot read existing source inventory: {exc}")
+        inventory = update_web_chat_inventory(
+            existing,
+            args.web_chat_input,
+            args.include,
+            args.manifest,
+            review_resolutions=args.web_chat_review_resolutions,
+        )
+    else:
+        inventory = build_inventory(
+            args.claude_input,
+            args.codex_input,
+            args.notes_input,
+            args.manifest,
+            articles_input=args.articles_input,
+            web_chat_input=args.web_chat_input,
+            codex_review_resolutions=args.codex_review_resolutions,
+            web_chat_review_resolutions=args.web_chat_review_resolutions,
+        )
     if not args.dry_run:
         save_inventory(inventory, args.output)
+    selected = (
+        inventory["inputs"]
+        if args.provider is None
+        else [item for item in inventory["inputs"] if item["provider"] == args.provider]
+    )
     summary = ", ".join(
-        f"{item['provider']}={item['discovered']}/{item['retained']}/{item['skipped']}" for item in inventory["inputs"]
+        f"{item['provider']}={item['discovered']}/{item['retained']}/{item['skipped']}" for item in selected
     )
     print(f"Source inventory ({'dry-run' if args.dry_run else 'written'}): {summary}")
 

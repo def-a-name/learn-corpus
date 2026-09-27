@@ -5,9 +5,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shlex
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from src.corpus.document import parse_line_locator
 from src.corpus.manifest import load_manifest
@@ -16,6 +17,8 @@ from src.corpus.paths import MANIFEST_PATH, REPO_ROOT
 
 DEFAULT_INVENTORY = REPO_ROOT / "meta" / "source-inventory.json"
 DEFAULT_OUTPUT = REPO_ROOT / "meta" / "source-review-queue.md"
+_QUEUE_SOURCE_ID = re.compile(r"^- \[ \] \*\*来源 ID\*\*：`([^`]+)`$", re.MULTILINE)
+_QUEUE_RAW_PATH = re.compile(r"^- \*\*Raw path\*\*：`([^`]+)`$", re.MULTILINE)
 
 
 def _review_items(manifest_path: Path, inventory_path: Path) -> list[dict[str, Any]]:
@@ -82,11 +85,54 @@ def _raw_location_lines(item: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _queue_blocks(content: str) -> dict[str, tuple[str, str]]:
+    """按 source ID 解析生成文件，以便限制局部重建的写入边界。"""
+
+    blocks: dict[str, tuple[str, str]] = {}
+    for section in re.split(r"(?=^## )", content, flags=re.MULTILINE)[1:]:
+        source_match = _QUEUE_SOURCE_ID.search(section)
+        path_match = _QUEUE_RAW_PATH.search(section)
+        if source_match is None or path_match is None:
+            raise ValueError("existing review queue has an unsupported format")
+        source_id = source_match.group(1)
+        if source_id in blocks:
+            raise ValueError("existing review queue contains duplicate source IDs")
+        blocks[source_id] = (path_match.group(1), section.rstrip() + "\n")
+    return blocks
+
+
+def _check_scoped_change(
+    existing: str,
+    generated: str,
+    source_paths: Iterable[Path],
+) -> None:
+    """保证局部重建不会增删改本批文件之外的审核项。"""
+
+    selected = {str(path.resolve(strict=True)) for path in source_paths}
+    if not selected:
+        raise ValueError("at least one scoped review source path is required")
+    before = _queue_blocks(existing)
+    after = _queue_blocks(generated)
+    for source_id in before.keys() | after.keys():
+        old = before.get(source_id)
+        new = after.get(source_id)
+        paths = {
+            value[0]
+            for value in (old, new)
+            if value is not None
+        }
+        if paths.isdisjoint(selected) and old != new:
+            raise ValueError(
+                f"review queue update would change unselected source: {source_id}"
+            )
+
+
 def build_queue(
     manifest_path: Path,
     output_path: Path,
     inventory_path: Path = DEFAULT_INVENTORY,
     dry_run: bool = False,
+    source_paths: Iterable[Path] | None = None,
 ) -> str:
     items = _review_items(manifest_path, inventory_path)
     lines = [
@@ -125,6 +171,14 @@ def build_queue(
                 )
             )
     content = "\n".join(lines).rstrip() + "\n"
+    if source_paths is not None:
+        if not output_path.is_file():
+            raise ValueError("scoped review queue update requires an existing queue")
+        _check_scoped_change(
+            output_path.read_text(encoding="utf-8"),
+            content,
+            source_paths,
+        )
     if not dry_run:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(content, encoding="utf-8")
@@ -136,9 +190,21 @@ def main() -> None:
     parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
     parser.add_argument("--inventory", type=Path, default=DEFAULT_INVENTORY)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument(
+        "--source-path",
+        type=Path,
+        action="append",
+        help="allow changes only for the specified raw source path; repeatable",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
-    content = build_queue(args.manifest, args.output, args.inventory, args.dry_run)
+    content = build_queue(
+        args.manifest,
+        args.output,
+        args.inventory,
+        args.dry_run,
+        args.source_path,
+    )
     issue_count = content.count("**来源 ID**")
     print(f"Source review queue issues: {issue_count}")
 
