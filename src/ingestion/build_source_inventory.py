@@ -29,6 +29,7 @@ from src.ingestion.import_web_chat import iter_web_chat_units
 from src.ingestion.import_web_chat import load_review_resolutions as load_web_chat_review_resolutions
 from src.ingestion.import_web_chat import unit_inventory_record as web_chat_unit_inventory_record
 from src.ingestion.import_web_chat import unit_skip_reason as web_chat_unit_skip_reason
+from src.ingestion.markdown_sources import discover_markdown
 from src.corpus.manifest import load_manifest
 from src.corpus.paths import MANIFEST_PATH, REPO_ROOT
 from src.corpus.storage import sha256_file
@@ -306,6 +307,237 @@ def update_web_chat_inventory(
         records,
         _standardized_counts(manifest_path),
         scanned_at=timestamp,
+    )
+    return result
+
+
+def _claude_records_for_update(
+    input_root: Path,
+    includes: Iterable[str],
+    manifest_sources: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """为显式 Claude Markdown 文件生成 inventory 单元。"""
+
+    records: list[dict[str, Any]] = []
+    for unit in iter_export_units(input_root, includes=includes):
+        reason = unit_skip_reason(unit)
+        manifest_document = manifest_sources.get(unit.source_id, {})
+        forced_status = ""
+        if manifest_document.get("source_kind") == "document" and manifest_document.get("layer") in {
+            "note", "article",
+        }:
+            ingest_status = str(manifest_document.get("ingest_status") or "")
+            if ingest_status == "ready":
+                reason = ""
+                forced_status = "imported"
+            elif ingest_status == "review":
+                reason = str(manifest_document.get("ingest_issue") or "document_import_review")
+                forced_status = "review"
+            elif ingest_status == "skipped":
+                reason = str(manifest_document.get("skip_reason") or "document_import_skipped")
+                forced_status = "excluded"
+        if forced_status:
+            status = forced_status
+        elif reason == "document_classification_review":
+            status = "review"
+        elif reason:
+            status = "excluded"
+        elif unit.source_id in manifest_sources:
+            status = "imported"
+        elif unit.kind == "document":
+            status = "deferred"
+        else:
+            status = "ready"
+        records.append(unit_inventory_record(unit, status, reason))
+    return records
+
+
+def _codex_records_for_update(
+    input_root: Path,
+    includes: Iterable[str],
+    manifest_sources: dict[str, Any],
+    review_resolutions: Path,
+) -> list[dict[str, Any]]:
+    """为显式 Codex rollout 文件生成 inventory 单元。"""
+
+    units = list(iter_codex_units(input_root, includes))
+    resolved_units = resolve_codex_units(
+        units,
+        load_codex_review_resolutions(review_resolutions),
+    )
+    records: list[dict[str, Any]] = []
+    for resolved in resolved_units:
+        unit = resolved.unit
+        reason = resolved.skip_reason
+        status = (
+            "review" if reason in CODEX_REVIEW_SKIP_REASONS
+            else "deferred" if reason in CODEX_DEFERRED_SKIP_REASONS
+            else "excluded" if reason
+            else "imported" if unit.source_id in manifest_sources
+            else "ready"
+        )
+        records.append(codex_unit_inventory_record(resolved, status, reason))
+    return records
+
+
+def _updated_input_record(
+    current: dict[str, Any],
+    input_root: Path,
+    records: list[dict[str, Any]],
+    standardized_count: int,
+    scanned_at: str,
+) -> dict[str, Any]:
+    """从保留和更新后的单元重算一个来源类别的汇总。"""
+
+    provider = str(current.get("provider") or "")
+    records = sorted(
+        records,
+        key=lambda record: (
+            str(record.get("raw_source_path") or ""),
+            str(record.get("raw_source_locator") or ""),
+            str(record.get("source_id") or ""),
+        ),
+    )
+    retained = sum(not record.get("skip_reason") for record in records)
+    skip_reasons = Counter(
+        str(record["skip_reason"])
+        for record in records
+        if record.get("skip_reason")
+    )
+    result = deepcopy(current)
+    result.update({
+        "input_path": _display_path(input_root),
+        "available": True,
+        "discovered": len(records),
+        "retained": retained,
+        "skipped": len(records) - retained,
+        "skip_reasons": dict(sorted(skip_reasons.items())),
+        "currently_standardized": standardized_count,
+        "units": records,
+        "scanned_at": scanned_at,
+    })
+    if provider not in {"notes", "articles"}:
+        result["date_range"] = _date_range(
+            str(record.get("created") or "unknown") for record in records
+        )
+    if provider == "claude-export":
+        kinds = Counter(str(record.get("unit_kind") or "") for record in records)
+        threads = Counter(
+            str(record.get("thread_kind") or "unknown")
+            for record in records if record.get("unit_kind") == "session"
+        )
+        documents = Counter(
+            str(record.get("document_kind") or "unknown")
+            for record in records if record.get("unit_kind") == "document"
+        )
+        result["unit_counts"] = {"session": kinds["session"], "document": kinds["document"]}
+        result["thread_counts"] = {
+            "main": threads["main"], "subagent": threads["subagent"],
+            "unknown": threads["unknown"],
+        }
+        result["document_counts"] = dict(sorted(documents.items()))
+    elif provider == "codex":
+        threads = Counter(str(record.get("thread_kind") or "unknown") for record in records)
+        result["thread_counts"] = {
+            "main": threads["main"], "subagent": threads["subagent"],
+            "unknown": threads["unknown"],
+        }
+    return result
+
+
+def update_inventory(
+    existing: dict[str, Any],
+    provider: str,
+    includes: Iterable[str],
+    *,
+    claude_input: Path = CLAUDE_INPUT,
+    codex_input: Path = CODEX_INPUT,
+    notes_input: Path = DEFAULT_NOTES_INPUT,
+    articles_input: Path = DEFAULT_ARTICLES_INPUT,
+    web_chat_input: Path = WEB_CHAT_INPUT,
+    manifest_path: Path = MANIFEST_PATH,
+    codex_review_resolutions: Path = CODEX_REVIEW_RESOLUTIONS,
+    web_chat_review_resolutions: Path = WEB_CHAT_REVIEW_RESOLUTIONS,
+    scanned_at: str | None = None,
+) -> dict[str, Any]:
+    """按来源类别和显式文件列表更新现有 inventory。"""
+
+    values = tuple(includes)
+    if provider == "web-chat":
+        return update_web_chat_inventory(
+            existing,
+            web_chat_input,
+            values,
+            manifest_path,
+            review_resolutions=web_chat_review_resolutions,
+            scanned_at=scanned_at,
+        )
+    if existing.get("version") != 3 or not isinstance(existing.get("inputs"), list):
+        raise ValueError("existing source inventory has an unsupported format")
+    if not values:
+        raise ValueError("at least one included source file is required")
+    positions = [
+        index for index, item in enumerate(existing["inputs"])
+        if item.get("provider") == provider
+    ]
+    if len(positions) != 1:
+        raise ValueError(f"existing source inventory must contain one {provider} input")
+    position = positions[0]
+    current = existing["inputs"][position]
+    if not isinstance(current.get("units"), list):
+        raise ValueError(f"existing {provider} inventory is missing unit records")
+
+    roots = {
+        "claude-export": (claude_input, ".md", "claude-export"),
+        "codex": (codex_input, ".jsonl", "codex"),
+        "notes": (notes_input, ".md", "personal-notes"),
+        "articles": (articles_input, ".md", "external-articles"),
+    }
+    if provider not in roots:
+        raise ValueError(f"unsupported scoped inventory provider: {provider}")
+    input_root, suffix, standardized_origin = roots[provider]
+    root = input_root.resolve(strict=True)
+    selected_paths: set[str] = set()
+    for value in values:
+        path = (root / value).resolve(strict=True)
+        try:
+            path.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(f"included path escapes the input directory: {value}") from exc
+        if not path.is_file() or path.suffix.lower() != suffix:
+            raise FileNotFoundError(f"included source file does not exist: {value}")
+        selected_paths.add(str(path))
+
+    manifest_sources = _manifest_sources(manifest_path)
+    if provider == "claude-export":
+        updated_records = _claude_records_for_update(
+            input_root, values, manifest_sources
+        )
+    elif provider == "codex":
+        updated_records = _codex_records_for_update(
+            input_root, values, manifest_sources, codex_review_resolutions
+        )
+    else:
+        updated_records, _, _ = _markdown_units(
+            discover_markdown(input_root, values),
+            input_root,
+            manifest_sources,
+            "note" if provider == "notes" else "article",
+        )
+    retained_records = [
+        deepcopy(record)
+        for record in current["units"]
+        if str(record.get("raw_source_path") or "") not in selected_paths
+    ]
+    timestamp = scanned_at or datetime.now(ZoneInfo("Asia/Hong_Kong")).isoformat(timespec="seconds")
+    result = deepcopy(existing)
+    result["updated_at"] = timestamp
+    result["inputs"][position] = _updated_input_record(
+        current,
+        input_root,
+        [*retained_records, *updated_records],
+        _standardized_counts(manifest_path)[standardized_origin],
+        timestamp,
     )
     return result
 
@@ -590,7 +822,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--provider",
-        choices=("web-chat",),
+        choices=("claude-export", "web-chat", "codex", "notes", "articles"),
         help="update only one provider in the existing inventory",
     )
     parser.add_argument(
@@ -603,19 +835,25 @@ def main() -> None:
     args = parser.parse_args()
     if bool(args.provider) != bool(args.include):
         parser.error("--provider and at least one --include must be used together")
-    if args.provider == "web-chat":
+    if args.provider is not None:
         if not args.output.is_file():
             parser.error("scoped inventory update requires an existing output file")
         try:
             existing = json.loads(args.output.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             parser.error(f"cannot read existing source inventory: {exc}")
-        inventory = update_web_chat_inventory(
+        inventory = update_inventory(
             existing,
-            args.web_chat_input,
+            args.provider,
             args.include,
-            args.manifest,
-            review_resolutions=args.web_chat_review_resolutions,
+            claude_input=args.claude_input,
+            codex_input=args.codex_input,
+            notes_input=args.notes_input,
+            articles_input=args.articles_input,
+            web_chat_input=args.web_chat_input,
+            manifest_path=args.manifest,
+            codex_review_resolutions=args.codex_review_resolutions,
+            web_chat_review_resolutions=args.web_chat_review_resolutions,
         )
     else:
         inventory = build_inventory(

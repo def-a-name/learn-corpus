@@ -337,10 +337,44 @@ def parse_session(section: str, locator: str, start_line: int = 1) -> SessionPar
     )
 
 
-def iter_export_units(input_dir: Path, kind: str = "all") -> Iterable[ExportUnit]:
-    for path in sorted(input_dir.rglob("*.md")):
-        if path.name in EXCLUDED_FILES or any(part.startswith(".") for part in path.relative_to(input_dir).parts):
-            continue
+def _selected_export_paths(
+    input_dir: Path,
+    includes: Iterable[str] | None = None,
+) -> list[Path]:
+    """发现全部导出文件，或严格解析一批显式相对路径。"""
+
+    if not input_dir.is_dir():
+        raise FileNotFoundError(f"Claude export directory does not exist: {input_dir}")
+    root = input_dir.resolve()
+    if includes:
+        paths: list[Path] = []
+        for value in includes:
+            path = (root / value).resolve()
+            try:
+                relative = path.relative_to(root)
+            except ValueError as exc:
+                raise ValueError(f"included path escapes the input directory: {value}") from exc
+            if not path.is_file() or path.suffix.lower() != ".md":
+                raise FileNotFoundError(f"included Claude export file does not exist: {value}")
+            if path.name in EXCLUDED_FILES or any(part.startswith(".") for part in relative.parts):
+                raise ValueError(f"included Claude export file is excluded: {value}")
+            paths.append(path)
+        return sorted(set(paths), key=lambda item: item.relative_to(root).as_posix())
+    return [
+        path.resolve()
+        for path in sorted(input_dir.rglob("*.md"))
+        if path.name not in EXCLUDED_FILES
+        and not any(part.startswith(".") for part in path.relative_to(input_dir).parts)
+    ]
+
+
+def iter_export_units(
+    input_dir: Path,
+    kind: str = "all",
+    includes: Iterable[str] | None = None,
+) -> Iterable[ExportUnit]:
+    input_dir = input_dir.resolve()
+    for path in _selected_export_paths(input_dir, includes):
         text = path.read_text(encoding="utf-8", errors="replace")
         if not text.strip():
             continue
@@ -593,6 +627,7 @@ def import_exports(
     manifest_path: Path,
     *,
     kind: str = "session",
+    includes: Iterable[str] | None = None,
     limit: int | None = None,
     dry_run: bool = False,
     replace_legacy: bool = False,
@@ -626,7 +661,7 @@ def import_exports(
     if replace_legacy:
         stats["legacy_removed"] = _remove_legacy_sources(manifest, output_dir, dry_run, change_tracker)
 
-    for unit in iter_export_units(input_dir, kind):
+    for unit in iter_export_units(input_dir, kind, includes):
         skip_reason = unit_skip_reason(unit)
         if unit.kind == "document" and not skip_reason:
             skip_reason = "document_note_deferred"
@@ -725,6 +760,11 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
     parser.add_argument("--kind", choices=("all", "session", "document"), default="session")
+    parser.add_argument(
+        "--include",
+        action="append",
+        help="import only the specified relative path under input; repeatable",
+    )
     parser.add_argument("--limit", type=int)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
@@ -738,6 +778,7 @@ def main() -> None:
         args.output,
         args.manifest,
         kind=args.kind,
+        includes=args.include,
         limit=args.limit,
         dry_run=args.dry_run,
         replace_legacy=args.replace_legacy,

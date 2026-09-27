@@ -559,9 +559,37 @@ def parse_session(path: Path, input_root: Path | None = None) -> CodexSession:
     )
 
 
-def iter_session_units(input_dir: Path) -> Iterable[CodexSession]:
-    for path in sorted(input_dir.rglob("*.jsonl")):
-        yield parse_session(path, input_dir)
+def _selected_session_paths(
+    input_dir: Path,
+    includes: Iterable[str] | None = None,
+) -> list[Path]:
+    """发现全部 rollout，或严格解析一批显式相对路径。"""
+
+    if not input_dir.is_dir():
+        raise FileNotFoundError(f"Codex session directory does not exist: {input_dir}")
+    root = input_dir.resolve()
+    if includes:
+        paths: list[Path] = []
+        for value in includes:
+            path = (root / value).resolve()
+            try:
+                path.relative_to(root)
+            except ValueError as exc:
+                raise ValueError(f"included path escapes the input directory: {value}") from exc
+            if not path.is_file() or path.suffix.lower() != ".jsonl":
+                raise FileNotFoundError(f"included Codex session file does not exist: {value}")
+            paths.append(path)
+        return sorted(set(paths), key=lambda item: item.relative_to(root).as_posix())
+    return [path.resolve() for path in sorted(input_dir.rglob("*.jsonl"))]
+
+
+def iter_session_units(
+    input_dir: Path,
+    includes: Iterable[str] | None = None,
+) -> Iterable[CodexSession]:
+    root = input_dir.resolve()
+    for path in _selected_session_paths(root, includes):
+        yield parse_session(path, root)
 
 
 def _intrinsic_skip_reason(
@@ -739,9 +767,10 @@ def resolve_session_units(
 def iter_resolved_session_units(
     input_dir: Path,
     review_resolutions_path: Path = DEFAULT_REVIEW_RESOLUTIONS,
+    includes: Iterable[str] | None = None,
 ) -> Iterable[CodexResolvedSession]:
     yield from resolve_session_units(
-        iter_session_units(input_dir),
+        iter_session_units(input_dir, includes),
         load_review_resolutions(review_resolutions_path),
     )
 
@@ -986,6 +1015,7 @@ def import_sessions(
     limit: int | None = None,
     dry_run: bool = False,
     session_ids: set[str] | None = None,
+    includes: Iterable[str] | None = None,
     review_resolutions_path: Path = DEFAULT_REVIEW_RESOLUTIONS,
 ) -> dict[str, Any]:
     if not input_dir.is_dir():
@@ -1016,7 +1046,7 @@ def import_sessions(
     requested = set(session_ids or ())
     seen_requested: set[str] = set()
     resolved_units = _dependency_order(
-        iter_resolved_session_units(input_dir, review_resolutions_path)
+        iter_resolved_session_units(input_dir, review_resolutions_path, includes)
     )
     resolved_by_source_id = {item.unit.source_id: item for item in resolved_units}
     available_source_ids = {
@@ -1154,6 +1184,11 @@ def main() -> None:
     parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--session-id", action="append", dest="session_ids")
+    parser.add_argument(
+        "--include",
+        action="append",
+        help="import only the specified relative path under input; repeatable",
+    )
     parser.add_argument("--review-resolutions", type=Path, default=DEFAULT_REVIEW_RESOLUTIONS)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -1164,6 +1199,7 @@ def main() -> None:
         limit=args.limit,
         dry_run=args.dry_run,
         session_ids=set(args.session_ids or ()),
+        includes=args.include,
         review_resolutions_path=args.review_resolutions,
     )
     print("Codex import result:", ", ".join(f"{key}={value}" for key, value in stats.items()))
