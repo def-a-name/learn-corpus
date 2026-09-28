@@ -11,11 +11,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-from src.corpus.ingest_log import SourceChangeTracker
 from src.corpus.document import format_line_locator, yaml_document
-from src.corpus.manifest import load_manifest, save_manifest, utc_now
+from src.corpus.manifest import utc_now
 from src.corpus.paths import MANIFEST_PATH, REPO_ROOT, relative_to_repo
 from src.corpus.storage import sha256_file
+from src.ingestion.batch import InputSnapshot, PlannedFile, PlannedSource, ProviderPlan, execute_batch
 from src.ingestion.common import (
     CODEX_ASSISTANT_FINAL_DETECTION,
     CODEX_IMPORTER_VERSION,
@@ -1007,22 +1007,28 @@ def _render_session(resolved: CodexResolvedSession, imported: str) -> tuple[str,
     return yaml_document(metadata, body), redactions, title
 
 
-def import_sessions(
-    input_dir: Path,
-    output_dir: Path,
-    manifest_path: Path,
-    *,
-    limit: int | None = None,
-    dry_run: bool = False,
-    session_ids: set[str] | None = None,
-    includes: Iterable[str] | None = None,
-    review_resolutions_path: Path = DEFAULT_REVIEW_RESOLUTIONS,
-) -> dict[str, Any]:
-    if not input_dir.is_dir():
-        raise FileNotFoundError(f"Codex session directory does not exist: {input_dir}")
-    manifest = load_manifest(manifest_path)
-    change_tracker = SourceChangeTracker.for_output(output_dir)
-    stats: dict[str, Any] = {
+class CodexStrategy:
+    """按父子依赖顺序分析 rollout，并生成正式提交候选。"""
+
+    def __init__(
+        self,
+        input_dir: Path,
+        output_dir: Path,
+        limit: int | None,
+        session_ids: set[str] | None,
+        includes: Iterable[str] | None,
+        review_resolutions_path: Path,
+    ) -> None:
+        self.input_dir = input_dir
+        self.output_dir = output_dir
+        self.limit = limit
+        self.session_ids = set(session_ids or ())
+        self.includes = tuple(includes) if includes is not None else None
+        self.review_resolutions_path = review_resolutions_path
+
+    def prepare(self, manifest: dict[str, Any]) -> ProviderPlan:
+        paths = _selected_session_paths(self.input_dir.resolve(), self.includes)
+        stats: dict[str, Any] = {
         "discovered": 0,
         "imported": 0,
         "unchanged": 0,
@@ -1042,139 +1048,216 @@ def import_sessions(
         "omitted_unpaired_users": 0,
         "invalid_lines": 0,
         "redactions": 0,
-    }
-    requested = set(session_ids or ())
-    seen_requested: set[str] = set()
-    resolved_units = _dependency_order(
-        iter_resolved_session_units(input_dir, review_resolutions_path, includes)
-    )
-    resolved_by_source_id = {item.unit.source_id: item for item in resolved_units}
-    available_source_ids = {
-        item.unit.source_id for item in resolved_units if _manifest_source_is_current(item, manifest)
-    }
-    for resolved in resolved_units:
-        unit = resolved.unit
-        if requested and unit.provider_session_id not in requested:
-            continue
-        seen_requested.add(unit.provider_session_id)
-        skip_reason = resolved.skip_reason
-        if (
-            not skip_reason
-            and resolved.fork_parent_source_id
-            and resolved.fork_parent_source_id not in available_source_ids
-        ):
-            skip_reason = "fork_parent_not_standardized_review"
-        if not skip_reason and sha256_file(unit.source_path) != unit.content_hash:
-            skip_reason = "source_changed_during_import"
-        if (
-            not skip_reason
-            and resolved.fork_parent_source_id
-            and resolved.fork_parent_hash
-        ):
-            parent_result = resolved_by_source_id.get(resolved.fork_parent_source_id)
-            parent_source_path = parent_result.unit.source_path if parent_result else None
-            if parent_source_path is None or sha256_file(parent_source_path) != resolved.fork_parent_hash:
-                skip_reason = "fork_parent_changed_during_import"
-        current = manifest["sources"].get(unit.source_id, {})
-        is_unchanged = not skip_reason and _manifest_source_is_current(resolved, manifest)
-        if not skip_reason and not is_unchanged and limit is not None and stats["imported"] >= limit:
-            break
+        }
+        plan = ProviderPlan(
+            provider="codex",
+            importer="codex",
+            input_root=self.input_dir,
+            output_root=self.output_dir,
+            stats=stats,
+            selected_paths=paths,
+            snapshots=[InputSnapshot(path, sha256_file(path)) for path in paths],
+        )
+        if self.review_resolutions_path.is_file():
+            plan.snapshots.append(InputSnapshot(
+                self.review_resolutions_path,
+                sha256_file(self.review_resolutions_path),
+            ))
+        requested = self.session_ids
+        seen_requested: set[str] = set()
+        resolved_units = _dependency_order(
+            iter_resolved_session_units(self.input_dir, self.review_resolutions_path, self.includes)
+        )
+        resolved_by_source_id = {item.unit.source_id: item for item in resolved_units}
+        available_source_ids = {
+            item.unit.source_id for item in resolved_units if _manifest_source_is_current(item, manifest)
+        }
+        for resolved in resolved_units:
+            unit = resolved.unit
+            if requested and unit.provider_session_id not in requested:
+                reason = resolved.skip_reason
+                status = (
+                    "review" if reason in REVIEW_SKIP_REASONS
+                    else "deferred" if reason in DEFERRED_SKIP_REASONS
+                    else "excluded" if reason
+                    else "imported" if _manifest_source_is_current(resolved, manifest)
+                    else "ready"
+                )
+                if status == "review":
+                    plan.blocking_reasons.append(reason)
+                plan.inventory_records.append(unit_inventory_record(resolved, status, reason))
+                continue
+            seen_requested.add(unit.provider_session_id)
+            skip_reason = resolved.skip_reason
+            if (
+                not skip_reason
+                and resolved.fork_parent_source_id
+                and resolved.fork_parent_source_id not in available_source_ids
+            ):
+                skip_reason = "fork_parent_not_standardized_review"
+            if not skip_reason and sha256_file(unit.source_path) != unit.content_hash:
+                skip_reason = "source_changed_during_analysis_review"
+            if (
+                not skip_reason
+                and resolved.fork_parent_source_id
+                and resolved.fork_parent_hash
+            ):
+                parent_result = resolved_by_source_id.get(resolved.fork_parent_source_id)
+                parent_source_path = parent_result.unit.source_path if parent_result else None
+                if parent_source_path is None or sha256_file(parent_source_path) != resolved.fork_parent_hash:
+                    skip_reason = "fork_parent_changed_during_analysis_review"
+            current = manifest["sources"].get(unit.source_id, {})
+            if current and current.get("ingest_status") == "ready" and current.get("source_hash") != unit.content_hash and skip_reason not in REVIEW_SKIP_REASONS:
+                skip_reason = "existing_source_changed_review"
+            if current and current.get("ingest_status") == "ready" and current.get("source_path") != str(unit.source_path.resolve()):
+                skip_reason = "source_id_collision_review"
+            is_unchanged = not skip_reason and _manifest_source_is_current(resolved, manifest)
+            if not skip_reason and not is_unchanged and self.limit is not None and stats["imported"] >= self.limit:
+                skip_reason = "limit_reached"
 
-        stats["discovered"] += 1
-        thread_kinds = stats["thread_kinds"]
-        thread_kinds[unit.thread_kind] = thread_kinds.get(unit.thread_kind, 0) + 1
-        stats["human_user_messages"] += unit.human_user_count if unit.thread_kind == "main" else 0
-        stats["assistant_finals"] += len(resolved.exchanges) if unit.thread_kind == "main" else 0
-        stats["omitted_trivial_exchanges"] += unit.omitted_trivial_exchange_count
-        stats["omitted_fork_prefix_exchanges"] += resolved.omitted_fork_prefix_exchange_count
-        stats["omitted_commentary"] += unit.omitted_commentary_count
-        stats["omitted_tool_calls"] += unit.omitted_tool_call_count
-        stats["omitted_tool_results"] += unit.omitted_tool_result_count
-        stats["omitted_reasoning"] += unit.omitted_reasoning_count
-        stats["omitted_interruptions"] += unit.omitted_interrupted_count
-        stats["omitted_superseded_turns"] += len(unit.superseded_incomplete_turns)
-        stats["omitted_unpaired_users"] += unit.omitted_unpaired_user_count
-        stats["invalid_lines"] += unit.invalid_line_count
+            stats["discovered"] += 1
+            thread_kinds = stats["thread_kinds"]
+            thread_kinds[unit.thread_kind] = thread_kinds.get(unit.thread_kind, 0) + 1
+            stats["human_user_messages"] += unit.human_user_count if unit.thread_kind == "main" else 0
+            stats["assistant_finals"] += len(resolved.exchanges) if unit.thread_kind == "main" else 0
+            stats["omitted_trivial_exchanges"] += unit.omitted_trivial_exchange_count
+            stats["omitted_fork_prefix_exchanges"] += resolved.omitted_fork_prefix_exchange_count
+            stats["omitted_commentary"] += unit.omitted_commentary_count
+            stats["omitted_tool_calls"] += unit.omitted_tool_call_count
+            stats["omitted_tool_results"] += unit.omitted_tool_result_count
+            stats["omitted_reasoning"] += unit.omitted_reasoning_count
+            stats["omitted_interruptions"] += unit.omitted_interrupted_count
+            stats["omitted_superseded_turns"] += len(unit.superseded_incomplete_turns)
+            stats["omitted_unpaired_users"] += unit.omitted_unpaired_user_count
+            stats["invalid_lines"] += unit.invalid_line_count
 
-        if skip_reason:
+            if skip_reason:
+                stats["skipped"] += 1
+                reasons = stats["skip_reasons"]
+                reasons[skip_reason] = reasons.get(skip_reason, 0) + 1
+                status = (
+                    "review" if skip_reason in REVIEW_SKIP_REASONS or skip_reason.endswith("_review")
+                    else "deferred" if skip_reason in DEFERRED_SKIP_REASONS
+                    else "excluded"
+                )
+                if status == "review":
+                    plan.blocking_reasons.append(skip_reason)
+                plan.inventory_records.append(unit_inventory_record(resolved, status, skip_reason))
+                continue
+            if is_unchanged:
+                stats["unchanged"] += 1
+                available_source_ids.add(unit.source_id)
+                plan.inventory_records.append(unit_inventory_record(resolved, "imported", ""))
+                continue
+
+            document, redactions, title = _render_session(resolved, utc_now()[:10])
+            date = unit.created if unit.created != "unknown" else "undated"
+            output_path = self.output_dir / f"{date}-{unit.provider_session_id}.md"
+            stats["imported"] += 1
+            stats["redactions"] += redactions
+            plan.inventory_records.append(unit_inventory_record(resolved, "ready", ""))
+            record = {
+                "origin": "codex",
+                "source_kind": "session",
+                "provider": "codex",
+                "thread_kind": "main",
+                "provider_session_id": unit.provider_session_id,
+                "derived_session_key": None,
+                "identity_confidence": unit.identity_confidence,
+                "assistant_final_detection": CODEX_ASSISTANT_FINAL_DETECTION,
+                "source_scope": resolved.source_scope,
+                "forked_from_id": unit.forked_from_id,
+                "fork_parent_source_id": resolved.fork_parent_source_id,
+                "fork_parent_hash": resolved.fork_parent_hash,
+                "source_path": str(unit.source_path.resolve()),
+                "source_locator": unit.locator,
+                "source_hash": unit.content_hash,
+                "output_path": relative_to_repo(output_path),
+                "ingest_status": "ready",
+                "curation_status": current.get("curation_status", "unassessed"),
+                "title": title,
+                "created": unit.created,
+                "omitted_trivial_exchange_count": unit.omitted_trivial_exchange_count,
+                "omitted_fork_prefix_exchange_count": resolved.omitted_fork_prefix_exchange_count,
+                "invalid_jsonl_lines": unit.invalid_line_count,
+                "active_open_turn_count": unit.active_open_turn_count,
+                "superseded_incomplete_turn_count": len(unit.superseded_incomplete_turns),
+                "redaction_count": redactions,
+                "imported_at": utc_now(),
+                "importer_version": CODEX_IMPORTER_VERSION,
+            }
+            if resolved.review_resolution:
+                resolution = resolved.review_resolution
+                record.update(
+                    {
+                        "review_resolution": resolution.decision,
+                        "reviewed_at": resolution.reviewed_at,
+                        "reviewed_by": resolution.reviewed_by,
+                        "review_resolution_hash": resolution.content_hash,
+                        "reviewed_invalid_jsonl_lines": len(resolution.invalid_lines),
+                        "reviewed_superseded_incomplete_turn_count": len(resolution.superseded_turns),
+                    }
+                )
+            plan.sources.append(PlannedSource(
+                unit.source_id, record, (PlannedFile(output_path, text=document),)
+            ))
+            available_source_ids.add(unit.source_id)
+
+        selected = {path.resolve() for path in paths}
+        resolved_source_ids = {item.unit.source_id for item in resolved_units}
+        for source_id, item in manifest["sources"].items():
+            if (
+                item.get("origin") != "codex"
+                or item.get("ingest_status") != "ready"
+                or Path(str(item.get("source_path") or "")).resolve() not in selected
+                or source_id in resolved_source_ids
+            ):
+                continue
+            raw_path = Path(str(item["source_path"]))
+            provider_session_id = str(item.get("provider_session_id") or "")
+            if requested and provider_session_id not in requested:
+                continue
+            reason = "session_identity_missing_review"
+            plan.blocking_reasons.append(reason)
+            stats["discovered"] += 1
             stats["skipped"] += 1
             reasons = stats["skip_reasons"]
-            reasons[skip_reason] = reasons.get(skip_reason, 0) + 1
-            if not dry_run and current and skip_reason not in DEFERRED_SKIP_REASONS | REVIEW_SKIP_REASONS:
-                old_output = REPO_ROOT / str(current.get("output_path", ""))
-                if old_output.is_file() and old_output.parent.resolve() == output_dir.resolve():
-                    change_tracker.observe(old_output)
-                    old_output.unlink()
-                manifest["sources"].pop(unit.source_id, None)
-            continue
-        if is_unchanged:
-            stats["unchanged"] += 1
-            available_source_ids.add(unit.source_id)
-            continue
+            reasons[reason] = reasons.get(reason, 0) + 1
+            plan.inventory_records.append({
+                "source_id": source_id,
+                "unit_kind": "session",
+                "provider_session_id": provider_session_id,
+                "title": item.get("title") or provider_session_id,
+                "raw_source_path": str(raw_path.resolve()),
+                "raw_source_hash": sha256_file(raw_path),
+                "raw_source_locator": item.get("source_locator") or f"{raw_path.name}@L1-L1",
+                "parse_status": "review",
+                "skip_reason": reason,
+            })
+            seen_requested.add(provider_session_id)
+        missing = requested - seen_requested
+        if missing:
+            raise ValueError(f"Codex session IDs were not found: {', '.join(sorted(missing))}")
+        stats["blocked"] = bool(plan.blocking_reasons)
+        return plan
 
-        document, redactions, title = _render_session(resolved, utc_now()[:10])
-        date = unit.created if unit.created != "unknown" else "undated"
-        output_path = output_dir / f"{date}-{unit.provider_session_id}.md"
-        stats["imported"] += 1
-        stats["redactions"] += redactions
-        if dry_run:
-            available_source_ids.add(unit.source_id)
-            continue
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        change_tracker.observe(output_path)
-        output_path.write_text(document, encoding="utf-8")
-        manifest["version"] = max(int(manifest.get("version", 1)), 2)
-        manifest["sources"][unit.source_id] = {
-            "origin": "codex",
-            "source_kind": "session",
-            "provider": "codex",
-            "thread_kind": "main",
-            "provider_session_id": unit.provider_session_id,
-            "derived_session_key": None,
-            "identity_confidence": unit.identity_confidence,
-            "assistant_final_detection": CODEX_ASSISTANT_FINAL_DETECTION,
-            "source_scope": resolved.source_scope,
-            "forked_from_id": unit.forked_from_id,
-            "fork_parent_source_id": resolved.fork_parent_source_id,
-            "fork_parent_hash": resolved.fork_parent_hash,
-            "source_path": str(unit.source_path.resolve()),
-            "source_locator": unit.locator,
-            "source_hash": unit.content_hash,
-            "output_path": relative_to_repo(output_path),
-            "ingest_status": "ready",
-            "curation_status": current.get("curation_status", "unassessed"),
-            "title": title,
-            "created": unit.created,
-            "omitted_trivial_exchange_count": unit.omitted_trivial_exchange_count,
-            "omitted_fork_prefix_exchange_count": resolved.omitted_fork_prefix_exchange_count,
-            "invalid_jsonl_lines": unit.invalid_line_count,
-            "active_open_turn_count": unit.active_open_turn_count,
-            "superseded_incomplete_turn_count": len(unit.superseded_incomplete_turns),
-            "redaction_count": redactions,
-            "imported_at": utc_now(),
-            "importer_version": CODEX_IMPORTER_VERSION,
-        }
-        if resolved.review_resolution:
-            resolution = resolved.review_resolution
-            manifest["sources"][unit.source_id].update(
-                {
-                    "review_resolution": resolution.decision,
-                    "reviewed_at": resolution.reviewed_at,
-                    "reviewed_by": resolution.reviewed_by,
-                    "review_resolution_hash": resolution.content_hash,
-                    "reviewed_invalid_jsonl_lines": len(resolution.invalid_lines),
-                    "reviewed_superseded_incomplete_turn_count": len(resolution.superseded_turns),
-                }
-            )
-        available_source_ids.add(unit.source_id)
 
-    missing = requested - seen_requested
-    if missing:
-        raise ValueError(f"Codex session IDs were not found: {', '.join(sorted(missing))}")
-    if not dry_run:
-        save_manifest(manifest, manifest_path)
-        change_tracker.append("codex")
-    return stats
+def import_sessions(
+    input_dir: Path,
+    output_dir: Path,
+    manifest_path: Path,
+    *,
+    limit: int | None = None,
+    dry_run: bool = False,
+    session_ids: set[str] | None = None,
+    includes: Iterable[str] | None = None,
+    review_resolutions_path: Path = DEFAULT_REVIEW_RESOLUTIONS,
+) -> dict[str, Any]:
+    return execute_batch(
+        [CodexStrategy(input_dir, output_dir, limit, session_ids, includes, review_resolutions_path)],
+        manifest_path,
+        dry_run=dry_run,
+    )[0].stats
 
 
 def main() -> None:

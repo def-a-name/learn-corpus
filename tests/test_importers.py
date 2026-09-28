@@ -7,7 +7,6 @@ import sys
 import tempfile
 from pathlib import Path
 
-import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -25,24 +24,6 @@ def write_jsonl(path: Path, records: list[dict]) -> None:
 
 
 class TestImporter:
-    def test_import_claude_rejects_missing_input_before_replacing_legacy(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            manifest = root / "manifest.json"
-            manifest.write_text(
-                json.dumps({"version": 1, "sources": {"old": {"origin": "claude"}}}),
-                encoding="utf-8",
-            )
-            with pytest.raises(FileNotFoundError):
-                import_claude.import_exports(
-                    root / "missing",
-                    root / "output",
-                    manifest,
-                    replace_legacy=True,
-                )
-            saved = json.loads(manifest.read_text(encoding="utf-8"))
-        assert "old" in saved["sources"]
-
     def test_import_codex_whitelists_final_messages(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

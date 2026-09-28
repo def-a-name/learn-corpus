@@ -13,16 +13,20 @@ from urllib.parse import unquote, urlsplit
 
 import yaml
 
-from src.corpus.ingest_log import SourceChangeTracker
 from src.corpus.document import yaml_document
-from src.corpus.manifest import load_manifest, save_manifest, utc_now
+from src.corpus.manifest import utc_now
 from src.corpus.paths import MANIFEST_PATH, REPO_ROOT, relative_to_repo
 from src.corpus.storage import (
-    atomic_copy_file,
-    atomic_write_text,
     registered_assets_are_current,
     sha256_file,
     sha256_text,
+)
+from src.ingestion.batch import (
+    InputSnapshot,
+    PlannedFile,
+    PlannedSource,
+    ProviderPlan,
+    execute_batch,
 )
 from src.ingestion.common import (
     MARKDOWN_SOURCE_IMPORTER_VERSION,
@@ -286,7 +290,7 @@ def _stable_id(path: Path, input_root: Path, policy: MarkdownPolicy, relative_pa
         from src.ingestion.import_claude import iter_export_units
 
         matched = next(
-            (unit for unit in iter_export_units(input_root, kind="document") if unit.source_path.resolve() == path.resolve()),
+            (unit for unit in iter_export_units(input_root, kind="document", includes=[relative_path]) if unit.source_path.resolve() == path.resolve()),
             None,
         )
         if matched is not None:
@@ -394,7 +398,7 @@ def prepare_source(path: Path, input_root: Path, policy: MarkdownPolicy) -> Prep
         path=path,
         relative_path=relative_path,
         source_id=source_id,
-        source_hash=sha256_file(path),
+        source_hash=hashlib.sha256(raw).hexdigest(),
         content_fingerprint=sha256_text(normalized_body),
         input_metadata=safe_metadata,
         body=normalized_body,
@@ -507,6 +511,169 @@ def _manifest_record(prepared: PreparedSource, policy: MarkdownPolicy, output_pa
     return record
 
 
+class MarkdownStrategy:
+    """将 note/article 的差异限制在 MarkdownPolicy，返回统一候选计划。"""
+
+    def __init__(
+        self,
+        input_root: Path,
+        policy: MarkdownPolicy,
+        includes: Iterable[str] | None,
+        limit: int | None,
+    ) -> None:
+        self.input_root = input_root
+        self.policy = policy
+        self.includes = includes
+        self.limit = limit
+
+    def _inventory_record(
+        self,
+        path: Path,
+        source_id: str,
+        digest: str,
+        locator: str,
+        title: str,
+        status: str,
+        reason: str,
+        detail: str,
+    ) -> dict[str, Any]:
+        if self.policy.origin == "claude-export":
+            from src.ingestion.import_claude import iter_export_units, unit_inventory_record
+
+            relative_path = path.resolve().relative_to(self.input_root.resolve()).as_posix()
+            unit = next(iter(iter_export_units(
+                self.input_root, kind="document", includes=[relative_path]
+            )), None)
+            if unit is not None:
+                record = unit_inventory_record(unit, status, reason)
+                if detail:
+                    record["review_details"] = [detail]
+                return record
+        record = {
+            "source_id": source_id,
+            "unit_kind": "document",
+            "document_kind": self.policy.layer,
+            "title": title,
+            "raw_source_path": str(path.resolve()),
+            "raw_source_hash": f"sha256:{digest}",
+            "raw_source_locator": locator,
+            "parse_status": status,
+            "skip_reason": reason or None,
+        }
+        if detail:
+            record["review_details"] = [detail]
+        return record
+
+    def prepare(self, manifest: dict[str, Any]) -> ProviderPlan:
+        paths = discover_markdown(self.input_root, self.includes)
+        stats: dict[str, Any] = {
+            "discovered": len(paths), "imported": 0, "unchanged": 0,
+            "skipped": 0, "skip_reasons": {}, "redactions": 0,
+            "assets": 0, "images": 0, "links": 0,
+        }
+        plan = ProviderPlan(
+            provider="claude-export" if self.policy.origin == "claude-export" else f"{self.policy.layer}s",
+            importer=f"{self.policy.layer}s",
+            input_root=self.input_root,
+            output_root=self.policy.output_dir,
+            stats=stats,
+            selected_paths=paths,
+        )
+        canonical_by_fingerprint: dict[str, str] = {}
+        for source_id, item in manifest["sources"].items():
+            if item.get("ingest_status") == "ready" and item.get("layer") == self.policy.layer:
+                fingerprint = str(item.get("content_fingerprint") or "")
+                if fingerprint:
+                    canonical_by_fingerprint.setdefault(fingerprint, source_id)
+
+        for path in paths:
+            relative_path = path.resolve().relative_to(self.input_root.resolve()).as_posix()
+            source_id = _stable_id(path, self.input_root, self.policy, relative_path)
+            raw = path.read_bytes()
+            digest = hashlib.sha256(raw).hexdigest()
+            plan.snapshots.append(InputSnapshot(path, digest))
+            locator = f"{relative_path}@L1-L{max(1, len(raw.splitlines()))}"
+            reason = ""
+            detail = ""
+            status = "ready"
+            prepared: PreparedSource | None = None
+            try:
+                prepared = prepare_source(path, self.input_root, self.policy)
+            except (OSError, MarkdownImportError, ValueError) as exc:
+                detail = str(exc)
+                reason = detail.split(":", 1)[0]
+            if prepared is not None:
+                source_id = prepared.source_id
+                locator = prepared.locator
+                current = manifest["sources"].get(source_id, {})
+                if prepared.source_hash != digest:
+                    reason = "source_changed_during_analysis_review"
+                elif current and (
+                    current.get("origin") != self.policy.origin
+                    or Path(str(current.get("source_path") or "")).resolve() != path.resolve()
+                ):
+                    reason = "source_id_collision_review"
+                else:
+                    canonical = canonical_by_fingerprint.get(prepared.content_fingerprint)
+                    if canonical and canonical != source_id:
+                        reason = "exact_duplicate"
+                if not reason:
+                    output_path = self.policy.output_dir / f"{source_id}.md"
+                    is_unchanged = bool(
+                        current.get("ingest_status") == "ready"
+                        and current.get("source_hash") == prepared.source_hash
+                        and current.get("content_fingerprint") == prepared.content_fingerprint
+                        and current.get("importer_version") == MARKDOWN_SOURCE_IMPORTER_VERSION
+                        and output_path.is_file()
+                        and not source_needs_redaction(output_path)
+                        and registered_assets_are_current(current.get("assets", []))
+                    )
+                    if is_unchanged:
+                        stats["unchanged"] += 1
+                        status = "imported"
+                        canonical_by_fingerprint[prepared.content_fingerprint] = source_id
+                    elif self.limit is not None and stats["imported"] >= self.limit:
+                        reason = "limit_reached"
+                    else:
+                        document = _render_document(prepared, self.policy)
+                        files = tuple(
+                            PlannedFile(asset.stored_path, copy_from=asset.source_path)
+                            for asset in prepared.assets
+                        ) + (PlannedFile(output_path, text=document),)
+                        plan.sources.append(PlannedSource(
+                            source_id,
+                            _manifest_record(prepared, self.policy, output_path, current),
+                            files,
+                        ))
+                        canonical_by_fingerprint[prepared.content_fingerprint] = source_id
+                        plan.snapshots.extend(
+                            InputSnapshot(asset.source_path, asset.digest)
+                            for asset in prepared.assets
+                        )
+                        stats["imported"] += 1
+                        stats["redactions"] += prepared.redaction_count
+                        stats["assets"] += len(prepared.assets)
+                        stats["images"] += len(prepared.scan.image_references)
+                        stats["links"] += prepared.scan.link_count
+            if reason:
+                status = "excluded" if reason in {"exact_duplicate", "limit_reached"} else "review"
+                stats["skipped"] += 1
+                reasons = stats["skip_reasons"]
+                reasons[reason] = reasons.get(reason, 0) + 1
+                if reason not in {"exact_duplicate", "limit_reached"}:
+                    plan.blocking_reasons.append(reason)
+            plan.inventory_records.append(self._inventory_record(
+                path, source_id, digest, locator,
+                prepared.title if prepared else path.stem,
+                status, reason, detail,
+            ))
+        if stats["discovered"] != stats["imported"] + stats["unchanged"] + stats["skipped"]:
+            raise AssertionError("Markdown import discovered count is inconsistent")
+        stats["skip_reasons"] = dict(sorted(stats["skip_reasons"].items()))
+        stats["blocked"] = bool(plan.blocking_reasons)
+        return plan
+
+
 def import_markdown_sources(
     input_root: Path,
     policy: MarkdownPolicy,
@@ -516,143 +683,18 @@ def import_markdown_sources(
     limit: int | None = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    paths = discover_markdown(input_root, includes)
-    manifest = load_manifest(manifest_path)
-    change_tracker = SourceChangeTracker.for_output(policy.output_dir)
-    stats: dict[str, Any] = {
-        "discovered": len(paths),
-        "imported": 0,
-        "unchanged": 0,
-        "skipped": 0,
-        "skip_reasons": {},
-        "redactions": 0,
-        "assets": 0,
-        "images": 0,
-        "links": 0,
-    }
-    prepared_by_path: dict[Path, PreparedSource] = {}
-    errors_by_path: dict[Path, str] = {}
-    for path in paths:
-        try:
-            prepared_by_path[path] = prepare_source(path, input_root, policy)
-        except (OSError, MarkdownImportError, ValueError) as exc:
-            errors_by_path[path] = str(exc)
-
-    canonical_by_fingerprint: dict[str, str] = {}
-    for source_id, item in manifest["sources"].items():
-        if item.get("ingest_status") == "ready" and item.get("layer") == policy.layer:
-            fingerprint = str(item.get("content_fingerprint") or "")
-            if fingerprint:
-                canonical_by_fingerprint.setdefault(fingerprint, source_id)
-
-    for path in paths:
-        relative_path = path.resolve().relative_to(input_root.resolve()).as_posix()
-        fallback_id = _stable_id(path, input_root, policy, relative_path)
-        current = manifest["sources"].get(fallback_id, {})
-        if path in errors_by_path:
-            stats["skipped"] += 1
-            reason = errors_by_path[path].split(":", 1)[0]
-            stats["skip_reasons"][reason] = stats["skip_reasons"].get(reason, 0) + 1
-            if not dry_run:
-                review = dict(current)
-                review.update(
-                    {
-                        "origin": policy.origin,
-                        "source_kind": "document",
-                        "layer": policy.layer,
-                        "source_path": str(path.resolve()),
-                        "source_locator": f"{relative_path}@L1-L1",
-                        "relative_path": relative_path,
-                        "ingest_status": "review",
-                        "curation_status": current.get("curation_status", "unassessed"),
-                        "title": path.stem,
-                        "ingest_issue": errors_by_path[path],
-                        "importer_version": MARKDOWN_SOURCE_IMPORTER_VERSION,
-                    }
-                )
-                manifest["sources"][fallback_id] = review
-            continue
-
-        prepared = prepared_by_path[path]
-        current = manifest["sources"].get(prepared.source_id, {})
-        if current and (
-            current.get("origin") != policy.origin
-            or Path(str(current.get("source_path") or "")).resolve() != prepared.path.resolve()
-        ):
-            stats["skipped"] += 1
-            stats["skip_reasons"]["source_id_collision"] = stats["skip_reasons"].get("source_id_collision", 0) + 1
-            continue
-        canonical = canonical_by_fingerprint.get(prepared.content_fingerprint)
-        if canonical and canonical != prepared.source_id:
-            stats["skipped"] += 1
-            stats["skip_reasons"]["exact_duplicate"] = stats["skip_reasons"].get("exact_duplicate", 0) + 1
-            if not dry_run:
-                manifest["sources"][prepared.source_id] = {
-                    "origin": policy.origin,
-                    "source_kind": "document",
-                    "layer": policy.layer,
-                    "source_path": str(prepared.path.resolve()),
-                    "source_locator": prepared.locator,
-                    "relative_path": prepared.relative_path,
-                    "source_hash": prepared.source_hash,
-                    "content_fingerprint": prepared.content_fingerprint,
-                    "ingest_status": "skipped",
-                    "curation_status": current.get("curation_status", "unassessed"),
-                    "skip_reason": "exact_duplicate",
-                    "duplicate_of": canonical,
-                    "title": prepared.title,
-                    "imported_at": utc_now(),
-                    "importer_version": MARKDOWN_SOURCE_IMPORTER_VERSION,
-                }
-            continue
-        canonical_by_fingerprint[prepared.content_fingerprint] = prepared.source_id
-        output_path = policy.output_dir / f"{prepared.source_id}.md"
-        is_unchanged = bool(
-            current.get("ingest_status") == "ready"
-            and current.get("source_hash") == prepared.source_hash
-            and current.get("content_fingerprint") == prepared.content_fingerprint
-            and current.get("importer_version") == MARKDOWN_SOURCE_IMPORTER_VERSION
-            and output_path.is_file()
-            and not source_needs_redaction(output_path)
-            and registered_assets_are_current(current.get("assets", []))
-        )
-        if is_unchanged:
-            stats["unchanged"] += 1
-            continue
-        if limit is not None and stats["imported"] >= limit:
-            stats["skipped"] += 1
-            stats["skip_reasons"]["limit_reached"] = stats["skip_reasons"].get("limit_reached", 0) + 1
-            continue
-        stats["imported"] += 1
-        stats["redactions"] += prepared.redaction_count
-        stats["assets"] += len(prepared.assets)
-        stats["images"] += len(prepared.scan.image_references)
-        stats["links"] += prepared.scan.link_count
-        if dry_run:
-            continue
-        for asset in prepared.assets:
-            change_tracker.observe(asset.stored_path)
-            atomic_copy_file(asset.source_path, asset.stored_path)
-        change_tracker.observe(output_path)
-        atomic_write_text(output_path, _render_document(prepared, policy))
-        manifest["sources"][prepared.source_id] = _manifest_record(prepared, policy, output_path, current)
-
-    if stats["discovered"] != stats["imported"] + stats["unchanged"] + stats["skipped"]:
-        raise AssertionError("Markdown import discovered count is inconsistent")
-    stats["skip_reasons"] = dict(sorted(stats["skip_reasons"].items()))
-    if not dry_run:
-        manifest["version"] = max(int(manifest.get("version", 1)), 2)
-        save_manifest(manifest, manifest_path)
-        change_tracker.append(f"{policy.layer}s")
-    return stats
+    strategy = MarkdownStrategy(input_root, policy, includes, limit)
+    return execute_batch([strategy], manifest_path, dry_run=dry_run)[0].stats
 
 
 def print_stats(label: str, stats: dict[str, Any], dry_run: bool) -> None:
     reasons = ", ".join(f"{key}={value}" for key, value in stats["skip_reasons"].items()) or "none"
+    state = "dry-run" if dry_run else "blocked" if stats.get("blocked") else "written"
     print(
-        f"{label} ({'dry-run' if dry_run else 'written'}): "
+        f"{label} ({state}): "
         f"discovered={stats['discovered']}, imported={stats['imported']}, "
         f"unchanged={stats['unchanged']}, skipped={stats['skipped']}, "
         f"assets={stats['assets']}, images={stats['images']}, links={stats['links']}, "
         f"redactions={stats['redactions']}, skip_reasons={reasons}"
+        + (f", deferred_by_batch={stats['deferred_by_batch']}" if stats.get("blocked") else "")
     )

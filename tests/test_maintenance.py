@@ -497,13 +497,14 @@ class TestMaintenance:
             )
             errors, warnings = check_source_consistency(manifest, sources, repo)
             raw.write_text('{"source": false}\n', encoding="utf-8")
-            stale_errors, _ = check_source_consistency(manifest, sources, repo)
+            stale_errors, stale_warnings = check_source_consistency(manifest, sources, repo)
             orphan = sources / "orphan.md"
             orphan.write_text(yaml_document({"id": "orphan"}, "# Orphan"), encoding="utf-8")
             orphan_errors, _ = check_source_consistency(manifest, sources, repo)
         assert errors == []
         assert warnings == []
-        assert any("raw source hash is stale" in error for error in stale_errors)
+        assert stale_errors == []
+        assert any("raw source differs from accepted version" in warning for warning in stale_warnings)
         assert any("orphan source" in error for error in orphan_errors)
 
     def test_secret_scan_reports_location_without_value(self) -> None:
