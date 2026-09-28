@@ -12,12 +12,15 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from src.ingestion.build_source_inventory import build_inventory  # noqa: E402
+from src.ingestion.import_notes import import_notes  # noqa: E402
 from src.maintenance.check_corpus import check_source_consistency  # noqa: E402
 from src.maintenance.rebuild_review_queue import build_queue  # noqa: E402
 from src.corpus.removal import SourceRemovalError, remove_source  # noqa: E402
 from src.maintenance.scan_secrets import scan_paths  # noqa: E402
 from src.corpus.document import yaml_document  # noqa: E402
 from src.corpus.storage import sha256_file  # noqa: E402
+from src.corpus import paths as corpus_paths  # noqa: E402
+from src.ingestion import batch as ingestion_batch  # noqa: E402
 
 
 # 所有来源文本、路径和凭据样例都是专用的虚构测试数据。
@@ -146,6 +149,40 @@ class TestMaintenance:
             assert output.is_file()
             assert manifest.read_bytes() == before
             assert not (root / "meta" / "ingest.log").exists()
+
+    def test_removed_note_can_be_imported_again_from_unchanged_raw_file(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            monkeypatch.setattr(corpus_paths, "REPO_ROOT", root)
+            monkeypatch.setattr(ingestion_batch, "REPO_ROOT", root)
+            input_root = root / "raw-notes"
+            input_root.mkdir()
+            raw = input_root / "synthetic-observation.md"
+            raw.write_text("# 虚构观测记录\n\n合成校准结果。\n", encoding="utf-8")
+            output = root / "sources" / "notes"
+            manifest = root / "meta" / "manifest.json"
+            assets = root / "sources" / "assets"
+
+            first = import_notes(input_root, output, manifest, asset_root=assets, includes=[raw.name])
+            source_id = next(iter(json.loads(manifest.read_text(encoding="utf-8"))["sources"]))
+            preview = remove_source(source_id, repo_root=root, dry_run=True)
+            removed = remove_source(source_id, repo_root=root)
+            second = import_notes(input_root, output, manifest, asset_root=assets, includes=[raw.name])
+            saved = json.loads(manifest.read_text(encoding="utf-8"))["sources"]
+            events = [
+                json.loads(line)
+                for line in (root / "meta" / "ingest.log").read_text(encoding="utf-8").splitlines()
+            ]
+
+            assert first["imported"] == 1
+            assert preview["removed"] is False
+            assert removed["removed"] is True
+            assert second["imported"] == 1
+            assert list(saved) == [source_id]
+            assert saved[source_id]["ingest_status"] == "ready"
+            assert raw.is_file()
+            assert len(list(output.glob("*.md"))) == 1
+            assert [event["changes"][0]["action"] for event in events] == ["added", "deleted", "added"]
 
     def test_remove_source_rejects_manifest_dependents_and_shared_assets(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

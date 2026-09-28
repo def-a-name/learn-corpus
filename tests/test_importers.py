@@ -886,7 +886,7 @@ Synthetic skill process output.
             input_dir.mkdir(parents=True)
             (input_dir / "note.md").write_text("# 合成笔记\n\n虚构观测内容。\n", encoding="utf-8")
             stats = import_claude.import_exports(root / "claude-exec-docs", output, manifest, kind="all")
-            saved = json.loads(manifest.read_text(encoding="utf-8"))
+            saved = json.loads(manifest.read_text(encoding="utf-8")) if manifest.exists() else {"sources": {}}
         assert stats["discovered"] == 1
         assert stats["skipped"] == 1
         assert stats["skip_reasons"] == {"document_note_deferred": 1}
@@ -925,9 +925,10 @@ Synthetic skill process output.
             write_session("03-third.md", "第三个虚构校准请求")
             second = import_claude.import_exports(input_dir, output, manifest, limit=1)
         assert first["imported"] == 1
-        assert second["discovered"] == 2
+        assert second["discovered"] == 3
         assert second["unchanged"] == 1
         assert second["imported"] == 1
+        assert second["skip_reasons"] == {"limit_reached": 1}
         assert second["discovered"] == second["imported"] + second["unchanged"] + second["skipped"]
 
     def test_codex_limit_skips_unchanged_and_skipped_units(self) -> None:

@@ -660,7 +660,7 @@ class ClaudeStrategy:
             if unit.kind == "document" and not skip_reason:
                 skip_reason = "document_note_deferred"
             current = manifest["sources"].get(unit.source_id, {})
-            if current and current.get("ingest_status") == "ready" and current.get("source_kind") != "document" and current.get("source_hash") != unit.content_hash and skip_reason:
+            if current and current.get("ingest_status") == "ready" and current.get("source_hash") != unit.content_hash and skip_reason:
                 skip_reason = "existing_source_changed_review"
             if current and current.get("ingest_status") == "ready" and current.get("source_path") != str(unit.source_path.resolve()):
                 skip_reason = "source_id_collision_review"
@@ -707,9 +707,19 @@ class ClaudeStrategy:
                 if status == "review":
                     plan.blocking_reasons.append(skip_reason)
                 inventory_status = status
-                if unit.kind == "document" and current.get("source_kind") == "document" and current.get("ingest_status") == "ready":
+                inventory_reason = skip_reason
+                if unit.kind == "document" and skip_reason == "document_note_deferred":
+                    inventory_status = "ready"
+                    inventory_reason = ""
+                if (
+                    unit.kind == "document"
+                    and current.get("source_kind") == "document"
+                    and current.get("ingest_status") == "ready"
+                    and current.get("source_hash") == unit.content_hash
+                ):
                     inventory_status = "imported"
-                plan.inventory_records.append(unit_inventory_record(unit, inventory_status, skip_reason))
+                    inventory_reason = ""
+                plan.inventory_records.append(unit_inventory_record(unit, inventory_status, inventory_reason))
                 continue
             if is_unchanged:
                 stats["unchanged"] += 1
@@ -773,8 +783,16 @@ class ClaudeStrategy:
                 "parse_status": "review",
                 "skip_reason": "source_units_missing_review",
             })
+        ignored_paths: set[Path] = set()
         for path in paths:
             if path.resolve() in parsed_paths:
+                continue
+            if any(iter_export_units(
+                self.input_dir,
+                "all",
+                [path.relative_to(self.input_dir).as_posix()],
+            )):
+                ignored_paths.add(path.resolve())
                 continue
             if any(record.get("raw_source_path") == str(path.resolve()) for record in plan.inventory_records):
                 continue
@@ -792,6 +810,8 @@ class ClaudeStrategy:
                 "parse_status": "excluded",
                 "skip_reason": "empty_export_excluded",
             })
+        plan.selected_paths = [path for path in paths if path.resolve() not in ignored_paths]
+        plan.snapshots = [snapshot for snapshot in plan.snapshots if snapshot.path.resolve() not in ignored_paths]
         stats["blocked"] = bool(plan.blocking_reasons)
         return plan
 

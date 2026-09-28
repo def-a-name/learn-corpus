@@ -228,7 +228,10 @@ tags: [synthetic]
                 claude,
                 root / "sources" / "conversations" / "claude",
                 manifest,
-                kind="all",
+                kind="session",
+            )
+            inventory_after_session = json.loads(
+                (root / "meta" / "source-inventory.json").read_text(encoding="utf-8")
             )
             inventory = build_inventory(
                 claude,
@@ -242,6 +245,7 @@ tags: [synthetic]
             saved = json.loads(manifest.read_text(encoding="utf-8"))
 
         assert claude_input["retained"] == 1
+        assert inventory_after_session["inputs"][0]["units"][0]["parse_status"] == "ready"
         assert claude_input["skipped"] == 0
         assert claude_input["units"][0]["document_kind"] == "instruction"
         assert claude_input["units"][0]["parse_status"] == "imported"

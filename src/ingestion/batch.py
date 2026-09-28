@@ -361,22 +361,25 @@ def execute_batch(
     manifest = load_manifest(manifest_path)
     manifest_digest = _manifest_digest(manifest_path)
     plans = [strategy.prepare(manifest) for strategy in strategies]
-    mark_inventory_collisions(plans, manifest_path.parent / "source-inventory.json")
-    mark_target_conflicts(plans, manifest)
-    validate_plan_targets(plans, manifest)
+    effective_plans = [plan for plan in plans if plan.selected_paths or plan.inventory_records or plan.sources]
+    mark_inventory_collisions(effective_plans, manifest_path.parent / "source-inventory.json")
+    mark_target_conflicts(effective_plans, manifest)
+    validate_plan_targets(effective_plans, manifest)
     if dry_run:
         return plans
-    validate_snapshots(plans)
+    if not effective_plans:
+        return plans
+    validate_snapshots(effective_plans)
     if _manifest_digest(manifest_path) != manifest_digest:
         raise ValueError("manifest changed during import preparation")
-    update_auxiliary_state(plans, manifest_path)
+    update_auxiliary_state(effective_plans, manifest_path)
     if any(plan.blocking_reasons for plan in plans):
         for plan in plans:
             plan.stats["deferred_by_batch"] = plan.stats["imported"]
             plan.stats["imported"] = 0
             plan.stats["blocked"] = True
         return plans
-    commit_plans(plans, manifest_path, expected_manifest_digest=manifest_digest)
+    commit_plans(effective_plans, manifest_path, expected_manifest_digest=manifest_digest)
     return plans
 
 
