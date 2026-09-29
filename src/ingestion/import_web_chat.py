@@ -30,7 +30,7 @@ from src.ingestion.common import (
     redact_secrets,
     source_needs_redaction,
 )
-from src.ingestion.markdown_sources import MarkdownImportError, scan_markdown
+from src.ingestion.import_markdown import MarkdownImportError, scan_markdown
 
 
 DEFAULT_INPUT = REPO_ROOT.parent / "web-chats"

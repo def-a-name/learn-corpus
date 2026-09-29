@@ -22,7 +22,7 @@ from src.ingestion.import_web_chat import DEFAULT_ASSETS as WEB_CHAT_ASSETS
 from src.ingestion.import_web_chat import DEFAULT_INPUT as WEB_CHAT_INPUT
 from src.ingestion.import_web_chat import DEFAULT_OUTPUT as WEB_CHAT_OUTPUT
 from src.ingestion.import_web_chat import WebChatStrategy
-from src.ingestion.markdown_sources import MarkdownPolicy, MarkdownStrategy
+from src.ingestion.import_markdown import MarkdownPolicy, MarkdownStrategy
 from src.ingestion.import_codex import DEFAULT_REVIEW_RESOLUTIONS
 
 

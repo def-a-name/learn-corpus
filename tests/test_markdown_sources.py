@@ -13,7 +13,7 @@ from src.ingestion import import_claude  # noqa: E402
 from src.ingestion.build_source_inventory import build_inventory  # noqa: E402
 from src.ingestion.import_articles import import_articles  # noqa: E402
 from src.ingestion.import_notes import import_notes  # noqa: E402
-from src.ingestion.markdown_sources import content_fingerprint  # noqa: E402
+from src.ingestion.import_markdown import content_fingerprint  # noqa: E402
 from src.maintenance.check_corpus import check_source_consistency  # noqa: E402
 from src.corpus.document import parse_frontmatter  # noqa: E402
 

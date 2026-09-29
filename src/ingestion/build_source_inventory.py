@@ -68,7 +68,7 @@ def _analysis_strategy(
     from src.ingestion.import_claude import ClaudeStrategy
     from src.ingestion.import_codex import CodexStrategy
     from src.ingestion.import_web_chat import WebChatStrategy
-    from src.ingestion.markdown_sources import MarkdownPolicy, MarkdownStrategy
+    from src.ingestion.import_markdown import MarkdownPolicy, MarkdownStrategy
 
     source_root = (manifest_path.parent.parent if manifest_path.parent.name == "meta" else manifest_path.parent) / "sources"
     if provider == "claude-export":

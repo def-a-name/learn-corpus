@@ -10,7 +10,7 @@ from src.ingestion import batch as ingestion_batch
 from src.ingestion import import_claude, import_codex, import_web_chat
 from src.ingestion.batch import execute_batch
 from src.ingestion.import_notes import import_notes
-from src.ingestion.markdown_sources import MarkdownPolicy, MarkdownStrategy
+from src.ingestion.import_markdown import MarkdownPolicy, MarkdownStrategy
 
 
 @pytest.fixture
