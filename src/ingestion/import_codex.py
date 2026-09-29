@@ -80,6 +80,7 @@ class CodexExchange:
     user_locator: str
     user_message_locators: tuple[str, ...]
     assistant_locator: str
+    recovered_incomplete_sequence: bool = False
 
     @property
     def user_text(self) -> str:
@@ -180,6 +181,7 @@ class CodexSession:
     active_open_turn_count: int
     superseded_incomplete_turns: tuple[SupersededIncompleteTurn, ...]
     multi_user_exchange_count: int
+    recovered_incomplete_turn_count: int
     ambiguous_user_turn_count: int
     ambiguous_final_turn_count: int
     extra_session_meta_count: int
@@ -205,6 +207,7 @@ class CodexResolvedSession:
     fork_parent_source_id: str | None = None
     fork_parent_hash: str | None = None
     omitted_fork_prefix_exchange_count: int = 0
+    fork_without_shared_prefix: bool = False
     review_resolution: CodexReviewResolution | None = None
 
 
@@ -433,13 +436,29 @@ def parse_session(path: Path, input_root: Path | None = None) -> CodexSession:
     ambiguous_finals = 0
     orphan_finals = 0
     multi_user_exchanges = 0
+    recovered_incomplete_turns = 0
+    pending_incomplete: list[tuple[_Turn, str]] = []
     notes: set[str] = set()
+
+    def omit_pending_incomplete() -> None:
+        nonlocal interruptions, unpaired_users, ambiguous_users
+        if not pending_incomplete:
+            return
+        interruptions += sum(terminal == "aborted" for _, terminal in pending_incomplete)
+        unpaired_users += sum(turn.human_user_message_count for turn, _ in pending_incomplete)
+        ambiguous_users += sum(
+            turn.human_user_message_count > 1 for turn, _ in pending_incomplete
+        )
+        pending_incomplete.clear()
 
     def finish_turn(terminal: str, next_start_line: int | None = None) -> None:
         nonlocal current, active_open_turns, interruptions, unpaired_users
         nonlocal ambiguous_users, ambiguous_finals, orphan_finals, multi_user_exchanges
+        nonlocal recovered_incomplete_turns
         if current is None:
             return
+        finished = current
+        current = None
         if terminal == "active":
             active_open_turns += 1
         elif terminal == "superseded":
@@ -447,70 +466,119 @@ def parse_session(path: Path, input_root: Path | None = None) -> CodexSession:
                 raise ValueError("superseded turn has no following task start line")
             superseded_incomplete_turns.append(
                 SupersededIncompleteTurn(
-                    start_line=current.start_line,
+                    start_line=finished.start_line,
                     next_start_line=next_start_line,
                 )
             )
-        elif terminal == "aborted":
-            interruptions += 1
         assistant_line = (
-            current.assistant_finals[0][0]
-            if len(current.assistant_finals) == 1
+            finished.assistant_finals[0][0]
+            if len(finished.assistant_finals) == 1
             else None
         )
         pairable = bool(
             terminal == "complete"
-            and current.human_users
+            and finished.human_users
             and assistant_line is not None
-            and all(end_line < assistant_line for _, end_line, _ in current.human_users)
+            and all(end_line < assistant_line for _, end_line, _ in finished.human_users)
         )
-        if (
-            current.human_users
-            and assistant_line is not None
-            and not pairable
-        ) or (current.human_user_message_count > 1 and not pairable):
-            ambiguous_users += 1
-        if len(current.assistant_finals) > 1:
+        incomplete_candidate = bool(
+            terminal in {"aborted", "complete"}
+            and finished.human_users
+            and not finished.assistant_finals
+        )
+        if not incomplete_candidate:
+            if (
+                finished.human_users
+                and assistant_line is not None
+                and not pairable
+            ) or (finished.human_user_message_count > 1 and not pairable):
+                ambiguous_users += 1
+        if len(finished.assistant_finals) > 1:
             ambiguous_finals += 1
+
+        if incomplete_candidate:
+            pending_incomplete.append((finished, terminal))
+            return
+
+        if terminal == "aborted":
+            omit_pending_incomplete()
+            interruptions += 1
+            if finished.human_users:
+                unpaired_users += finished.human_user_message_count
+            elif finished.assistant_finals:
+                orphan_finals += len(finished.assistant_finals)
+            return
+
+        recovered = bool(
+            pairable
+            and pending_incomplete
+        )
+        if recovered:
+            recovered_from = tuple(pending_incomplete)
+            pending_incomplete.clear()
+            recovered_incomplete_turns += len(recovered_from)
+            human_items = [
+                *(
+                    (turn.ordinal, start_line, end_line, text)
+                    for turn, _ in recovered_from
+                    for start_line, end_line, text in turn.human_users
+                ),
+                *(
+                    (finished.ordinal, start_line, end_line, text)
+                    for start_line, end_line, text in finished.human_users
+                ),
+            ]
+        else:
+            omit_pending_incomplete()
+            human_items = [
+                (finished.ordinal, start_line, end_line, text)
+                for start_line, end_line, text in finished.human_users
+            ]
+
         if pairable:
-            if current.human_user_message_count > 1:
+            if len(human_items) > 1:
                 multi_user_exchanges += 1
-            user_start_line = current.human_users[0][0]
-            user_end_line = current.human_users[-1][1]
-            assistant_line, assistant_text = current.assistant_finals[0]
+            user_start_line = human_items[0][1]
+            user_end_line = human_items[-1][2]
+            assistant_line, assistant_text = finished.assistant_finals[0]
             user_message_locators = tuple(
                 format_line_locator(
-                    f"{semantic_locator}/Turn:{current.ordinal}/User:{index}",
+                    f"{semantic_locator}/Turn:{item_turn}/User:{index}",
                     start_line,
                     end_line,
                 )
-                for index, (start_line, end_line, _) in enumerate(
-                    current.human_users,
+                for index, (item_turn, start_line, end_line, _) in enumerate(
+                    human_items,
                     start=1,
                 )
             )
+            turn_label = (
+                f"{human_items[0][0]}-{finished.ordinal}"
+                if recovered
+                else str(finished.ordinal)
+            )
             exchanges.append(
                 CodexExchange(
-                    turn_index=current.ordinal,
-                    user_messages=tuple(text for _, _, text in current.human_users),
+                    turn_index=finished.ordinal,
+                    user_messages=tuple(text for _, _, _, text in human_items),
                     assistant_text=assistant_text,
                     user_locator=format_line_locator(
-                        f"{semantic_locator}/Turn:{current.ordinal}/User",
+                        f"{semantic_locator}/Turn:{turn_label}/User",
                         user_start_line,
                         user_end_line,
                     ),
                     user_message_locators=user_message_locators,
                     assistant_locator=format_line_locator(
-                        f"{semantic_locator}/Turn:{current.ordinal}/AssistantFinal", assistant_line, assistant_line
+                        f"{semantic_locator}/Turn:{finished.ordinal}/AssistantFinal", assistant_line, assistant_line
                     ),
+                    recovered_incomplete_sequence=recovered,
                 )
             )
         else:
-            if current.human_users:
-                unpaired_users += current.human_user_message_count
-            elif current.assistant_finals:
-                orphan_finals += len(current.assistant_finals)
-        current = None
+            if finished.human_users:
+                unpaired_users += finished.human_user_message_count
+            elif finished.assistant_finals:
+                orphan_finals += len(finished.assistant_finals)
 
     for line_number, record in records:
         record_type = record.get("type")
@@ -597,6 +665,7 @@ def parse_session(path: Path, input_root: Path | None = None) -> CodexSession:
             finish_turn("complete" if payload_type == "task_complete" else "aborted")
 
     finish_turn("active")
+    omit_pending_incomplete()
     if unpaired_users:
         notes.add("存在没有显式 assistant final 的 human user turn；该 turn 未写入标准化正文。")
     if orphan_finals:
@@ -607,6 +676,8 @@ def parse_session(path: Path, input_root: Path | None = None) -> CodexSession:
         notes.add("历史 task 未见终止事件且已被后续 task 取代；该 turn 未写入标准化正文。")
     if invalid_lines:
         notes.add("文件包含无法解析的 JSONL 行。")
+    if recovered_incomplete_turns:
+        notes.add("相邻完成 task 恢复了此前连续未形成 final 的用户请求。")
     if len(session_metas) > 1:
         notes.add("文件包含额外 session_meta；身份只取文件首个 metadata。")
 
@@ -658,6 +729,7 @@ def parse_session(path: Path, input_root: Path | None = None) -> CodexSession:
         active_open_turn_count=active_open_turns,
         superseded_incomplete_turns=tuple(superseded_incomplete_turns),
         multi_user_exchange_count=multi_user_exchanges,
+        recovered_incomplete_turn_count=recovered_incomplete_turns,
         ambiguous_user_turn_count=ambiguous_users,
         ambiguous_final_turn_count=ambiguous_finals,
         extra_session_meta_count=max(len(session_metas) - 1, 0),
@@ -837,6 +909,20 @@ def resolve_session_units(
 
         prefix = _common_exchange_prefix(parent, unit)
         if prefix == 0:
+            if unit.exchanges and unit.exchanges[0].recovered_incomplete_sequence:
+                result = CodexResolvedSession(
+                    unit=unit,
+                    exchanges=unit.exchanges,
+                    title=unit.title,
+                    source_scope="fork_delta",
+                    skip_reason="",
+                    fork_parent_source_id=parent.source_id,
+                    fork_parent_hash=parent.content_hash,
+                    fork_without_shared_prefix=True,
+                    review_resolution=applied_resolution,
+                )
+                resolved[unit.provider_session_id] = result
+                return result
             result = CodexResolvedSession(
                 unit=unit,
                 exchanges=unit.exchanges,
@@ -994,6 +1080,8 @@ def unit_inventory_record(
             for item in unit.superseded_incomplete_turns
         ],
         "multi_user_exchange_count": unit.multi_user_exchange_count,
+        "recovered_incomplete_turn_count": unit.recovered_incomplete_turn_count,
+        "fork_without_shared_prefix": resolved.fork_without_shared_prefix,
         "ambiguous_user_turn_count": unit.ambiguous_user_turn_count,
         "ambiguous_final_turn_count": unit.ambiguous_final_turn_count,
         "extra_session_meta_count": unit.extra_session_meta_count,
@@ -1037,11 +1125,17 @@ def _render_session(resolved: CodexResolvedSession, imported: str) -> tuple[str,
                     )
                 )
             )
+        recovery_metadata = (
+            "- **Recovered incomplete sequence**: true\n"
+            if exchange.recovered_incomplete_sequence
+            else ""
+        )
         rendered.append(
             f"## Exchange {ordinal}\n\n"
             f"- **Turn**: {exchange.turn_index}\n"
             f"- **User locator**: `{exchange.user_locator}`\n"
             f"{user_message_metadata}"
+            f"{recovery_metadata}"
             f"- **Assistant locator**: `{exchange.assistant_locator}`\n\n"
             f"### Human user\n\n{user_text}\n\n"
             f"### Assistant final\n\n{assistant_text}"
@@ -1084,6 +1178,8 @@ def _render_session(resolved: CodexResolvedSession, imported: str) -> tuple[str,
         "omitted_interrupted_count": unit.omitted_interrupted_count,
         "omitted_unpaired_user_count": unit.omitted_unpaired_user_count,
         "multi_user_exchange_count": unit.multi_user_exchange_count,
+        "recovered_incomplete_turn_count": unit.recovered_incomplete_turn_count,
+        "fork_without_shared_prefix": resolved.fork_without_shared_prefix,
         "invalid_jsonl_lines": unit.invalid_line_count,
         "active_open_turn_count": unit.active_open_turn_count,
         "superseded_incomplete_turn_count": len(unit.superseded_incomplete_turns),
@@ -1115,8 +1211,13 @@ def _render_session(resolved: CodexResolvedSession, imported: str) -> tuple[str,
         "> 本页从 Codex rollout JSONL 生成，只保留主线程 human user 与显式 `phase=final_answer`。"
         "developer、commentary、tool、reasoning、compaction 和中断事件只计数，不复制正文。\n\n"
         + (
-            f"> 该会话从 `{unit.forked_from_id}` fork；已省略与父会话完全相同的"
-            f" {resolved.omitted_fork_prefix_exchange_count} 个 exchange，本页只保留分叉后的新内容。\n\n"
+            (
+                f"> 该会话从 `{unit.forked_from_id}` fork；父子 rollout 没有共同的完整 exchange 前缀，"
+                "但子会话以连续未完成 task 恢复首个 exchange；本页保留子会话中可验证的分叉内容。\n\n"
+                if resolved.fork_without_shared_prefix
+                else f"> 该会话从 `{unit.forked_from_id}` fork；已省略与父会话完全相同的"
+                f" {resolved.omitted_fork_prefix_exchange_count} 个 exchange，本页只保留分叉后的新内容。\n\n"
+            )
             if unit.forked_from_id
             else ""
         )
@@ -1171,6 +1272,7 @@ class CodexStrategy:
         "omitted_superseded_turns": 0,
         "omitted_unpaired_users": 0,
         "multi_user_exchanges": 0,
+        "recovered_incomplete_turns": 0,
         "invalid_lines": 0,
         "redactions": 0,
         }
@@ -1255,6 +1357,9 @@ class CodexStrategy:
             stats["omitted_superseded_turns"] += len(unit.superseded_incomplete_turns)
             stats["omitted_unpaired_users"] += unit.omitted_unpaired_user_count
             stats["multi_user_exchanges"] += unit.multi_user_exchange_count
+            stats["recovered_incomplete_turns"] += (
+                unit.recovered_incomplete_turn_count
+            )
             stats["invalid_lines"] += unit.invalid_line_count
 
             if skip_reason:
@@ -1309,6 +1414,10 @@ class CodexStrategy:
                 "active_open_turn_count": unit.active_open_turn_count,
                 "superseded_incomplete_turn_count": len(unit.superseded_incomplete_turns),
                 "multi_user_exchange_count": unit.multi_user_exchange_count,
+                "recovered_incomplete_turn_count": (
+                    unit.recovered_incomplete_turn_count
+                ),
+                "fork_without_shared_prefix": resolved.fork_without_shared_prefix,
                 "redaction_count": redactions,
                 "imported_at": utc_now(),
                 "importer_version": CODEX_IMPORTER_VERSION,

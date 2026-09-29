@@ -886,6 +886,108 @@ class TestImporter:
         assert resolved["identical"].skip_reason == "fork_no_novel_exchange"
         assert resolved["identical"].omitted_fork_prefix_exchange_count == 1
 
+    def test_codex_recovers_incomplete_sequence_as_zero_prefix_fork_delta(self) -> None:
+        def meta(session_id: str, **extra: str) -> dict:
+            payload = {
+                "id": session_id,
+                "timestamp": "2026-09-30T00:00:00Z",
+                "source": "cli",
+                "thread_source": "user",
+            }
+            payload.update(extra)
+            return {"type": "session_meta", "payload": payload}
+
+        def turn(user: str, assistant: str | None, *, aborted: bool = False) -> list[dict]:
+            records = [
+                {"type": "event_msg", "payload": {"type": "task_started"}},
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": user}],
+                    },
+                },
+            ]
+            if assistant is not None:
+                records.append(
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "phase": "final_answer",
+                            "content": [{"type": "output_text", "text": assistant}],
+                        },
+                    }
+                )
+            records.append(
+                {
+                    "type": "event_msg",
+                    "payload": {"type": "turn_aborted" if aborted else "task_complete"},
+                }
+            )
+            return records
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            input_dir = root / "input"
+            output = root / "sources" / "conversations" / "codex"
+            manifest = root / "meta" / "manifest.json"
+            parent_records = [meta("parent")]
+            parent_records.extend(turn("父会话中的既有请求", "父会话中的既有回复"))
+            parent_records.extend(turn("讲解虚构应用工厂的设计", None, aborted=True))
+            child_records = [meta("child", forked_from_id="parent")]
+            child_records.extend(turn("讲解虚构应用工厂的测试", None, aborted=True))
+            child_records.extend(turn("补充虚构兼容性约束", None))
+            child_records.extend(turn("换个方式，先从入口讲起", "虚构应用工厂讲解完成。"))
+            child_records.extend(turn("补充一个虚构问题", "补充回复。"))
+            write_jsonl(input_dir / "parent.jsonl", parent_records)
+            write_jsonl(input_dir / "child.jsonl", child_records)
+
+            parsed = {
+                unit.provider_session_id: unit
+                for unit in import_codex.iter_session_units(input_dir)
+            }
+            resolved = {
+                item.unit.provider_session_id: item
+                for item in import_codex.resolve_session_units(parsed.values())
+            }
+            stats = import_codex.import_sessions(input_dir, output, manifest)
+            saved = json.loads(manifest.read_text(encoding="utf-8"))
+            child_entry = saved["sources"]["codex-child"]
+            child_document = (root / child_entry["output_path"]).read_text(encoding="utf-8")
+            errors, warnings = check_source_consistency(manifest, root / "sources", root)
+
+        child = parsed["child"]
+        first_exchange = child.exchanges[0]
+        child_result = resolved["child"]
+        assert first_exchange.user_messages == (
+            "讲解虚构应用工厂的测试",
+            "补充虚构兼容性约束",
+            "换个方式，先从入口讲起",
+        )
+        assert first_exchange.recovered_incomplete_sequence
+        assert "/Turn:1/User:1@" in first_exchange.user_message_locators[0]
+        assert "/Turn:2/User:2@" in first_exchange.user_message_locators[1]
+        assert "/Turn:3/User:3@" in first_exchange.user_message_locators[2]
+        assert child.recovered_incomplete_turn_count == 2
+        assert child.omitted_interrupted_count == 0
+        assert child.omitted_unpaired_user_count == 0
+        assert child.multi_user_exchange_count == 1
+        assert child_result.skip_reason == ""
+        assert child_result.source_scope == "fork_delta"
+        assert child_result.fork_without_shared_prefix
+        assert child_result.omitted_fork_prefix_exchange_count == 0
+        assert stats["imported"] == 2
+        assert stats["recovered_incomplete_turns"] == 2
+        assert child_entry["forked_from_id"] == "parent"
+        assert child_entry["fork_without_shared_prefix"] is True
+        assert "Recovered incomplete sequence**: true" in child_document
+        assert "父子 rollout 没有共同的完整 exchange 前缀" in child_document
+        assert errors == []
+        assert warnings == []
+
     def test_import_claude_whitelists_main_human_and_final(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

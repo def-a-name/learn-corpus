@@ -225,6 +225,8 @@ def check_source_consistency(
             "omitted_trivial_exchange_count",
             "omitted_unpaired_user_count",
             "omitted_fork_prefix_exchange_count",
+            "recovered_incomplete_turn_count",
+            "fork_without_shared_prefix",
             "invalid_jsonl_lines",
             "active_open_turn_count",
             "superseded_incomplete_turn_count",
@@ -411,6 +413,32 @@ def check_source_consistency(
             if int(item.get("multi_user_exchange_count") or 0) != unit.multi_user_exchange_count:
                 errors.append(
                     f"manifest {source_id}: manifest multi-user exchange count differs "
+                    "from raw rollout"
+                )
+            if (
+                int(metadata.get("recovered_incomplete_turn_count") or 0)
+                != unit.recovered_incomplete_turn_count
+            ):
+                errors.append(
+                    f"manifest {source_id}: Codex recovered incomplete turn count differs "
+                    "from raw rollout"
+                )
+            if (
+                int(item.get("recovered_incomplete_turn_count") or 0)
+                != unit.recovered_incomplete_turn_count
+            ):
+                errors.append(
+                    f"manifest {source_id}: manifest recovered incomplete turn count differs "
+                    "from raw rollout"
+                )
+            if bool(metadata.get("fork_without_shared_prefix")) != resolved.fork_without_shared_prefix:
+                errors.append(
+                    f"manifest {source_id}: Codex fork shared-prefix recovery differs "
+                    "from raw rollout"
+                )
+            if bool(item.get("fork_without_shared_prefix")) != resolved.fork_without_shared_prefix:
+                errors.append(
+                    f"manifest {source_id}: manifest fork shared-prefix recovery differs "
                     "from raw rollout"
                 )
             if str(metadata.get("source_scope") or "") != resolved.source_scope:
