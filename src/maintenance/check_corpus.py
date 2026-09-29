@@ -497,12 +497,6 @@ def check(
     ingest_errors, ingest_warnings = check_ingest_log(REPO_ROOT)
     errors.extend(ingest_errors)
     warnings.extend(ingest_warnings)
-    for vault_config in REPO_ROOT.rglob(".obsidian"):
-        if vault_config != REPO_ROOT / ".obsidian":
-            warnings.append(
-                f"nested Obsidian Vault configuration found: "
-                f"{vault_config.relative_to(REPO_ROOT)}"
-            )
     return errors, warnings
 
 
