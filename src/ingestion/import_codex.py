@@ -39,6 +39,18 @@ AGENTS_RUNTIME_USER_ENVELOPE = re.compile(
     r"(?:\s*<environment_context>.*?</environment_context>)?\s*\Z",
     re.DOTALL,
 )
+SKILL_RUNTIME_USER_ENVELOPE = re.compile(
+    r"\A<skill>\s*"
+    r"<name>[^<\r\n]+</name>\s*"
+    r"<path>[^<\r\n]+</path>\s*"
+    r"---(?:\r?\n).*?</skill>\s*\Z",
+    re.DOTALL,
+)
+QUESTION_REPLY_USER_ENVELOPE = re.compile(
+    r"\A<send_user_message_question_reply>\s*(.*?)\s*"
+    r"</send_user_message_question_reply>\s*\Z",
+    re.DOTALL,
+)
 REVIEW_SKIP_REASONS = {
     "fork_cycle_review",
     "fork_parent_missing_review",
@@ -63,10 +75,22 @@ DEFERRED_SKIP_REASONS = {
 @dataclass(frozen=True)
 class CodexExchange:
     turn_index: int
-    user_text: str
+    user_messages: tuple[str, ...]
     assistant_text: str
     user_locator: str
+    user_message_locators: tuple[str, ...]
     assistant_locator: str
+
+    @property
+    def user_text(self) -> str:
+        """按原始顺序把同一 task 的用户消息渲染为一个 human item。"""
+
+        if len(self.user_messages) == 1:
+            return self.user_messages[0]
+        return "\n\n".join(
+            f"#### User message {index}\n\n{text}"
+            for index, text in enumerate(self.user_messages, start=1)
+        )
 
 
 @dataclass(frozen=True)
@@ -155,6 +179,7 @@ class CodexSession:
     invalid_lines: tuple[InvalidJsonlLine, ...]
     active_open_turn_count: int
     superseded_incomplete_turns: tuple[SupersededIncompleteTurn, ...]
+    multi_user_exchange_count: int
     ambiguous_user_turn_count: int
     ambiguous_final_turn_count: int
     extra_session_meta_count: int
@@ -187,9 +212,39 @@ class CodexResolvedSession:
 class _Turn:
     ordinal: int
     start_line: int
-    human_users: list[tuple[int, str]] = field(default_factory=list)
+    human_users: list[tuple[int, int, str]] = field(default_factory=list)
+    human_user_message_count: int = 0
     assistant_finals: list[tuple[int, str]] = field(default_factory=list)
     turn_context_seen: bool = False
+
+
+def _normalize_question_reply(raw: str) -> str | None:
+    """把 Codex 结构化提问回复信封还原为可读的用户内容。"""
+
+    match = QUESTION_REPLY_USER_ENVELOPE.fullmatch(raw)
+    if not match:
+        return None
+    try:
+        replies = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(replies, list) or not replies:
+        return None
+
+    rendered: list[str] = []
+    for reply in replies:
+        if not isinstance(reply, dict):
+            return None
+        question = reply.get("question")
+        answer = reply.get("answer")
+        if not isinstance(question, str) or not isinstance(answer, str):
+            return None
+        question = clean_message(question)
+        answer = clean_message(answer)
+        if not question or not answer:
+            return None
+        rendered.append(f"助手问题：{question}\n用户回答：{answer}")
+    return "\n\n".join(rendered)
 
 
 def _classify_user_text(
@@ -199,8 +254,13 @@ def _classify_user_text(
 ) -> tuple[str, str]:
     if before_turn_context and AGENTS_RUNTIME_USER_ENVELOPE.fullmatch(raw):
         return "runtime", ""
+    if SKILL_RUNTIME_USER_ENVELOPE.fullmatch(raw):
+        return "runtime", ""
     if is_noise_message(raw) or RUNTIME_USER_TAG.search(raw):
         return "runtime", ""
+    question_reply = _normalize_question_reply(raw)
+    if question_reply is not None:
+        return "structured_reply", question_reply
     cleaned = clean_message(raw)
     if not cleaned:
         return "runtime", ""
@@ -372,11 +432,12 @@ def parse_session(path: Path, input_root: Path | None = None) -> CodexSession:
     ambiguous_users = 0
     ambiguous_finals = 0
     orphan_finals = 0
+    multi_user_exchanges = 0
     notes: set[str] = set()
 
     def finish_turn(terminal: str, next_start_line: int | None = None) -> None:
         nonlocal current, active_open_turns, interruptions, unpaired_users
-        nonlocal ambiguous_users, ambiguous_finals, orphan_finals
+        nonlocal ambiguous_users, ambiguous_finals, orphan_finals, multi_user_exchanges
         if current is None:
             return
         if terminal == "active":
@@ -392,21 +453,53 @@ def parse_session(path: Path, input_root: Path | None = None) -> CodexSession:
             )
         elif terminal == "aborted":
             interruptions += 1
-        if len(current.human_users) > 1:
+        assistant_line = (
+            current.assistant_finals[0][0]
+            if len(current.assistant_finals) == 1
+            else None
+        )
+        pairable = bool(
+            terminal == "complete"
+            and current.human_users
+            and assistant_line is not None
+            and all(end_line < assistant_line for _, end_line, _ in current.human_users)
+        )
+        if (
+            current.human_users
+            and assistant_line is not None
+            and not pairable
+        ) or (current.human_user_message_count > 1 and not pairable):
             ambiguous_users += 1
         if len(current.assistant_finals) > 1:
             ambiguous_finals += 1
-        if terminal == "complete" and len(current.human_users) == 1 and len(current.assistant_finals) == 1:
-            user_line, user_text = current.human_users[0]
+        if pairable:
+            if current.human_user_message_count > 1:
+                multi_user_exchanges += 1
+            user_start_line = current.human_users[0][0]
+            user_end_line = current.human_users[-1][1]
             assistant_line, assistant_text = current.assistant_finals[0]
+            user_message_locators = tuple(
+                format_line_locator(
+                    f"{semantic_locator}/Turn:{current.ordinal}/User:{index}",
+                    start_line,
+                    end_line,
+                )
+                for index, (start_line, end_line, _) in enumerate(
+                    current.human_users,
+                    start=1,
+                )
+            )
             exchanges.append(
                 CodexExchange(
                     turn_index=current.ordinal,
-                    user_text=user_text,
+                    user_messages=tuple(text for _, _, text in current.human_users),
                     assistant_text=assistant_text,
                     user_locator=format_line_locator(
-                        f"{semantic_locator}/Turn:{current.ordinal}/User", user_line, user_line
+                        f"{semantic_locator}/Turn:{current.ordinal}/User",
+                        user_start_line,
+                        user_end_line,
                     ),
+                    user_message_locators=user_message_locators,
                     assistant_locator=format_line_locator(
                         f"{semantic_locator}/Turn:{current.ordinal}/AssistantFinal", assistant_line, assistant_line
                     ),
@@ -414,7 +507,7 @@ def parse_session(path: Path, input_root: Path | None = None) -> CodexSession:
             )
         else:
             if current.human_users:
-                unpaired_users += len(current.human_users)
+                unpaired_users += current.human_user_message_count
             elif current.assistant_finals:
                 orphan_finals += len(current.assistant_finals)
         current = None
@@ -457,7 +550,16 @@ def parse_session(path: Path, input_root: Path | None = None) -> CodexSession:
                     notes.add("发现不在 task 生命周期内的 human user message；未写入标准化正文。")
                 else:
                     human_users += 1
-                    current.human_users.append((line_number, cleaned))
+                    current.human_user_message_count += 1
+                    if classification == "structured_reply" and current.human_users:
+                        start_line, _, existing = current.human_users[-1]
+                        current.human_users[-1] = (
+                            start_line,
+                            line_number,
+                            f"{existing}\n\n{cleaned}",
+                        )
+                    else:
+                        current.human_users.append((line_number, line_number, cleaned))
                 continue
             if role == "assistant":
                 assistant_text = clean_message(extract_text(payload.get("content"), {"output_text"}))
@@ -514,7 +616,10 @@ def parse_session(path: Path, input_root: Path | None = None) -> CodexSession:
         if not is_exact_meaningless_exchange(exchange.user_text, exchange.assistant_text)
     )
     omitted_trivial_exchanges = len(exchanges) - len(retained_exchanges)
-    title_messages = [{"role": "user", "text": exchange.user_text} for exchange in retained_exchanges]
+    title_messages = [
+        {"role": "user", "text": exchange.user_messages[0]}
+        for exchange in retained_exchanges
+    ]
     title = derive_title("codex", title_messages) if title_messages else "Codex 会话：未形成完整问答"
     return CodexSession(
         source_id=f"codex-{provider_session_id}",
@@ -552,6 +657,7 @@ def parse_session(path: Path, input_root: Path | None = None) -> CodexSession:
         invalid_lines=tuple(invalid_lines),
         active_open_turn_count=active_open_turns,
         superseded_incomplete_turns=tuple(superseded_incomplete_turns),
+        multi_user_exchange_count=multi_user_exchanges,
         ambiguous_user_turn_count=ambiguous_users,
         ambiguous_final_turn_count=ambiguous_finals,
         extra_session_meta_count=max(len(session_metas) - 1, 0),
@@ -626,7 +732,7 @@ def _common_exchange_prefix(parent: CodexSession, child: CodexSession) -> int:
     prefix = 0
     for parent_exchange, child_exchange in zip(parent.exchanges, child.exchanges):
         if (
-            parent_exchange.user_text != child_exchange.user_text
+            parent_exchange.user_messages != child_exchange.user_messages
             or parent_exchange.assistant_text != child_exchange.assistant_text
         ):
             break
@@ -745,7 +851,10 @@ def resolve_session_units(
             return result
 
         selected = unit.exchanges[prefix:]
-        title_messages = [{"role": "user", "text": exchange.user_text} for exchange in selected]
+        title_messages = [
+            {"role": "user", "text": exchange.user_messages[0]}
+            for exchange in selected
+        ]
         title = derive_title("codex", title_messages) if title_messages else unit.title
         result = CodexResolvedSession(
             unit=unit,
@@ -884,6 +993,7 @@ def unit_inventory_record(
             }
             for item in unit.superseded_incomplete_turns
         ],
+        "multi_user_exchange_count": unit.multi_user_exchange_count,
         "ambiguous_user_turn_count": unit.ambiguous_user_turn_count,
         "ambiguous_final_turn_count": unit.ambiguous_final_turn_count,
         "extra_session_meta_count": unit.extra_session_meta_count,
@@ -915,10 +1025,23 @@ def _render_session(resolved: CodexResolvedSession, imported: str) -> tuple[str,
         redactions += count
         if not user_text or not assistant_text:
             continue
+        user_message_metadata = ""
+        if len(exchange.user_message_locators) > 1:
+            user_message_metadata = (
+                f"- **User message count**: {len(exchange.user_message_locators)}\n"
+                + "".join(
+                    f"- **User message {index} locator**: `{locator}`\n"
+                    for index, locator in enumerate(
+                        exchange.user_message_locators,
+                        start=1,
+                    )
+                )
+            )
         rendered.append(
             f"## Exchange {ordinal}\n\n"
             f"- **Turn**: {exchange.turn_index}\n"
             f"- **User locator**: `{exchange.user_locator}`\n"
+            f"{user_message_metadata}"
             f"- **Assistant locator**: `{exchange.assistant_locator}`\n\n"
             f"### Human user\n\n{user_text}\n\n"
             f"### Assistant final\n\n{assistant_text}"
@@ -960,6 +1083,7 @@ def _render_session(resolved: CodexResolvedSession, imported: str) -> tuple[str,
         "omitted_compaction_count": unit.omitted_compaction_count,
         "omitted_interrupted_count": unit.omitted_interrupted_count,
         "omitted_unpaired_user_count": unit.omitted_unpaired_user_count,
+        "multi_user_exchange_count": unit.multi_user_exchange_count,
         "invalid_jsonl_lines": unit.invalid_line_count,
         "active_open_turn_count": unit.active_open_turn_count,
         "superseded_incomplete_turn_count": len(unit.superseded_incomplete_turns),
@@ -1046,6 +1170,7 @@ class CodexStrategy:
         "omitted_interruptions": 0,
         "omitted_superseded_turns": 0,
         "omitted_unpaired_users": 0,
+        "multi_user_exchanges": 0,
         "invalid_lines": 0,
         "redactions": 0,
         }
@@ -1129,6 +1254,7 @@ class CodexStrategy:
             stats["omitted_interruptions"] += unit.omitted_interrupted_count
             stats["omitted_superseded_turns"] += len(unit.superseded_incomplete_turns)
             stats["omitted_unpaired_users"] += unit.omitted_unpaired_user_count
+            stats["multi_user_exchanges"] += unit.multi_user_exchange_count
             stats["invalid_lines"] += unit.invalid_line_count
 
             if skip_reason:
@@ -1182,6 +1308,7 @@ class CodexStrategy:
                 "invalid_jsonl_lines": unit.invalid_line_count,
                 "active_open_turn_count": unit.active_open_turn_count,
                 "superseded_incomplete_turn_count": len(unit.superseded_incomplete_turns),
+                "multi_user_exchange_count": unit.multi_user_exchange_count,
                 "redaction_count": redactions,
                 "imported_at": utc_now(),
                 "importer_version": CODEX_IMPORTER_VERSION,

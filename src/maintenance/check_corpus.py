@@ -371,6 +371,11 @@ def check_source_consistency(
             actual_assistant_locators = re.findall(
                 r"^- \*\*Assistant locator\*\*: `([^`]+)`$", body, flags=re.MULTILINE
             )
+            actual_user_message_locators = re.findall(
+                r"^- \*\*User message \d+ locator\*\*: `([^`]+)`$",
+                body,
+                flags=re.MULTILINE,
+            )
             if actual_user_locators != [exchange.user_locator for exchange in resolved.exchanges]:
                 errors.append(
                     f"manifest {source_id}: Codex user turn locator differs from raw rollout"
@@ -379,6 +384,16 @@ def check_source_consistency(
                 errors.append(
                     f"manifest {source_id}: Codex assistant final locator differs from raw rollout"
                 )
+            expected_user_message_locators = [
+                locator
+                for exchange in resolved.exchanges
+                if len(exchange.user_message_locators) > 1
+                for locator in exchange.user_message_locators
+            ]
+            if actual_user_message_locators != expected_user_message_locators:
+                errors.append(
+                    f"manifest {source_id}: Codex user message locator differs from raw rollout"
+                )
             if int(metadata.get("exchange_count") or 0) != body.count("\n## Exchange "):
                 errors.append(
                     f"manifest {source_id}: Codex exchange_count differs from standardized body"
@@ -386,6 +401,16 @@ def check_source_consistency(
             if int(metadata.get("omitted_trivial_exchange_count") or 0) != unit.omitted_trivial_exchange_count:
                 errors.append(
                     f"manifest {source_id}: Codex omitted trivial exchange count differs "
+                    "from raw rollout"
+                )
+            if int(metadata.get("multi_user_exchange_count") or 0) != unit.multi_user_exchange_count:
+                errors.append(
+                    f"manifest {source_id}: Codex multi-user exchange count differs "
+                    "from raw rollout"
+                )
+            if int(item.get("multi_user_exchange_count") or 0) != unit.multi_user_exchange_count:
+                errors.append(
+                    f"manifest {source_id}: manifest multi-user exchange count differs "
                     "from raw rollout"
                 )
             if str(metadata.get("source_scope") or "") != resolved.source_scope:

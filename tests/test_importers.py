@@ -15,6 +15,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from src.ingestion import import_claude, import_codex  # noqa: E402
 from src.ingestion.read_raw_locator import render_text, resolve_locator  # noqa: E402
 from src.maintenance.check_corpus import check_source_consistency  # noqa: E402
+from src.retrieval.project_items import project_corpus  # noqa: E402
 
 
 # 所有会话、路径和标识都是为测试构造的虚构数据。
@@ -234,6 +235,262 @@ class TestImporter:
                 before_turn_context=True,
             )[0] == \
             "human"
+
+    def test_import_codex_filters_skill_envelope_and_merges_structured_reply(self) -> None:
+        skill_envelope = (
+            "<skill>\n"
+            "<name>synthetic-observatory</name>\n"
+            "<path>/workspace/skills/synthetic-observatory/SKILL.md</path>\n"
+            "---\n"
+            "name: synthetic-observatory\n"
+            "description: 虚构观测站运行说明。\n"
+            "---\n\n"
+            "# 合成技能\n\n"
+            "只处理虚构数据。\n"
+            "</skill>"
+        )
+        structured_reply = (
+            "<send_user_message_question_reply>\n"
+            '[{"answer":"批准合成校准","question":"是否执行虚构观测站校准？",'
+            '"questionItemId":"synthetic-question-1"}]\n'
+            "</send_user_message_question_reply>"
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "rollout-runtime-envelopes.jsonl"
+            write_jsonl(
+                source,
+                [
+                    {
+                        "type": "session_meta",
+                        "payload": {
+                            "id": "runtime-envelopes",
+                            "timestamp": "2026-09-29T00:00:00Z",
+                            "source": "cli",
+                            "thread_source": "user",
+                        },
+                    },
+                    {"type": "event_msg", "payload": {"type": "task_started"}},
+                    {"type": "turn_context", "payload": {"turn_id": "turn-1"}},
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "请准备虚构校准"}],
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": skill_envelope}],
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": structured_reply}],
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "phase": "final_answer",
+                            "content": [{"type": "output_text", "text": "虚构校准已完成。"}],
+                        },
+                    },
+                    {"type": "event_msg", "payload": {"type": "task_complete"}},
+                ],
+            )
+            parsed = import_codex.parse_session(source, root)
+
+        assert len(parsed.exchanges) == 1
+        assert parsed.visible_user_count == 3
+        assert parsed.human_user_count == 2
+        assert parsed.omitted_runtime_user_count == 1
+        assert parsed.ambiguous_user_turn_count == 0
+        assert import_codex._intrinsic_skip_reason(parsed) == ""
+        assert parsed.exchanges[0].user_text == (
+            "请准备虚构校准\n\n"
+            "助手问题：是否执行虚构观测站校准？\n"
+            "用户回答：批准合成校准"
+        )
+        assert parsed.exchanges[0].user_locator.endswith("/Turn:1/User@L4-L6")
+        assert import_codex._classify_user_text(skill_envelope)[0] == "runtime"
+        assert import_codex._classify_user_text(
+            "<skill>请解释这个标签的含义。</skill>"
+        )[0] == "human"
+        assert import_codex._classify_user_text(
+            "<send_user_message_question_reply>invalid</send_user_message_question_reply>"
+        )[0] == "human"
+
+    def test_import_codex_aggregates_multiple_users_before_one_final(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "input" / "rollout-multi-user.jsonl"
+            write_jsonl(
+                source,
+                [
+                    {
+                        "type": "session_meta",
+                        "payload": {
+                            "id": "multi-user",
+                            "timestamp": "2026-09-29T00:00:00Z",
+                            "source": "cli",
+                            "thread_source": "user",
+                        },
+                    },
+                    {"type": "event_msg", "payload": {"type": "task_started"}},
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "请校准虚构观测站"}],
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "phase": "commentary",
+                            "content": [{"type": "output_text", "text": "正在检查合成参数"}],
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "温度阈值使用 42"}],
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "phase": "final_answer",
+                            "content": [{"type": "output_text", "text": "虚构观测站校准完成。"}],
+                        },
+                    },
+                    {"type": "event_msg", "payload": {"type": "task_complete"}},
+                ],
+            )
+            parsed = import_codex.parse_session(source, source.parent)
+            resolved = import_codex.resolve_session_units([parsed])[0]
+            document, _, _ = import_codex._render_session(resolved, "2026-09-29")
+            output = root / "sources" / "conversations" / "codex" / "multi-user.md"
+            output.parent.mkdir(parents=True)
+            output.write_text(document, encoding="utf-8")
+            manifest = root / "meta" / "manifest.json"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "sources": {
+                            parsed.source_id: {
+                                "output_path": output.relative_to(root).as_posix(),
+                                "source_hash": parsed.content_hash,
+                                "importer_version": import_codex.CODEX_IMPORTER_VERSION,
+                                "ingest_status": "ready",
+                                "provider": "codex",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            projected = project_corpus(root, manifest)
+
+        exchange = parsed.exchanges[0]
+        assert parsed.human_user_count == 2
+        assert parsed.multi_user_exchange_count == 1
+        assert parsed.ambiguous_user_turn_count == 0
+        assert parsed.omitted_unpaired_user_count == 0
+        assert import_codex._intrinsic_skip_reason(parsed) == ""
+        assert exchange.user_messages == ("请校准虚构观测站", "温度阈值使用 42")
+        assert exchange.user_locator.endswith("/Turn:1/User@L3-L5")
+        assert exchange.user_message_locators[0].endswith("/Turn:1/User:1@L3-L3")
+        assert exchange.user_message_locators[1].endswith("/Turn:1/User:2@L5-L5")
+        assert "#### User message 1\n\n请校准虚构观测站" in document
+        assert "#### User message 2\n\n温度阈值使用 42" in document
+        assert document.count("### Human user") == 1
+        assert len([item for item in projected.items if item.role == "human"]) == 1
+        assert len([item for item in projected.items if item.role == "assistant"]) == 1
+
+    def test_import_codex_reviews_unpairable_multiple_users(self) -> None:
+        def records(*, user_after_final: bool) -> list[dict]:
+            messages = [
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "after-final" if user_after_final else "without-final",
+                        "timestamp": "2026-09-29T00:00:00Z",
+                        "source": "cli",
+                        "thread_source": "user",
+                    },
+                },
+                {"type": "event_msg", "payload": {"type": "task_started"}},
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "第一条虚构请求"}],
+                    },
+                },
+            ]
+            if user_after_final:
+                messages.append(
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "phase": "final_answer",
+                            "content": [{"type": "output_text", "text": "过早的虚构回复"}],
+                        },
+                    }
+                )
+            messages.extend(
+                [
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "第二条虚构请求"}],
+                        },
+                    },
+                    {"type": "event_msg", "payload": {"type": "task_complete"}},
+                ]
+            )
+            return messages
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            without_final = root / "rollout-without-final.jsonl"
+            after_final = root / "rollout-after-final.jsonl"
+            write_jsonl(without_final, records(user_after_final=False))
+            write_jsonl(after_final, records(user_after_final=True))
+            parsed_without_final = import_codex.parse_session(without_final, root)
+            parsed_after_final = import_codex.parse_session(after_final, root)
+
+        for parsed in (parsed_without_final, parsed_after_final):
+            assert parsed.exchanges == ()
+            assert parsed.multi_user_exchange_count == 0
+            assert parsed.ambiguous_user_turn_count == 1
+            assert parsed.omitted_unpaired_user_count == 2
+            assert import_codex._intrinsic_skip_reason(parsed) == "turn_boundary_review"
 
     def test_codex_classifies_subagent_fork_and_active_session(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
