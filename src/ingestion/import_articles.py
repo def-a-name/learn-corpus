@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from src.ingestion.markdown_sources import MarkdownPolicy, import_markdown_sources, print_stats
+from src.ingestion.import_markdown import MarkdownPolicy, import_markdown_sources, print_stats
 from src.corpus.paths import MANIFEST_PATH, REPO_ROOT
 
 

@@ -13,7 +13,7 @@ from src.ingestion import import_claude  # noqa: E402
 from src.ingestion.build_source_inventory import build_inventory  # noqa: E402
 from src.ingestion.import_articles import import_articles  # noqa: E402
 from src.ingestion.import_notes import import_notes  # noqa: E402
-from src.ingestion.markdown_sources import content_fingerprint  # noqa: E402
+from src.ingestion.import_markdown import content_fingerprint  # noqa: E402
 from src.maintenance.check_corpus import check_source_consistency  # noqa: E402
 from src.corpus.document import parse_frontmatter  # noqa: E402
 
@@ -174,7 +174,6 @@ tags: [synthetic]
             note_stats = import_notes(notes, note_output, manifest, asset_root=assets)
             article_stats = import_articles(articles, article_output, manifest, asset_root=assets)
             saved = json.loads(manifest.read_text(encoding="utf-8"))
-            duplicate = next(item for item in saved["sources"].values() if item["ingest_status"] == "skipped")
             note_output_count = len(list(note_output.glob("*.md")))
             article_output_count = len(list(article_output.glob("*.md")))
 
@@ -183,7 +182,7 @@ tags: [synthetic]
         assert article_stats["imported"] == 1
         assert note_output_count == 1
         assert article_output_count == 1
-        assert duplicate["duplicate_of"] in saved["sources"]
+        assert len(saved["sources"]) == 2
 
     def test_missing_local_image_enters_review_without_output(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -196,11 +195,11 @@ tags: [synthetic]
             (inputs / "broken.md").write_text("# 合成缺失资源\n\n![](missing.png)\n", encoding="utf-8")
 
             stats = import_notes(inputs, output, manifest, asset_root=sources / "assets")
-            saved = json.loads(manifest.read_text(encoding="utf-8"))
+            saved = json.loads(manifest.read_text(encoding="utf-8")) if manifest.exists() else {"sources": {}}
             errors, _ = check_source_consistency(manifest, sources, root)
 
         assert stats["skip_reasons"] == {"asset_missing": 1}
-        assert next(iter(saved["sources"].values()))["ingest_status"] == "review"
+        assert saved["sources"] == {}
         assert not output.exists()
         assert errors == []
 
@@ -229,7 +228,10 @@ tags: [synthetic]
                 claude,
                 root / "sources" / "conversations" / "claude",
                 manifest,
-                kind="all",
+                kind="session",
+            )
+            inventory_after_session = json.loads(
+                (root / "meta" / "source-inventory.json").read_text(encoding="utf-8")
             )
             inventory = build_inventory(
                 claude,
@@ -243,6 +245,7 @@ tags: [synthetic]
             saved = json.loads(manifest.read_text(encoding="utf-8"))
 
         assert claude_input["retained"] == 1
+        assert inventory_after_session["inputs"][0]["units"][0]["parse_status"] == "ready"
         assert claude_input["skipped"] == 0
         assert claude_input["units"][0]["document_kind"] == "instruction"
         assert claude_input["units"][0]["parse_status"] == "imported"

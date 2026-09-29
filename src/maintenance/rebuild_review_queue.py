@@ -23,12 +23,24 @@ _QUEUE_RAW_PATH = re.compile(r"^- \*\*Raw path\*\*：`([^`]+)`$", re.MULTILINE)
 
 def _review_items(manifest_path: Path, inventory_path: Path) -> list[dict[str, Any]]:
     manifest = load_manifest(manifest_path)
-    by_id: dict[str, dict[str, Any]] = {}
+    by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    inventory_inputs: list[dict[str, Any]] = []
+    if inventory_path.is_file():
+        inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
+        inventory_inputs = inventory.get("inputs", [])
+    inventory_paths = {
+        str(unit.get("raw_source_path") or "")
+        for source_input in inventory_inputs
+        for unit in source_input.get("units", [])
+    }
     for source_id, value in manifest["sources"].items():
         legacy_review = value.get("status") in {"review", "conflict"}
         if value.get("ingest_status") != "review" and not legacy_review:
             continue
-        by_id[source_id] = {
+        raw_path = str(value.get("source_path") or "")
+        if raw_path in inventory_paths:
+            continue
+        by_key[(source_id, raw_path)] = {
             "source_id": source_id,
             "title": value.get("title") or source_id,
             "provider": value.get("origin", "unknown"),
@@ -39,9 +51,8 @@ def _review_items(manifest_path: Path, inventory_path: Path) -> list[dict[str, A
             "reason": value.get("ingest_issue") or value.get("status") or "manifest_ingest_review",
         }
 
-    if inventory_path.is_file():
-        inventory = json.loads(inventory_path.read_text(encoding="utf-8"))
-        for source_input in inventory.get("inputs", []):
+    if inventory_inputs:
+        for source_input in inventory_inputs:
             input_provider = source_input.get("provider", "unknown")
             for unit in source_input.get("units", []):
                 if unit.get("parse_status") != "review":
@@ -49,7 +60,8 @@ def _review_items(manifest_path: Path, inventory_path: Path) -> list[dict[str, A
                 source_id = str(unit.get("source_id") or "")
                 if not source_id:
                     continue
-                by_id[source_id] = {
+                raw_path = str(unit.get("raw_source_path") or "")
+                by_key[(source_id, raw_path)] = {
                     "source_id": source_id,
                     "title": unit.get("title") or source_id,
                     "provider": unit.get("provider") or input_provider,
@@ -60,7 +72,9 @@ def _review_items(manifest_path: Path, inventory_path: Path) -> list[dict[str, A
                     "reason": unit.get("skip_reason") or "inventory_parse_review",
                     "review_details": unit.get("review_details") or [],
                 }
-    return sorted(by_id.values(), key=lambda item: (str(item.get("created", "")), item["source_id"]))
+    return sorted(by_key.values(), key=lambda item: (
+        str(item.get("created", "")), item["source_id"], str(item.get("raw_source_path") or "")
+    ))
 
 
 def _raw_location_lines(item: dict[str, Any]) -> list[str]:
@@ -85,19 +99,20 @@ def _raw_location_lines(item: dict[str, Any]) -> list[str]:
     return lines
 
 
-def _queue_blocks(content: str) -> dict[str, tuple[str, str]]:
-    """按 source ID 解析生成文件，以便限制局部重建的写入边界。"""
+def _queue_blocks(content: str) -> dict[tuple[str, str], tuple[str, str]]:
+    """按来源 ID 和原文路径解析队列，限制局部重建的写入边界。"""
 
-    blocks: dict[str, tuple[str, str]] = {}
+    blocks: dict[tuple[str, str], tuple[str, str]] = {}
     for section in re.split(r"(?=^## )", content, flags=re.MULTILINE)[1:]:
         source_match = _QUEUE_SOURCE_ID.search(section)
         path_match = _QUEUE_RAW_PATH.search(section)
         if source_match is None or path_match is None:
             raise ValueError("existing review queue has an unsupported format")
         source_id = source_match.group(1)
-        if source_id in blocks:
-            raise ValueError("existing review queue contains duplicate source IDs")
-        blocks[source_id] = (path_match.group(1), section.rstrip() + "\n")
+        key = (source_id, path_match.group(1))
+        if key in blocks:
+            raise ValueError("existing review queue contains duplicate source locations")
+        blocks[key] = (path_match.group(1), section.rstrip() + "\n")
     return blocks
 
 
@@ -113,9 +128,9 @@ def _check_scoped_change(
         raise ValueError("at least one scoped review source path is required")
     before = _queue_blocks(existing)
     after = _queue_blocks(generated)
-    for source_id in before.keys() | after.keys():
-        old = before.get(source_id)
-        new = after.get(source_id)
+    for source_key in before.keys() | after.keys():
+        old = before.get(source_key)
+        new = after.get(source_key)
         paths = {
             value[0]
             for value in (old, new)
@@ -123,7 +138,7 @@ def _check_scoped_change(
         }
         if paths.isdisjoint(selected) and old != new:
             raise ValueError(
-                f"review queue update would change unselected source: {source_id}"
+                f"review queue update would change unselected source: {source_key[0]}"
             )
 
 

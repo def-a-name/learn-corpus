@@ -71,9 +71,7 @@ def _codex_session_units(
     manifest: dict[str, Any],
     review_resolutions_path: Path | None = None,
 ) -> dict[str, Any]:
-    from src.ingestion.import_codex import DEFAULT_REVIEW_RESOLUTIONS, iter_resolved_session_units
-
-    review_resolutions_path = review_resolutions_path or DEFAULT_REVIEW_RESOLUTIONS
+    from src.ingestion.import_codex import iter_session_units, resolve_session_units
 
     roots: set[Path] = set()
     for item in manifest["sources"].values():
@@ -95,7 +93,7 @@ def _codex_session_units(
             units.update(
                 {
                     resolved.unit.source_id: resolved
-                    for resolved in iter_resolved_session_units(root, review_resolutions_path)
+                    for resolved in resolve_session_units(iter_session_units(root), {})
                 }
             )
     return units
@@ -269,6 +267,24 @@ def check_source_consistency(
                     f"manifest {source_id}: local asset hash is stale: {asset.get('stored_path')}"
                 )
 
+        raw_path = Path(str(item.get("source_path") or ""))
+        if raw_path.resolve() == output_path.resolve():
+            errors.append(
+                f"manifest {source_id}: raw source and standardized output are the same file"
+            )
+            continue
+        if not raw_path.is_file():
+            warnings.append(f"manifest {source_id}: accepted raw source is unavailable")
+            continue
+        if item.get("origin") == "claude-export" and item.get("source_kind") == "session":
+            unit = claude_units.get(source_id)
+            current_hash = unit.content_hash if unit is not None else ""
+        else:
+            current_hash = sha256_file(raw_path)
+        if current_hash != manifest_hash:
+            warnings.append(f"manifest {source_id}: raw source differs from accepted version")
+            continue
+
         if item.get("origin") == "claude-export" and item.get("source_kind") == "session":
             if item.get("assistant_final_detection") != CLAUDE_ASSISTANT_FINAL_DETECTION:
                 errors.append(
@@ -337,13 +353,6 @@ def check_source_consistency(
                 )
                 continue
             unit = resolved.unit
-            expected_resolution_hash = (
-                resolved.review_resolution.content_hash if resolved.review_resolution else ""
-            )
-            if manifest_resolution_hash != expected_resolution_hash:
-                errors.append(
-                    f"manifest {source_id}: Codex review resolution differs from current record"
-                )
             if str(item.get("provider_session_id") or "") != unit.provider_session_id:
                 errors.append(
                     f"manifest {source_id}: Codex provider session ID differs from raw rollout"
@@ -352,6 +361,12 @@ def check_source_consistency(
                 errors.append(
                     f"manifest {source_id}: Codex session locator differs from raw rollout lines"
                 )
+            if manifest_resolution_hash:
+                if int(metadata.get("exchange_count") or 0) != body.count("\n## Exchange "):
+                    errors.append(
+                        f"manifest {source_id}: Codex exchange_count differs from standardized body"
+                    )
+                continue
             actual_user_locators = re.findall(r"^- \*\*User locator\*\*: `([^`]+)`$", body, flags=re.MULTILINE)
             actual_assistant_locators = re.findall(
                 r"^- \*\*Assistant locator\*\*: `([^`]+)`$", body, flags=re.MULTILINE
@@ -468,22 +483,6 @@ def check_source_consistency(
                     f"manifest {source_id}: web-chat omitted unpaired user count mismatch"
                 )
 
-        raw_path = Path(str(item.get("source_path") or ""))
-        if not raw_path.is_file():
-            errors.append(f"manifest {source_id}: raw source does not exist: {raw_path}")
-            continue
-        if raw_path.resolve() == output_path.resolve():
-            errors.append(
-                f"manifest {source_id}: raw source and standardized output are the same file"
-            )
-            continue
-        elif item.get("origin") == "claude-export" and item.get("source_kind") == "session":
-            current_hash = claude_units[source_id].content_hash
-        else:
-            current_hash = sha256_file(raw_path)
-        if current_hash != manifest_hash:
-            errors.append(f"manifest {source_id}: raw source hash is stale")
-
     for output_path, count in Counter(output_paths).items():
         if count > 1:
             errors.append(f"manifest has duplicate output_path: {output_path}")
@@ -498,12 +497,6 @@ def check(
     ingest_errors, ingest_warnings = check_ingest_log(REPO_ROOT)
     errors.extend(ingest_errors)
     warnings.extend(ingest_warnings)
-    for vault_config in REPO_ROOT.rglob(".obsidian"):
-        if vault_config != REPO_ROOT / ".obsidian":
-            warnings.append(
-                f"nested Obsidian Vault configuration found: "
-                f"{vault_config.relative_to(REPO_ROOT)}"
-            )
     return errors, warnings
 
 

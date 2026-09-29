@@ -14,16 +14,14 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import unquote, urlsplit
 
-from src.corpus.ingest_log import SourceChangeTracker
 from src.corpus.document import format_line_locator, yaml_document
-from src.corpus.manifest import load_manifest, save_manifest, utc_now
+from src.corpus.manifest import utc_now
 from src.corpus.paths import MANIFEST_PATH, REPO_ROOT, relative_to_repo
 from src.corpus.storage import (
-    atomic_copy_file,
-    atomic_write_text,
     registered_assets_are_current,
     sha256_file,
 )
+from src.ingestion.batch import InputSnapshot, PlannedFile, PlannedSource, ProviderPlan, execute_batch
 from src.ingestion.common import (
     WEB_CHAT_ASSISTANT_FINAL_DETECTION,
     WEB_CHAT_IMPORTER_VERSION,
@@ -32,7 +30,7 @@ from src.ingestion.common import (
     redact_secrets,
     source_needs_redaction,
 )
-from src.ingestion.markdown_sources import MarkdownImportError, scan_markdown
+from src.ingestion.import_markdown import MarkdownImportError, scan_markdown
 
 
 DEFAULT_INPUT = REPO_ROOT.parent / "web-chats"
@@ -924,22 +922,29 @@ def _render_session(
     return yaml_document(metadata, body), redactions, title
 
 
-def import_web_chats(
-    input_dir: Path,
-    output_root: Path,
-    manifest_path: Path,
-    *,
-    asset_root: Path = DEFAULT_ASSETS,
-    review_resolutions_path: Path = DEFAULT_REVIEW_RESOLUTIONS,
-    includes: Iterable[str] | None = None,
-    dry_run: bool = False,
-) -> dict[str, Any]:
-    units = list(iter_web_chat_units(input_dir, includes))
-    review_resolutions = load_review_resolutions(review_resolutions_path)
-    source_id_counts = Counter(unit.source_id for unit in units)
-    manifest = load_manifest(manifest_path)
-    change_tracker = SourceChangeTracker.for_output(output_root)
-    stats: dict[str, Any] = {
+class WebChatStrategy:
+    """分析网页会话、引用及本地资源，生成统一候选计划。"""
+
+    def __init__(
+        self,
+        input_dir: Path,
+        output_root: Path,
+        asset_root: Path,
+        review_resolutions_path: Path,
+        includes: Iterable[str] | None,
+    ) -> None:
+        self.input_dir = input_dir
+        self.output_root = output_root
+        self.asset_root = asset_root
+        self.review_resolutions_path = review_resolutions_path
+        self.includes = tuple(includes) if includes is not None else None
+
+    def prepare(self, manifest: dict[str, Any]) -> ProviderPlan:
+        paths = _selected_markdown_paths(self.input_dir, self.includes)
+        units = list(iter_web_chat_units(self.input_dir, self.includes))
+        resolutions = load_review_resolutions(self.review_resolutions_path)
+        source_id_counts = Counter(unit.source_id for unit in units)
+        stats: dict[str, Any] = {
         "discovered": 0,
         "imported": 0,
         "unchanged": 0,
@@ -953,110 +958,177 @@ def import_web_chats(
         "citations_missing": 0,
         "assets": 0,
         "redactions": 0,
-    }
-    changed = False
-    for unit in units:
-        stats["discovered"] += 1
-        providers = stats["providers"]
-        providers[unit.provider] = providers.get(unit.provider, 0) + 1
-        if unit.parse:
-            stats["human_user_messages"] += unit.parse.visible_user_block_count
-            stats["assistant_finals"] += unit.parse.assistant_final_count
-            stats["omitted_trivial_exchanges"] += unit.parse.omitted_trivial_exchange_count
-            stats["omitted_unpaired_users"] += unit.parse.omitted_unpaired_user_count
-        stats["citations_missing"] += unit.citation_marker_count
-        stats["assets"] += len(unit.raw_assets)
+        }
+        plan = ProviderPlan(
+            provider="web-chat",
+            importer="web-chat",
+            input_root=self.input_dir,
+            output_root=self.output_root,
+            stats=stats,
+            selected_paths=paths,
+            snapshots=[InputSnapshot(path, sha256_file(path)) for path in paths],
+        )
+        if self.review_resolutions_path.is_file():
+            plan.snapshots.append(InputSnapshot(
+                self.review_resolutions_path,
+                sha256_file(self.review_resolutions_path),
+            ))
+        for unit in units:
+            stats["discovered"] += 1
+            providers = stats["providers"]
+            providers[unit.provider] = providers.get(unit.provider, 0) + 1
+            if unit.parse:
+                stats["human_user_messages"] += unit.parse.visible_user_block_count
+                stats["assistant_finals"] += unit.parse.assistant_final_count
+                stats["omitted_trivial_exchanges"] += unit.parse.omitted_trivial_exchange_count
+                stats["omitted_unpaired_users"] += unit.parse.omitted_unpaired_user_count
+            stats["citations_missing"] += unit.citation_marker_count
+            stats["assets"] += len(unit.raw_assets)
 
-        configured_resolution = review_resolutions.get(unit.source_id)
-        applied_resolution = (
-            configured_resolution
-            if configured_resolution
-            and review_resolution_matches(unit, configured_resolution)
-            else None
-        )
-        skip_reason = (
-            "source_id_collision_review"
-            if source_id_counts[unit.source_id] > 1
-            else unit_skip_reason(unit, configured_resolution)
-        )
-        current = manifest["sources"].get(unit.source_id, {})
-        assets = _stored_assets(unit, asset_root)
-        output_path = output_root / unit.provider / f"{unit.created}-{unit.derived_session_key}.md"
-        is_unchanged = bool(
-            not skip_reason
-            and current.get("source_hash") == unit.content_hash
-            and current.get("review_resolution_hash")
-            == (applied_resolution.content_hash if applied_resolution else None)
-            and current.get("importer_version") == WEB_CHAT_IMPORTER_VERSION
-            and Path(REPO_ROOT / str(current.get("output_path") or "")).is_file()
-            and registered_assets_are_current(current.get("assets", []))
-            and not source_needs_redaction(Path(REPO_ROOT / str(current.get("output_path") or "")))
-        )
-        if skip_reason:
+            configured_resolution = resolutions.get(unit.source_id)
+            applied_resolution = (
+                configured_resolution
+                if configured_resolution
+                and review_resolution_matches(unit, configured_resolution)
+                else None
+            )
+            skip_reason = (
+                "source_id_collision_review"
+                if source_id_counts[unit.source_id] > 1
+                else unit_skip_reason(unit, configured_resolution)
+            )
+            current = manifest["sources"].get(unit.source_id, {})
+            if current and current.get("ingest_status") == "ready" and current.get("source_hash") != unit.content_hash and skip_reason not in REVIEW_SKIP_REASONS:
+                skip_reason = "existing_source_changed_review"
+            if current and current.get("ingest_status") == "ready" and current.get("source_path") != str(unit.source_path.resolve()):
+                skip_reason = "source_id_collision_review"
+            assets = _stored_assets(unit, self.asset_root)
+            output_path = self.output_root / unit.provider / f"{unit.created}-{unit.derived_session_key}.md"
+            is_unchanged = bool(
+                not skip_reason
+                and current.get("source_hash") == unit.content_hash
+                and current.get("review_resolution_hash")
+                == (applied_resolution.content_hash if applied_resolution else None)
+                and current.get("importer_version") == WEB_CHAT_IMPORTER_VERSION
+                and Path(REPO_ROOT / str(current.get("output_path") or "")).is_file()
+                and registered_assets_are_current(current.get("assets", []))
+                and current.get("assets", []) == _asset_records(assets)
+                and not source_needs_redaction(Path(REPO_ROOT / str(current.get("output_path") or "")))
+            )
+            if skip_reason:
+                stats["skipped"] += 1
+                reasons = stats["skip_reasons"]
+                reasons[skip_reason] = reasons.get(skip_reason, 0) + 1
+                status = "review" if skip_reason in REVIEW_SKIP_REASONS or skip_reason == "existing_source_changed_review" else "excluded"
+                if status == "review":
+                    plan.blocking_reasons.append(skip_reason)
+                plan.inventory_records.append(unit_inventory_record(
+                    unit, status, skip_reason, configured_resolution
+                ))
+                continue
+            if is_unchanged:
+                stats["unchanged"] += 1
+                plan.inventory_records.append(unit_inventory_record(unit, "imported", "", configured_resolution))
+                continue
+
+            document, redactions, title = _render_session(
+                unit, assets, utc_now()[:10], applied_resolution
+            )
+            stats["imported"] += 1
+            stats["redactions"] += redactions
+            plan.inventory_records.append(unit_inventory_record(unit, "ready", "", configured_resolution))
+            files = tuple(
+                PlannedFile(asset.stored_path, copy_from=asset.raw.source_path)
+                for asset in assets
+            ) + (PlannedFile(output_path, text=document),)
+            plan.snapshots.extend(
+                InputSnapshot(asset.raw.source_path, asset.raw.digest)
+                for asset in assets
+            )
+            record = {
+                "origin": ORIGIN,
+                "source_kind": "session",
+                "provider": unit.provider,
+                "thread_kind": "main",
+                "provider_session_id": unit.provider_session_id or None,
+                "provider_share_id": unit.provider_share_id or None,
+                "derived_session_key": unit.derived_session_key,
+                "identity_confidence": unit.identity_confidence,
+                "assistant_final_detection": WEB_CHAT_ASSISTANT_FINAL_DETECTION,
+                "source_path": str(unit.source_path.resolve()),
+                "source_locator": unit.locator,
+                "source_hash": unit.content_hash,
+                "output_path": relative_to_repo(output_path),
+                "ingest_status": "ready",
+                "curation_status": current.get("curation_status", "unassessed"),
+                "title": title,
+                "created": unit.created,
+                "updated": unit.updated,
+                "omitted_trivial_exchange_count": unit.parse.omitted_trivial_exchange_count if unit.parse else 0,
+                "omitted_unpaired_user_count": unit.parse.omitted_unpaired_user_count if unit.parse else 0,
+                "redaction_count": redactions,
+                "assets": _asset_records(assets),
+                "imported_at": utc_now(),
+                "importer_version": WEB_CHAT_IMPORTER_VERSION,
+            }
+            if applied_resolution:
+                record.update(
+                    {
+                        "review_resolution": applied_resolution.decision,
+                        "reviewed_at": applied_resolution.reviewed_at,
+                        "reviewed_by": applied_resolution.reviewed_by,
+                        "review_resolution_hash": applied_resolution.content_hash,
+                        "omitted_unresolved_citation_marker_count": unit.citation_marker_count,
+                    }
+                )
+            plan.sources.append(PlannedSource(unit.source_id, record, files))
+
+        selected = {path.resolve() for path in paths}
+        parsed_source_ids = {unit.source_id for unit in units}
+        for source_id, item in manifest["sources"].items():
+            if (
+                item.get("origin") != ORIGIN
+                or item.get("ingest_status") != "ready"
+                or Path(str(item.get("source_path") or "")).resolve() not in selected
+                or source_id in parsed_source_ids
+            ):
+                continue
+            raw_path = Path(str(item["source_path"]))
+            reason = "session_identity_changed_review"
+            plan.blocking_reasons.append(reason)
+            stats["discovered"] += 1
             stats["skipped"] += 1
             reasons = stats["skip_reasons"]
-            reasons[skip_reason] = reasons.get(skip_reason, 0) + 1
-            continue
-        if is_unchanged:
-            stats["unchanged"] += 1
-            continue
+            reasons[reason] = reasons.get(reason, 0) + 1
+            plan.inventory_records.append({
+                "source_id": source_id,
+                "unit_kind": "session",
+                "title": item.get("title") or raw_path.stem,
+                "raw_source_path": str(raw_path.resolve()),
+                "raw_source_hash": sha256_file(raw_path),
+                "raw_source_locator": item.get("source_locator") or f"{raw_path.name}@L1-L1",
+                "parse_status": "review",
+                "skip_reason": reason,
+            })
+        stats["blocked"] = bool(plan.blocking_reasons)
+        return plan
 
-        document, redactions, title = _render_session(
-            unit, assets, utc_now()[:10], applied_resolution
-        )
-        stats["imported"] += 1
-        stats["redactions"] += redactions
-        if dry_run:
-            continue
-        change_tracker.observe(output_path)
-        for asset in assets:
-            change_tracker.observe(asset.stored_path)
-            atomic_copy_file(asset.raw.source_path, asset.stored_path)
-        atomic_write_text(output_path, document)
-        manifest["version"] = max(int(manifest.get("version", 1)), 2)
-        record = {
-            "origin": ORIGIN,
-            "source_kind": "session",
-            "provider": unit.provider,
-            "thread_kind": "main",
-            "provider_session_id": unit.provider_session_id or None,
-            "provider_share_id": unit.provider_share_id or None,
-            "derived_session_key": unit.derived_session_key,
-            "identity_confidence": unit.identity_confidence,
-            "assistant_final_detection": WEB_CHAT_ASSISTANT_FINAL_DETECTION,
-            "source_path": str(unit.source_path.resolve()),
-            "source_locator": unit.locator,
-            "source_hash": unit.content_hash,
-            "output_path": relative_to_repo(output_path),
-            "ingest_status": "ready",
-            "curation_status": current.get("curation_status", "unassessed"),
-            "title": title,
-            "created": unit.created,
-            "updated": unit.updated,
-            "omitted_trivial_exchange_count": unit.parse.omitted_trivial_exchange_count if unit.parse else 0,
-            "omitted_unpaired_user_count": unit.parse.omitted_unpaired_user_count if unit.parse else 0,
-            "redaction_count": redactions,
-            "assets": _asset_records(assets),
-            "imported_at": utc_now(),
-            "importer_version": WEB_CHAT_IMPORTER_VERSION,
-        }
-        if applied_resolution:
-            record.update(
-                {
-                    "review_resolution": applied_resolution.decision,
-                    "reviewed_at": applied_resolution.reviewed_at,
-                    "reviewed_by": applied_resolution.reviewed_by,
-                    "review_resolution_hash": applied_resolution.content_hash,
-                    "omitted_unresolved_citation_marker_count": unit.citation_marker_count,
-                }
-            )
-        manifest["sources"][unit.source_id] = record
-        changed = True
 
-    if not dry_run and changed:
-        save_manifest(manifest, manifest_path)
-        change_tracker.append("web-chat")
-    return stats
+def import_web_chats(
+    input_dir: Path,
+    output_root: Path,
+    manifest_path: Path,
+    *,
+    asset_root: Path = DEFAULT_ASSETS,
+    review_resolutions_path: Path = DEFAULT_REVIEW_RESOLUTIONS,
+    includes: Iterable[str] | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    return execute_batch(
+        [WebChatStrategy(input_dir, output_root, asset_root, review_resolutions_path, includes)],
+        manifest_path,
+        dry_run=dry_run,
+    )[0].stats
 
 
 def main() -> None:

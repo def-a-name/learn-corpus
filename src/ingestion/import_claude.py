@@ -11,11 +11,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from src.corpus.ingest_log import SourceChangeTracker
 from src.corpus.document import format_line_locator, yaml_document
-from src.corpus.manifest import load_manifest, save_manifest, utc_now
+from src.corpus.manifest import utc_now
 from src.corpus.paths import MANIFEST_PATH, REPO_ROOT, relative_to_repo
 from src.corpus.storage import sha256_file
+from src.ingestion.batch import InputSnapshot, PlannedFile, PlannedSource, ProviderPlan, execute_batch
 from src.ingestion.common import (
     CLAUDE_ASSISTANT_FINAL_DETECTION,
     CLAUDE_IMPORTER_VERSION,
@@ -603,41 +603,26 @@ def _render_session(unit: ExportUnit, imported: str) -> tuple[str, int, str]:
     return yaml_document(metadata, body), redactions, title
 
 
-def _remove_legacy_sources(
-    manifest: dict,
-    output_dir: Path,
-    dry_run: bool,
-    change_tracker: SourceChangeTracker,
-) -> int:
-    legacy_ids = [source_id for source_id, item in manifest["sources"].items() if item.get("origin") == "claude"]
-    if dry_run:
-        return len(legacy_ids)
-    for source_id in legacy_ids:
-        item = manifest["sources"].pop(source_id)
-        output_path = Path(REPO_ROOT / item.get("output_path", ""))
-        if output_path.is_file() and output_path.parent.resolve() == output_dir.resolve():
-            change_tracker.observe(output_path)
-            output_path.unlink()
-    return len(legacy_ids)
+class ClaudeStrategy:
+    """分析 Claude 导出单元并生成无持久化副作用的候选结果。"""
 
+    def __init__(
+        self,
+        input_dir: Path,
+        output_dir: Path,
+        kind: str,
+        includes: Iterable[str] | None,
+        limit: int | None,
+    ) -> None:
+        self.input_dir = input_dir
+        self.output_dir = output_dir
+        self.kind = kind
+        self.includes = tuple(includes) if includes is not None else None
+        self.limit = limit
 
-def import_exports(
-    input_dir: Path,
-    output_dir: Path,
-    manifest_path: Path,
-    *,
-    kind: str = "session",
-    includes: Iterable[str] | None = None,
-    limit: int | None = None,
-    dry_run: bool = False,
-    replace_legacy: bool = False,
-) -> dict[str, Any]:
-    if not input_dir.is_dir():
-        raise FileNotFoundError(f"Claude export directory does not exist: {input_dir}")
-
-    manifest = load_manifest(manifest_path)
-    change_tracker = SourceChangeTracker.for_output(output_dir)
-    stats: dict[str, Any] = {
+    def prepare(self, manifest: dict[str, Any]) -> ProviderPlan:
+        paths = _selected_export_paths(self.input_dir, self.includes)
+        stats: dict[str, Any] = {
         "discovered": 0,
         "imported": 0,
         "unchanged": 0,
@@ -655,103 +640,197 @@ def import_exports(
         "omitted_compactions": 0,
         "omitted_interruptions": 0,
         "omitted_unpaired_users": 0,
-        "legacy_removed": 0,
         "redactions": 0,
-    }
-    if replace_legacy:
-        stats["legacy_removed"] = _remove_legacy_sources(manifest, output_dir, dry_run, change_tracker)
-
-    for unit in iter_export_units(input_dir, kind, includes):
-        skip_reason = unit_skip_reason(unit)
-        if unit.kind == "document" and not skip_reason:
-            skip_reason = "document_note_deferred"
-        current = manifest["sources"].get(unit.source_id, {})
-        current_output = str(current.get("output_path") or "")
-        current_output_path = Path(REPO_ROOT / current_output) if current_output else Path()
-        is_unchanged = bool(
-            not skip_reason
-            and current.get("source_hash") == unit.content_hash
-            and current.get("importer_version") == CLAUDE_IMPORTER_VERSION
-            and current_output_path.is_file()
-            and not source_needs_redaction(current_output_path)
+        }
+        plan = ProviderPlan(
+            provider="claude-export",
+            importer="claude",
+            input_root=self.input_dir,
+            output_root=self.output_dir,
+            stats=stats,
+            selected_paths=paths,
+            snapshots=[InputSnapshot(path, sha256_file(path)) for path in paths],
         )
-        if not skip_reason and not is_unchanged and limit is not None and stats["imported"] >= limit:
-            break
+        parsed_source_ids: set[str] = set()
+        parsed_paths: set[Path] = set()
+        for unit in iter_export_units(self.input_dir, self.kind, self.includes):
+            parsed_source_ids.add(unit.source_id)
+            parsed_paths.add(unit.source_path.resolve())
+            skip_reason = unit_skip_reason(unit)
+            if unit.kind == "document" and not skip_reason:
+                skip_reason = "document_note_deferred"
+            current = manifest["sources"].get(unit.source_id, {})
+            if current and current.get("ingest_status") == "ready" and current.get("source_hash") != unit.content_hash and skip_reason:
+                skip_reason = "existing_source_changed_review"
+            if current and current.get("ingest_status") == "ready" and current.get("source_path") != str(unit.source_path.resolve()):
+                skip_reason = "source_id_collision_review"
+            current_output = str(current.get("output_path") or "")
+            current_output_path = Path(REPO_ROOT / current_output) if current_output else Path()
+            is_unchanged = bool(
+                not skip_reason
+                and current.get("source_hash") == unit.content_hash
+                and current.get("importer_version") == CLAUDE_IMPORTER_VERSION
+                and current_output_path.is_file()
+                and not source_needs_redaction(current_output_path)
+            )
+            if not skip_reason and not is_unchanged and self.limit is not None and stats["imported"] >= self.limit:
+                skip_reason = "limit_reached"
 
-        stats["discovered"] += 1
-        if unit.kind == "session" and unit.session_parse:
-            thread_kinds = stats["thread_kinds"]
-            thread_kinds[unit.thread_kind] = thread_kinds.get(unit.thread_kind, 0) + 1
-            parsed = unit.session_parse
-            if unit.thread_kind == "main":
-                stats["human_user_messages"] += parsed.human_user_count
-                stats["assistant_finals"] += parsed.assistant_final_count
-                stats["omitted_trivial_exchanges"] += parsed.omitted_trivial_exchange_count
-                stats["omitted_process"] += parsed.omitted_process_count
-                stats["omitted_tool_calls"] += parsed.omitted_tool_call_count
-                stats["omitted_instructions"] += parsed.omitted_instruction_count
-                stats["omitted_reasoning"] += parsed.omitted_reasoning_count
-                stats["omitted_compactions"] += parsed.omitted_compaction_count
-                stats["omitted_interruptions"] += parsed.omitted_interrupted_count
-                stats["omitted_unpaired_users"] += parsed.omitted_unpaired_user_count
-            else:
-                stats["omitted_agent_messages"] += parsed.visible_user_block_count + parsed.assistant_block_count
+            stats["discovered"] += 1
+            if unit.kind == "session" and unit.session_parse:
+                thread_kinds = stats["thread_kinds"]
+                thread_kinds[unit.thread_kind] = thread_kinds.get(unit.thread_kind, 0) + 1
+                parsed = unit.session_parse
+                if unit.thread_kind == "main":
+                    stats["human_user_messages"] += parsed.human_user_count
+                    stats["assistant_finals"] += parsed.assistant_final_count
+                    stats["omitted_trivial_exchanges"] += parsed.omitted_trivial_exchange_count
+                    stats["omitted_process"] += parsed.omitted_process_count
+                    stats["omitted_tool_calls"] += parsed.omitted_tool_call_count
+                    stats["omitted_instructions"] += parsed.omitted_instruction_count
+                    stats["omitted_reasoning"] += parsed.omitted_reasoning_count
+                    stats["omitted_compactions"] += parsed.omitted_compaction_count
+                    stats["omitted_interruptions"] += parsed.omitted_interrupted_count
+                    stats["omitted_unpaired_users"] += parsed.omitted_unpaired_user_count
+                else:
+                    stats["omitted_agent_messages"] += parsed.visible_user_block_count + parsed.assistant_block_count
 
-        if skip_reason:
+            if skip_reason:
+                stats["skipped"] += 1
+                reasons = stats["skip_reasons"]
+                reasons[skip_reason] = reasons.get(skip_reason, 0) + 1
+                status = (
+                    "review" if skip_reason.endswith("_review")
+                    else "deferred" if skip_reason.endswith("_deferred")
+                    else "excluded"
+                )
+                if status == "review":
+                    plan.blocking_reasons.append(skip_reason)
+                inventory_status = status
+                inventory_reason = skip_reason
+                if unit.kind == "document" and skip_reason == "document_note_deferred":
+                    inventory_status = "ready"
+                    inventory_reason = ""
+                if (
+                    unit.kind == "document"
+                    and current.get("source_kind") == "document"
+                    and current.get("ingest_status") == "ready"
+                    and current.get("source_hash") == unit.content_hash
+                ):
+                    inventory_status = "imported"
+                    inventory_reason = ""
+                plan.inventory_records.append(unit_inventory_record(unit, inventory_status, inventory_reason))
+                continue
+            if is_unchanged:
+                stats["unchanged"] += 1
+                plan.inventory_records.append(unit_inventory_record(unit, "imported", ""))
+                continue
+
+            if unit.kind != "session":
+                raise AssertionError(f"unsettled Claude document: {unit.locator}")
+            document, redactions, title = _render_session(unit, utc_now()[:10])
+            date = unit.created if unit.created != "unknown" else "undated"
+            output_path = self.output_dir / f"{date}-{unit.derived_session_key}.md"
+            stats["imported"] += 1
+            stats["redactions"] += redactions
+            plan.inventory_records.append(unit_inventory_record(unit, "ready", ""))
+            plan.sources.append(PlannedSource(unit.source_id, {
+                "origin": "claude-export",
+                "source_kind": "session",
+                "provider": "claude",
+                "thread_kind": "main",
+                "provider_session_id": None,
+                "derived_session_key": unit.derived_session_key,
+                "identity_confidence": "derived",
+                "assistant_final_detection": CLAUDE_ASSISTANT_FINAL_DETECTION,
+                "source_path": str(unit.source_path.resolve()),
+                "source_locator": unit.locator,
+                "source_hash": unit.content_hash,
+                "output_path": relative_to_repo(output_path),
+                "ingest_status": "ready",
+                "curation_status": current.get("curation_status", "unassessed"),
+                "title": title,
+                "created": unit.created,
+                "omitted_trivial_exchange_count": unit.session_parse.omitted_trivial_exchange_count,
+                "redaction_count": redactions,
+                "imported_at": utc_now(),
+                "importer_version": CLAUDE_IMPORTER_VERSION,
+            }, (PlannedFile(output_path, text=document),)))
+
+        selected = {path.resolve() for path in paths}
+        for source_id, current in manifest["sources"].items():
+            if (
+                current.get("origin") != "claude-export"
+                or current.get("source_kind") != "session"
+                or current.get("ingest_status") != "ready"
+                or Path(str(current.get("source_path") or "")).resolve() not in selected
+                or source_id in parsed_source_ids
+            ):
+                continue
+            raw_path = Path(str(current["source_path"]))
+            plan.blocking_reasons.append("source_units_missing_review")
+            stats["discovered"] += 1
             stats["skipped"] += 1
             reasons = stats["skip_reasons"]
-            reasons[skip_reason] = reasons.get(skip_reason, 0) + 1
-            if not dry_run and current and current.get("source_kind") != "document":
-                old_output = Path(REPO_ROOT / str(current.get("output_path", "")))
-                if old_output.is_file() and old_output.parent.resolve() == output_dir.resolve():
-                    change_tracker.observe(old_output)
-                    old_output.unlink()
-                manifest["sources"].pop(unit.source_id, None)
-            continue
-        if is_unchanged:
-            stats["unchanged"] += 1
-            continue
+            reasons["source_units_missing_review"] = reasons.get("source_units_missing_review", 0) + 1
+            plan.inventory_records.append({
+                "source_id": source_id,
+                "unit_kind": "session",
+                "title": current.get("title") or raw_path.stem,
+                "raw_source_path": str(raw_path.resolve()),
+                "raw_source_hash": f"sha256:{sha256_file(raw_path)}",
+                "raw_source_locator": current.get("source_locator") or f"{raw_path.name}@L1-L1",
+                "parse_status": "review",
+                "skip_reason": "source_units_missing_review",
+            })
+        ignored_paths: set[Path] = set()
+        for path in paths:
+            if path.resolve() in parsed_paths:
+                continue
+            if any(iter_export_units(
+                self.input_dir,
+                "all",
+                [path.relative_to(self.input_dir).as_posix()],
+            )):
+                ignored_paths.add(path.resolve())
+                continue
+            if any(record.get("raw_source_path") == str(path.resolve()) for record in plan.inventory_records):
+                continue
+            stats["discovered"] += 1
+            stats["skipped"] += 1
+            reasons = stats["skip_reasons"]
+            reasons["empty_export_excluded"] = reasons.get("empty_export_excluded", 0) + 1
+            plan.inventory_records.append({
+                "source_id": f"claude-input-{hashlib.sha256(str(path.resolve()).encode()).hexdigest()[:20]}",
+                "unit_kind": "unknown",
+                "title": path.stem,
+                "raw_source_path": str(path.resolve()),
+                "raw_source_hash": f"sha256:{sha256_file(path)}",
+                "raw_source_locator": f"{path.relative_to(self.input_dir).as_posix()}@L1-L1",
+                "parse_status": "excluded",
+                "skip_reason": "empty_export_excluded",
+            })
+        plan.selected_paths = [path for path in paths if path.resolve() not in ignored_paths]
+        plan.snapshots = [snapshot for snapshot in plan.snapshots if snapshot.path.resolve() not in ignored_paths]
+        stats["blocked"] = bool(plan.blocking_reasons)
+        return plan
 
-        if unit.kind != "session":
-            raise AssertionError(f"unsettled Claude document: {unit.locator}")
-        document, redactions, title = _render_session(unit, utc_now()[:10])
-        date = unit.created if unit.created != "unknown" else "undated"
-        output_path = output_dir / f"{date}-{unit.derived_session_key}.md"
-        stats["imported"] += 1
-        stats["redactions"] += redactions
-        if dry_run:
-            continue
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        change_tracker.observe(output_path)
-        output_path.write_text(document, encoding="utf-8")
-        manifest["version"] = max(int(manifest.get("version", 1)), 2)
-        manifest["sources"][unit.source_id] = {
-            "origin": "claude-export",
-            "source_kind": "session",
-            "provider": "claude",
-            "thread_kind": "main",
-            "provider_session_id": None,
-            "derived_session_key": unit.derived_session_key,
-            "identity_confidence": "derived",
-            "assistant_final_detection": CLAUDE_ASSISTANT_FINAL_DETECTION,
-            "source_path": str(unit.source_path.resolve()),
-            "source_locator": unit.locator,
-            "source_hash": unit.content_hash,
-            "output_path": relative_to_repo(output_path),
-            "ingest_status": "ready",
-            "curation_status": current.get("curation_status", "unassessed"),
-            "title": title,
-            "created": unit.created,
-            "omitted_trivial_exchange_count": unit.session_parse.omitted_trivial_exchange_count,
-            "redaction_count": redactions,
-            "imported_at": utc_now(),
-            "importer_version": CLAUDE_IMPORTER_VERSION,
-        }
 
-    if not dry_run:
-        save_manifest(manifest, manifest_path)
-        change_tracker.append("claude")
-    return stats
+def import_exports(
+    input_dir: Path,
+    output_dir: Path,
+    manifest_path: Path,
+    *,
+    kind: str = "session",
+    includes: Iterable[str] | None = None,
+    limit: int | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    return execute_batch(
+        [ClaudeStrategy(input_dir, output_dir, kind, includes, limit)],
+        manifest_path,
+        dry_run=dry_run,
+    )[0].stats
 
 
 def main() -> None:
@@ -767,11 +846,6 @@ def main() -> None:
     )
     parser.add_argument("--limit", type=int)
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument(
-        "--replace-legacy",
-        action="store_true",
-        help="remove sources generated by the legacy ~/.claude importer",
-    )
     args = parser.parse_args()
     stats = import_exports(
         args.input,
@@ -781,7 +855,6 @@ def main() -> None:
         includes=args.include,
         limit=args.limit,
         dry_run=args.dry_run,
-        replace_legacy=args.replace_legacy,
     )
     print("Claude export import result:", ", ".join(f"{key}={value}" for key, value in stats.items()))
 
