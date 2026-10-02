@@ -238,6 +238,18 @@ def test_task_detail_reports_complete_counts_before_response_truncation(store):
     assert detail["calls_truncated"] is False
 
 
+def test_new_defaults_preserve_existing_task_limits_after_reopen(store, ledger_config):
+    old = store.create_task("synthetic_owner", TaskLimitsConfig(4, 8, 8000))
+    reopened = ExecutionLedgerStore.open(ledger_config)
+    new = reopened.create_task("synthetic_owner")
+    assert new["limits"] == {
+        "search_calls": 16, "read_calls": 32, "estimated_evidence_tokens": 64000,
+    }
+    assert reopened.get_task("synthetic_owner", old["task_id"])["limits"] == {
+        "search_calls": 4, "read_calls": 8, "estimated_evidence_tokens": 8000,
+    }
+
+
 def test_task_limits_are_snapshotted_and_enforced(store):
     limits = TaskLimitsConfig(
         search_calls=1, read_calls=2, estimated_evidence_tokens=500,
@@ -274,7 +286,9 @@ def test_task_limits_are_snapshotted_and_enforced(store):
 
 
 def test_owner_duplicate_pending_seed_and_budget_rules(store):
-    task_id = store.create_task("synthetic_owner")["task_id"]
+    task_id = store.create_task(
+        "synthetic_owner", TaskLimitsConfig(estimated_evidence_tokens=8000),
+    )["task_id"]
     with pytest.raises(LedgerFailure) as failure:
         store.get_task("other_owner", task_id)
     assert failure.value.code == "task_not_found"

@@ -43,6 +43,7 @@ def test_deployment_examples_share_loopback_http_baseline():
     root = Path(__file__).resolve().parents[1]
     values = json.loads((root / "config/config.json.example").read_text())
     http = values["http"]
+    assert TaskLimitsConfig(**values["mcp"]["task_limits"]) == TaskLimitsConfig()
     assert (http["host"], http["port"]) == ("127.0.0.1", 2699)
     assert http["allowed_peers"] == ["127.0.0.1"]
 
@@ -65,7 +66,7 @@ def test_unified_http_keeps_auth_and_shared_mcp_core(unified, config, tmp_path):
     assert selected.transport == "http" and (selected.host, selected.port) == ("127.0.0.1", 8765)
     assert selected.runtime == config
     assert selected.ledger.path == tmp_path / "synthetic-ledger/execution.sqlite3"
-    assert selected.task_limits == TaskLimitsConfig()
+    assert selected.task_limits == TaskLimitsConfig(4, 8, 8000)
     with client_for(load_http_config(path)) as client:
         assert client.get("/v1/status").status_code == 401
         rest = client.get("/v1/status", headers=HEADERS).json()
@@ -76,6 +77,24 @@ def test_unified_http_keeps_auth_and_shared_mcp_core(unified, config, tmp_path):
         assert status == rest
     with pytest.raises(ValueError, match="cannot load stdio configuration"):
         load_stdio_config(path)
+
+
+@pytest.mark.parametrize("transport", ["http", "stdio"])
+@pytest.mark.parametrize("limits, expected", [
+    (None, (16, 32, 64000)),
+    ({}, (16, 32, 64000)),
+    ({"search_calls": 3}, (3, 32, 64000)),
+])
+def test_missing_task_limits_use_defaults_in_both_transports(
+    unified, tmp_path, transport, limits, expected,
+):
+    unified["mcp"]["transport"] = transport
+    if limits is None:
+        del unified["mcp"]["task_limits"]
+    else:
+        unified["mcp"]["task_limits"] = limits
+    selected = load_service_config(write_config(tmp_path, unified))
+    assert selected.task_limits == TaskLimitsConfig(*expected)
 
 
 @pytest.mark.parametrize("with_http", [False, True])
@@ -234,6 +253,7 @@ def test_stdio_dispatch_never_constructs_http(unified, tmp_path, monkeypatch, ca
 @pytest.mark.skipif(os.name != "posix", reason="POSIX pipe transport")
 def test_unified_stdio_real_pipes_without_network(unified, tmp_path):
     unified["mcp"]["transport"] = "stdio"
+    del unified["mcp"]["task_limits"]
     unified["http"] = {"credentials_file": "synthetic-missing-credentials"}
     (tmp_path / "synthetic-ledger").mkdir(mode=0o700)
     path = write_config(tmp_path, unified)
@@ -255,7 +275,12 @@ raise SystemExit(main())
         try:
             client.initialize()
             status = client.tool("status")["structuredContent"]
-            task_id = client.tool("start_retrieval_task")["structuredContent"]["task_id"]
+            task = client.tool("start_retrieval_task")["structuredContent"]
+            assert task["limits"] == {
+                "search_calls": 16, "read_calls": 32,
+                "estimated_evidence_tokens": 64000,
+            }
+            task_id = task["task_id"]
             search = client.tool("search_sources", {
                 "task_id": task_id, "queries": ["quasar"], "max_estimated_tokens": 2000,
             })["structuredContent"]

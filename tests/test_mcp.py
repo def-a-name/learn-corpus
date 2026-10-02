@@ -175,20 +175,21 @@ def test_task_switching_bounded_detail_and_owner_isolation(config):
         assert json.loads(foreign['content'][0]['text'])['error']['code'] == 'task_not_found'
 
 
-def test_configured_task_limits_are_returned_by_new_task(config):
-    limits = TaskLimitsConfig(
-        search_calls=7, read_calls=11, estimated_evidence_tokens=24000,
-    )
+@pytest.mark.parametrize('limits, expected', [
+    (None, (16, 32, 64000)),
+    (TaskLimitsConfig(7, 11, 24000), (7, 11, 24000)),
+])
+def test_default_and_configured_task_limits_are_returned_by_new_task(config, limits, expected):
     with client_for(config, task_limits=limits) as client:
         result = call(client, 'start_retrieval_task').json()['result']
         assert result['isError'] is False
         task = result['structuredContent']
         assert task['limits'] == {
-            'search_calls': 7,
-            'read_calls': 11,
-            'estimated_evidence_tokens': 24000,
+            'search_calls': expected[0],
+            'read_calls': expected[1],
+            'estimated_evidence_tokens': expected[2],
         }
-        assert task['execution']['available_estimated_tokens'] == 24000
+        assert task['execution']['available_estimated_tokens'] == expected[2]
 
 
 @pytest.mark.parametrize('method', ['resources/list', 'resources/templates/list', 'prompts/list', 'read_item', 'admin/rebuild'])
