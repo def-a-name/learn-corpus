@@ -33,7 +33,7 @@ from src.ingestion.common import (
 from src.ingestion.import_markdown import MarkdownImportError, scan_markdown
 
 
-DEFAULT_INPUT = REPO_ROOT.parent / "web-chats"
+DEFAULT_INPUT = REPO_ROOT / "raw" / "web-chat"
 DEFAULT_OUTPUT = REPO_ROOT / "sources" / "conversations"
 DEFAULT_ASSETS = REPO_ROOT / "sources" / "assets"
 DEFAULT_REVIEW_RESOLUTIONS = REPO_ROOT / "meta" / "source-review-resolutions.json"
@@ -1133,7 +1133,7 @@ def import_web_chats(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Import browser-exported web chat Markdown.")
-    parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
+    parser.add_argument("--input", type=Path, required=True, help="explicit raw input directory")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--assets", type=Path, default=DEFAULT_ASSETS)
     parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)

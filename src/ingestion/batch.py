@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo
 
 from src.corpus.ingest_log import SourceChangeTracker
 from src.corpus.manifest import load_manifest, save_manifest
-from src.corpus.paths import REPO_ROOT
+from src.corpus.paths import REPO_ROOT, validate_data_path
 from src.corpus.storage import atomic_copy_file, atomic_write_text, sha256_file
 
 
@@ -358,9 +358,15 @@ def execute_batch(
 ) -> list[ProviderPlan]:
     """先完成所有来源分析，再决定是否提交本批。"""
 
+    validate_data_path(manifest_path)
     manifest = load_manifest(manifest_path)
     manifest_digest = _manifest_digest(manifest_path)
     plans = [strategy.prepare(manifest) for strategy in strategies]
+    for plan in plans:
+        validate_data_path(plan.output_root)
+        for source in plan.sources:
+            for item in source.files:
+                validate_data_path(item.path)
     effective_plans = [plan for plan in plans if plan.selected_paths or plan.inventory_records or plan.sources]
     mark_inventory_collisions(effective_plans, manifest_path.parent / "source-inventory.json")
     mark_target_conflicts(effective_plans, manifest)

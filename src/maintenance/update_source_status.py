@@ -13,7 +13,7 @@ from src.corpus.manifest import (
     save_manifest,
     utc_now,
 )
-from src.corpus.paths import MANIFEST_PATH
+from src.corpus.paths import validate_data_path, MANIFEST_PATH
 
 
 def main() -> None:
@@ -23,6 +23,8 @@ def main() -> None:
     parser.add_argument("--kind", choices=("ingest", "curation"), default="curation")
     parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
     args = parser.parse_args()
+    if getattr(args, "manifest", None) is not None:
+        validate_data_path(args.manifest)
     manifest = load_manifest(args.manifest)
     if args.source_id not in manifest["sources"]:
         raise SystemExit(f"source does not exist: {args.source_id}")

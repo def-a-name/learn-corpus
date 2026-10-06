@@ -1,0 +1,43 @@
+# 可选的系统级 Linux/systemd HTTP 服务模板，示例安装位置为 /etc/systemd/system/learn-corpus.service。
+# 前提：已准备 learn-corpus 用户和组，项目位于 /opt/learn-corpus，config/ 中有真实配置。
+# 使用其他账户或路径时同步替换 User/Group、启动路径与 ReadWritePaths，并准备对应访问权限。
+[Unit]
+Description=Learn Corpus HTTP API
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=exec
+User=learn-corpus
+Group=learn-corpus
+WorkingDirectory=/opt/learn-corpus
+ExecStart=/opt/learn-corpus/venv/bin/python -E -s -B -u -m src.service.server --config /opt/learn-corpus/config/config.json
+Restart=on-failure
+RestartSec=5s
+# 先发送 SIGTERM 收尾，超过 30 秒后由 systemd 终止整个进程组。
+KillSignal=SIGTERM
+KillMode=control-group
+TimeoutStopSec=30s
+UMask=0077
+
+# 本模板隔离代码、配置和索引的写入，并屏蔽主目录；受保护路径内的安装需另行调整方案。
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+# 仅开放隔离层的写入，不创建目录、不设置所有者，也不授予 Unix 文件权限。
+ReadWritePaths=/opt/learn-corpus/var
+PrivateTmp=true
+PrivateDevices=true
+CapabilityBoundingSet=
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# stdout/stderr 交给 journal，日志保留和读取权限由目标机配置管理。
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=learn-corpus
+
+[Install]
+WantedBy=multi-user.target

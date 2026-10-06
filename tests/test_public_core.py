@@ -319,7 +319,7 @@ def test_known_missing_list_cannot_be_silently_shortened(open_core):
         read(core, items[0], max_estimated_tokens=250)
 
 
-def test_public_budget_does_not_truncate_internal_evaluation_results(open_core, monkeypatch):
+def test_public_budget_does_not_truncate_internal_search_results(open_core, monkeypatch):
     core = open_core(exchange())
     monkeypatch.setattr(public_core, "MAX_RESPONSE_BYTES", 500)
     assert len(core.store.search_lex(["quasar"], limit=20).results) == 4

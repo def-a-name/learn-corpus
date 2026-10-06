@@ -16,11 +16,11 @@ from src.ingestion.import_codex import DEFAULT_REVIEW_RESOLUTIONS as CODEX_REVIE
 from src.ingestion.import_web_chat import DEFAULT_INPUT as WEB_CHAT_INPUT
 from src.ingestion.import_web_chat import DEFAULT_REVIEW_RESOLUTIONS as WEB_CHAT_REVIEW_RESOLUTIONS
 from src.corpus.manifest import load_manifest
-from src.corpus.paths import MANIFEST_PATH, REPO_ROOT
+from src.corpus.paths import validate_data_path, MANIFEST_PATH, REPO_ROOT
 
 
-DEFAULT_NOTES_INPUT = REPO_ROOT.parent / "notes"
-DEFAULT_ARTICLES_INPUT = REPO_ROOT.parent / "articles"
+DEFAULT_NOTES_INPUT = REPO_ROOT / "raw" / "notes"
+DEFAULT_ARTICLES_INPUT = REPO_ROOT / "raw" / "articles"
 DEFAULT_OUTPUT = REPO_ROOT / "meta" / "source-inventory.json"
 WEB_CHAT_MISSING = [
     "只盘点当前目录中的 Chrome 插件 Markdown 导出，不代表账号全部网页历史",
@@ -138,8 +138,9 @@ def build_inventory(
     codex_review_resolutions: Path = CODEX_REVIEW_RESOLUTIONS,
     web_chat_review_resolutions: Path = WEB_CHAT_REVIEW_RESOLUTIONS,
     scanned_at: str | None = None,
+    selected_providers: set[str] | None = None,
 ) -> dict[str, Any]:
-    """用五类来源策略生成完整但不执行正式导入的覆盖快照。"""
+    """生成指定来源的覆盖快照；未指定范围时保持既有五类调用行为。"""
 
     from src.ingestion.batch import merge_inventory
 
@@ -172,6 +173,8 @@ def build_inventory(
         ("articles", articles_input, "markdown", ["远程图片和链接只记录引用，inventory 不下载或联网检查"]),
     )
     for provider, input_root, source_format, known_missing in sources:
+        if selected_providers is not None and provider not in selected_providers:
+            continue
         if not input_root.is_dir():
             missing = _missing_input(provider, input_root, source_format, known_missing)
             missing["scanned_at"] = timestamp
@@ -212,11 +215,11 @@ def save_inventory(inventory: dict[str, Any], output_path: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build the source coverage inventory.")
-    parser.add_argument("--claude-input", type=Path, default=CLAUDE_INPUT)
-    parser.add_argument("--codex-input", type=Path, default=CODEX_INPUT)
-    parser.add_argument("--notes-input", type=Path, default=DEFAULT_NOTES_INPUT)
-    parser.add_argument("--articles-input", type=Path, default=DEFAULT_ARTICLES_INPUT)
-    parser.add_argument("--web-chat-input", type=Path, default=WEB_CHAT_INPUT)
+    parser.add_argument("--claude-input", type=Path)
+    parser.add_argument("--codex-input", type=Path)
+    parser.add_argument("--notes-input", type=Path)
+    parser.add_argument("--articles-input", type=Path)
+    parser.add_argument("--web-chat-input", type=Path)
     parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
     parser.add_argument(
         "--codex-review-resolutions",
@@ -241,8 +244,29 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    if getattr(args, "manifest", None) is not None:
+        validate_data_path(args.manifest)
+    if getattr(args, "output", None) is not None:
+        validate_data_path(args.output)
     if bool(args.provider) != bool(args.include):
         parser.error("--provider and at least one --include must be used together")
+    roots = {
+        "claude-export": args.claude_input,
+        "codex": args.codex_input,
+        "notes": args.notes_input,
+        "articles": args.articles_input,
+        "web-chat": args.web_chat_input,
+    }
+    selected_providers = {provider for provider, path in roots.items() if path is not None}
+    if not selected_providers:
+        parser.error("at least one explicit input directory is required")
+    if args.provider and args.provider not in selected_providers:
+        parser.error("the selected provider requires an explicit input directory")
+    args.claude_input = args.claude_input or CLAUDE_INPUT
+    args.codex_input = args.codex_input or CODEX_INPUT
+    args.notes_input = args.notes_input or DEFAULT_NOTES_INPUT
+    args.articles_input = args.articles_input or DEFAULT_ARTICLES_INPUT
+    args.web_chat_input = args.web_chat_input or WEB_CHAT_INPUT
     if args.provider is not None:
         if not args.output.is_file():
             parser.error("scoped inventory update requires an existing output file")
@@ -273,6 +297,7 @@ def main() -> None:
             web_chat_input=args.web_chat_input,
             codex_review_resolutions=args.codex_review_resolutions,
             web_chat_review_resolutions=args.web_chat_review_resolutions,
+            selected_providers=selected_providers,
         )
     if not args.dry_run:
         save_inventory(inventory, args.output)

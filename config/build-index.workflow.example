@@ -1,0 +1,15 @@
+name: Build private retrieval index
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: OWNER/learn-corpus/.github/workflows/build-index.yml@PUBLIC_CODE_COMMIT
+    with:
+      repository: OWNER/learn-corpus-private

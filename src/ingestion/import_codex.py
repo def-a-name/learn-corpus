@@ -1498,7 +1498,7 @@ def import_sessions(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Import Codex rollout sessions.")
-    parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
+    parser.add_argument("--input", type=Path, required=True, help="explicit raw input directory")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
     parser.add_argument("--limit", type=int)

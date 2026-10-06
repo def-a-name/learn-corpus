@@ -19,7 +19,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 from src.maintenance import deploy_index as deployment  # noqa: E402
-from src.maintenance.build_release import _validate_assets, build_release  # noqa: E402
+from src.maintenance.build_release import _validate_assets, build_release, validate_code_checkout  # noqa: E402
 from src.corpus.document import yaml_document  # noqa: E402
 from src.retrieval.build_lexical_index import build_index, publish_index  # noqa: E402
 from test_build_lexical_index import fixture_projection, make_item  # noqa: E402
@@ -33,6 +33,66 @@ CURRENT_INDEX_ID = "idx_" + "d" * 20
 PREVIOUS_INDEX_ID = "idx_" + "e" * 20
 DIGEST = "sha256:" + "b" * 64
 DATABASE_HASH = "sha256:" + "c" * 64
+
+
+def test_explicit_repository_is_preserved_and_invalid_origin_is_rejected(tmp_path, monkeypatch):
+    repository = "synthetic-owner/synthetic-private-data"
+    config = tmp_path / "deployment.json"
+    value = {"service_config": "service.json", "github_header_file": "synthetic.header", "service": "synthetic-service", "service_user": "synthetic-user", "repository": repository}
+    config.write_text(json.dumps(value))
+    assert deployment.load_deployment_config(config).repository == repository
+    run = run_record(RUN_ID)
+    run["repository"]["full_name"] = repository
+    assert deployment._check_run(run, RUN_ID, repository=repository) == (COMMIT, RUN_ATTEMPT)
+    with pytest.raises(ValueError, match="expected repository"):
+        deployment._check_run(run_record(RUN_ID), RUN_ID, repository=repository)
+    with pytest.raises(ValueError, match="outside the expected repository"):
+        deployment._request(f"{deployment.API_ROOT}/actions/runs/{RUN_ID}", "synthetic-token", repository=repository)
+    for invalid in ["owner/repo/extra", "../repo", "https://example.test/repo", "owner/repo?secret", "owner/repo\n"]:
+        value["repository"] = invalid
+        config.write_text(json.dumps(value))
+        with pytest.raises(ValueError, match="explicit owner/name"):
+            deployment.load_deployment_config(config)
+    value.pop("repository")
+    config.write_text(json.dumps(value))
+    with pytest.raises(ValueError, match="missing required fields: repository"):
+        deployment.load_deployment_config(config)
+
+
+def test_release_repository_mismatch_fails_before_building(tmp_path):
+    with pytest.raises(ValueError, match="repository, ref, or commit"):
+        build_release(tmp_path, tmp_path / "output", repository="synthetic-owner/incorrect-data", expected_repository="synthetic-owner/expected-data", ref=deployment.REF, commit=COMMIT, run_id=str(RUN_ID), run_attempt=str(RUN_ATTEMPT))
+    assert not (tmp_path / "output").exists()
+
+
+def test_release_code_must_match_clean_committed_submodule(tmp_path):
+    code = tmp_path / "synthetic-code"
+    data = tmp_path / "synthetic-data"
+    code.mkdir()
+    data.mkdir()
+
+    def git(root, *args):
+        return subprocess.run(["git", "-C", root, "-c", "user.name=Synthetic User", "-c", "user.email=synthetic@example.test", *args], check=True, capture_output=True, text=True).stdout.strip()
+
+    for root in [code, data]:
+        git(root, "init", "-q")
+    (code / "README.md").write_text("Synthetic code revision.\n")
+    git(code, "add", "README.md")
+    git(code, "commit", "-qm", "Synthetic code baseline")
+    git(data, "-c", "protocol.file.allow=always", "submodule", "add", str(code), "engine")
+    git(data, "commit", "-qm", "Synthetic pinned code")
+    engine = data / "engine"
+    revision = git(engine, "rev-parse", "HEAD")
+    assert validate_code_checkout(data, engine) == revision
+    (engine / "README.md").write_text("Synthetic uncommitted change.\n")
+    with pytest.raises(ValueError, match="uncommitted changes"):
+        validate_code_checkout(data, engine)
+    git(engine, "add", "README.md")
+    git(engine, "commit", "-qm", "Synthetic unpinned change")
+    with pytest.raises(ValueError, match="does not match"):
+        validate_code_checkout(data, engine)
+    with pytest.raises(ValueError, match="pinned submodule"):
+        validate_code_checkout(data, code)
 
 
 def run_record(run_id: int, created_at: str = "2026-01-02T00:00:00Z") -> dict:
@@ -93,7 +153,7 @@ def test_accepts_matching_run_and_artifact_metadata() -> None:
 
 def test_latest_run_selects_newest_successful_main_build(monkeypatch) -> None:
     urls = []
-    monkeypatch.setattr(deployment, "_request", lambda url, token: urls.append(url) or {
+    monkeypatch.setattr(deployment, "_request", lambda url, token, **kwargs: urls.append(url) or {
         "workflow_runs": [
             run_record(101, "2026-01-01T00:00:00Z"),
             run_record(103, "2026-01-03T00:00:00Z"),
@@ -110,7 +170,7 @@ def test_latest_run_selects_newest_successful_main_build(monkeypatch) -> None:
 def test_latest_run_checks_later_pages(monkeypatch) -> None:
     pages = []
 
-    def request(url, token):
+    def request(url, token, **kwargs):
         pages.append(url)
         if len(pages) == 1:
             return {"workflow_runs": [run_record(index, "2026-01-01T00:00:00Z") for index in range(1, 101)]}
@@ -124,7 +184,7 @@ def test_latest_run_checks_later_pages(monkeypatch) -> None:
 def test_latest_run_requires_explicit_id_when_search_limit_is_reached(monkeypatch) -> None:
     pages = []
 
-    def request(url, token):
+    def request(url, token, **kwargs):
         pages.append(url)
         return {"workflow_runs": [run_record(index) for index in range(1, 101)]}
 
@@ -135,16 +195,16 @@ def test_latest_run_requires_explicit_id_when_search_limit_is_reached(monkeypatc
 
 
 def test_latest_run_fails_closed_on_missing_or_invalid_listing(monkeypatch) -> None:
-    monkeypatch.setattr(deployment, "_request", lambda url, token: {"workflow_runs": []})
+    monkeypatch.setattr(deployment, "_request", lambda url, token, **kwargs: {"workflow_runs": []})
     with pytest.raises(ValueError, match="no successful main"):
         deployment._latest_run_id("synthetic-token")
     invalid = run_record(101)
     invalid["path"] = ".github/workflows/other.yml@refs/heads/main"
-    monkeypatch.setattr(deployment, "_request", lambda url, token: {"workflow_runs": [invalid]})
+    monkeypatch.setattr(deployment, "_request", lambda url, token, **kwargs: {"workflow_runs": [invalid]})
     with pytest.raises(ValueError, match="expected repository"):
         deployment._latest_run_id("synthetic-token")
     invalid = run_record(101, "invalid-time")
-    monkeypatch.setattr(deployment, "_request", lambda url, token: {"workflow_runs": [invalid]})
+    monkeypatch.setattr(deployment, "_request", lambda url, token, **kwargs: {"workflow_runs": [invalid]})
     with pytest.raises(ValueError, match="creation time"):
         deployment._latest_run_id("synthetic-token")
 
@@ -177,6 +237,7 @@ def test_deployment_config_selects_run_and_resolves_paths(tmp_path: Path, run_id
     config_path.parent.mkdir()
     config_path.write_text(json.dumps({
         "service_config": "../service.json",
+        "repository": deployment.REPOSITORY,
         "github_header_file": "header",
         "service": "synthetic-service",
         "service_user": "synthetic-user",
@@ -222,6 +283,7 @@ def test_deployment_config_rejects_invalid_fields(tmp_path: Path, extra, message
     config_path = tmp_path / "deploy.json"
     config = {
         "service_config": "service.json",
+        "repository": deployment.REPOSITORY,
         "github_header_file": "header",
         "service": "synthetic-service",
         "service_user": "synthetic-user",
@@ -304,7 +366,7 @@ def test_latest_missing_artifact_does_not_fall_back(tmp_path: Path, monkeypatch)
     older = run_record(RUN_ID, "2026-01-02T00:00:00Z")
     urls = []
 
-    def request(url, token, *, binary=False):
+    def request(url, token, *, binary=False, **kwargs):
         urls.append(url)
         if "/workflows/build-index.yml/runs?" in url:
             return {"workflow_runs": [older, latest]}
@@ -484,8 +546,8 @@ def _stub_deployment(monkeypatch, retrieval_root: Path, *, run_id: int | None = 
     ))
     monkeypatch.setattr(deployment, "load_service_config", lambda path: config)
     monkeypatch.setattr(deployment, "_github_token", lambda path: "synthetic-token")
-    monkeypatch.setattr(deployment, "_request", lambda url, token, binary=False: b"archive" if binary else {})
-    monkeypatch.setattr(deployment, "_check_run", lambda run, run_id: (COMMIT, RUN_ATTEMPT))
+    monkeypatch.setattr(deployment, "_request", lambda url, token, binary=False, **kwargs: b"archive" if binary else {})
+    monkeypatch.setattr(deployment, "_check_run", lambda run, run_id, **kwargs: (COMMIT, RUN_ATTEMPT))
     monkeypatch.setattr(
         deployment,
         "_check_artifacts",
@@ -502,9 +564,9 @@ def test_incompatible_index_leaves_links_unchanged(tmp_path: Path, monkeypatch, 
         (root / name).symlink_to(index_id)
     _stub_deployment(monkeypatch, root, run_id=selected_run)
     selected = []
-    monkeypatch.setattr(deployment, "_latest_run_id", lambda token: selected.append(token) or RUN_ID)
+    monkeypatch.setattr(deployment, "_latest_run_id", lambda token, **kwargs: selected.append(token) or RUN_ID)
 
-    def extract(_archive, temporary, _run_id, _run_attempt, _commit):
+    def extract(_archive, temporary, _run_id, _run_attempt, _commit, **kwargs):
         staged = temporary / INDEX_ID
         staged.mkdir()
         return {"index_id": INDEX_ID}, staged
@@ -539,7 +601,7 @@ def test_deployment_reports_progress_without_credentials(tmp_path: Path, monkeyp
     (root / "previous").symlink_to(PREVIOUS_INDEX_ID)
     _stub_deployment(monkeypatch, root)
 
-    def extract(_archive, temporary, _run_id, _run_attempt, _commit):
+    def extract(_archive, temporary, _run_id, _run_attempt, _commit, **kwargs):
         staged = temporary / INDEX_ID
         staged.mkdir()
         (staged / "index.json").write_text("{}")
@@ -614,7 +676,7 @@ def ready_deployment(tmp_path: Path, monkeypatch):
             archive.write(path, f"{artifact.index_id}/{path.name}")
     data = buffer.getvalue()
     _stub_deployment(monkeypatch, root)
-    monkeypatch.setattr(deployment, "_request", lambda url, token, binary=False: data if binary else {})
+    monkeypatch.setattr(deployment, "_request", lambda url, token, binary=False, **kwargs: data if binary else {})
     monkeypatch.setattr(deployment, "_check_artifacts", lambda *args: (
         987, "sha256:" + hashlib.sha256(data).hexdigest(),
     ))
@@ -689,7 +751,7 @@ def test_initial_preparation_failure_keeps_corpus_empty(ready_deployment, monkey
     elif phase == "digest":
         monkeypatch.setattr(deployment, "_check_artifacts", lambda *args: (987, "sha256:" + "0" * 64))
     elif phase == "extraction":
-        def extract(data, target, *args):
+        def extract(data, target, *args, **kwargs):
             (target / "synthetic-partial-file").write_text("Synthetic partial extraction")
             fail()
         monkeypatch.setattr(deployment, "_extract_release", extract)
@@ -961,7 +1023,7 @@ def test_failed_restart_restores_previous_links(tmp_path: Path, monkeypatch, cap
         (root / "previous").symlink_to(PREVIOUS_INDEX_ID)
     _stub_deployment(monkeypatch, root)
 
-    def extract(_archive, temporary, _run_id, _run_attempt, _commit):
+    def extract(_archive, temporary, _run_id, _run_attempt, _commit, **kwargs):
         staged = temporary / INDEX_ID
         staged.mkdir()
         return {"index_id": INDEX_ID}, staged

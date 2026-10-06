@@ -10,7 +10,7 @@ from src.ingestion.import_markdown import MarkdownPolicy, import_markdown_source
 from src.corpus.paths import MANIFEST_PATH, REPO_ROOT
 
 
-DEFAULT_INPUT = REPO_ROOT.parent / "articles"
+DEFAULT_INPUT = REPO_ROOT / "raw" / "articles"
 DEFAULT_OUTPUT = REPO_ROOT / "sources" / "articles"
 DEFAULT_ASSETS = REPO_ROOT / "sources" / "assets"
 
@@ -38,7 +38,7 @@ def import_articles(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Import external Markdown articles.")
-    parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
+    parser.add_argument("--input", type=Path, required=True, help="explicit raw input directory")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--assets", type=Path, default=DEFAULT_ASSETS)
     parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)

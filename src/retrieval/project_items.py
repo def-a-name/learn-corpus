@@ -30,7 +30,7 @@ from src.retrieval.contracts import (
 )
 from src.retrieval.text import estimate_evidence_tokens
 from src.corpus.document import parse_frontmatter, parse_line_locator
-from src.corpus.paths import MANIFEST_PATH, REPO_ROOT
+from src.corpus.paths import validate_data_path, MANIFEST_PATH, REPO_ROOT
 from src.corpus.scopes import SOURCE_ROOTS
 
 TARGET_MIN_TOKENS = 400
@@ -997,6 +997,10 @@ def main() -> None:
     parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
     parser.add_argument("--manifest", type=Path)
     args = parser.parse_args()
+    if getattr(args, "repo_root", None) is not None:
+        validate_data_path(args.repo_root)
+    if getattr(args, "manifest", None) is not None:
+        validate_data_path(args.manifest)
     result = project_corpus(args.repo_root, args.manifest)
     counts = Counter(item.scope for item in result.items)
     print(

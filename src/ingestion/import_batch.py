@@ -9,17 +9,14 @@ from pathlib import Path
 from src.corpus.paths import MANIFEST_PATH
 from src.ingestion.batch import SourceStrategy, execute_batch
 from src.ingestion.import_articles import DEFAULT_ASSETS as ARTICLE_ASSETS
-from src.ingestion.import_articles import DEFAULT_INPUT as ARTICLE_INPUT
 from src.ingestion.import_articles import DEFAULT_OUTPUT as ARTICLE_OUTPUT
-from src.ingestion.import_claude import ClaudeStrategy, DEFAULT_INPUT as CLAUDE_INPUT
+from src.ingestion.import_claude import ClaudeStrategy
 from src.ingestion.import_claude import DEFAULT_OUTPUT as CLAUDE_OUTPUT
-from src.ingestion.import_codex import CodexStrategy, DEFAULT_INPUT as CODEX_INPUT
+from src.ingestion.import_codex import CodexStrategy
 from src.ingestion.import_codex import DEFAULT_OUTPUT as CODEX_OUTPUT
 from src.ingestion.import_notes import DEFAULT_ASSETS as NOTE_ASSETS
-from src.ingestion.import_notes import DEFAULT_INPUT as NOTE_INPUT
 from src.ingestion.import_notes import DEFAULT_OUTPUT as NOTE_OUTPUT
 from src.ingestion.import_web_chat import DEFAULT_ASSETS as WEB_CHAT_ASSETS
-from src.ingestion.import_web_chat import DEFAULT_INPUT as WEB_CHAT_INPUT
 from src.ingestion.import_web_chat import DEFAULT_OUTPUT as WEB_CHAT_OUTPUT
 from src.ingestion.import_web_chat import WebChatStrategy
 from src.ingestion.import_markdown import MarkdownPolicy, MarkdownStrategy
@@ -29,11 +26,11 @@ from src.ingestion.import_codex import DEFAULT_REVIEW_RESOLUTIONS
 def main() -> None:
     parser = argparse.ArgumentParser(description="Import an explicit batch of source files.")
     parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
-    parser.add_argument("--claude-input", type=Path, default=CLAUDE_INPUT)
-    parser.add_argument("--codex-input", type=Path, default=CODEX_INPUT)
-    parser.add_argument("--web-chat-input", type=Path, default=WEB_CHAT_INPUT)
-    parser.add_argument("--notes-input", type=Path, default=NOTE_INPUT)
-    parser.add_argument("--articles-input", type=Path, default=ARTICLE_INPUT)
+    parser.add_argument("--claude-input", type=Path)
+    parser.add_argument("--codex-input", type=Path)
+    parser.add_argument("--web-chat-input", type=Path)
+    parser.add_argument("--notes-input", type=Path)
+    parser.add_argument("--articles-input", type=Path)
     parser.add_argument("--review-resolutions", type=Path, default=DEFAULT_REVIEW_RESOLUTIONS)
     parser.add_argument("--claude-include", action="append")
     parser.add_argument("--claude-document-include", action="append")
@@ -55,6 +52,16 @@ def main() -> None:
         parser.error("at least one included source file is required")
     if args.codex_session_id and not args.codex_include:
         parser.error("--codex-session-id requires --codex-include")
+
+    for selected, input_root, option in (
+        (args.claude_include or args.claude_document_include, args.claude_input, "--claude-input"),
+        (args.codex_include, args.codex_input, "--codex-input"),
+        (args.web_chat_include, args.web_chat_input, "--web-chat-input"),
+        (args.note_include, args.notes_input, "--notes-input"),
+        (args.article_include, args.articles_input, "--articles-input"),
+    ):
+        if selected and input_root is None:
+            parser.error(f"{option} is required for selected source files")
 
     strategies: list[SourceStrategy] = []
     if args.claude_include:

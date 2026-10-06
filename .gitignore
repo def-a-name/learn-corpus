@@ -1,0 +1,49 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.venv/
+venv/
+
+# 本地凭据与私钥不进入仓库；可提交脱敏的示例文件。
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa
+id_ed25519
+
+# Obsidian 配置、插件偏好和布局都属于本地状态。
+.obsidian/
+
+# 导入时使用的临时文件。
+*.tmp
+
+# 可从 Markdown 重建的派生检索库。
+meta/search.db
+meta/search.db-*
+meta/corpus/
+
+# MCP execution ledger 本地运行状态。
+/var/
+
+# 本地部署配置
+config/*.json
+config/*.header
+config/*.conf
+config/*.service
+
+# 个人资料、来源状态与私有操作记录。
+/sources/
+/meta/
+/raw/
+/dev-logs/
+/evals/
+/private_tools/
+/private_tests/
+*.sqlite
+*.sqlite3
+*.db
+*.log
+*.zip

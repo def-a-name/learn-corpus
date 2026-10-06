@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from src.corpus.paths import REPO_ROOT
+from src.corpus.paths import validate_data_path, REPO_ROOT
 from src.corpus.removal import SourceRemovalError, remove_source
 
 
@@ -19,6 +19,10 @@ def main() -> None:
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    if getattr(args, "repo_root", None) is not None:
+        validate_data_path(args.repo_root)
+    if getattr(args, "manifest", None) is not None:
+        validate_data_path(args.manifest)
     try:
         result = remove_source(
             args.source_id,

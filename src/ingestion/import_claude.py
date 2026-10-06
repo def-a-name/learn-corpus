@@ -27,7 +27,7 @@ from src.ingestion.common import (
 )
 
 
-DEFAULT_INPUT = REPO_ROOT.parent / "claude-exec-docs"
+DEFAULT_INPUT = REPO_ROOT / "raw" / "claude"
 DEFAULT_OUTPUT = REPO_ROOT / "sources" / "conversations" / "claude"
 EXCLUDED_FILES = {"INDEX.md", "prompt-tmp.md"}
 SUBAGENT_MARKER = "> *This is a sub-agent conversation spawned by the main session.*"
@@ -835,7 +835,7 @@ def import_exports(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Import Claude Markdown exports.")
-    parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
+    parser.add_argument("--input", type=Path, required=True, help="explicit raw input directory")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
     parser.add_argument("--kind", choices=("all", "session", "document"), default="session")

@@ -1,0 +1,7 @@
+interface:
+  display_name: "Learn Corpus Retrieval"
+  short_description: "检索 Learn Corpus 中的历史会话、个人笔记和保存文章"
+  default_prompt: "Use $learn-corpus-retrieval to answer this question from Learn Corpus."
+
+policy:
+  allow_implicit_invocation: true

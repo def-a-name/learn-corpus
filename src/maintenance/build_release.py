@@ -10,7 +10,7 @@ import subprocess
 from pathlib import Path, PurePosixPath
 
 from src.corpus.ingest_log import check_committed_ingest_log
-from src.corpus.paths import REPO_ROOT
+from src.corpus.paths import REPO_ROOT, CODE_ROOT
 from src.corpus.storage import sha256_file
 from src.maintenance.scan_secrets import git_candidate_files, scan_paths
 from src.retrieval.build_lexical_index import build_index
@@ -18,9 +18,32 @@ from src.retrieval.index_artifact import validate_index_artifact
 from src.retrieval.project_items import project_corpus
 
 
-REPOSITORY = "def-a-name/learn-corpus"
+REPOSITORY = "example-owner/learn-corpus-private"
 REF = "refs/heads/main"
 SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
+
+
+def validate_code_checkout(repo_root: Path, code_root: Path) -> str:
+    """双仓库构建只接受数据 commit 固定且工作区未修改的代码版本。"""
+
+    code_root = code_root.resolve(strict=True)
+    if code_root == repo_root:
+        relative = "."
+    else:
+        try:
+            relative = code_root.relative_to(repo_root).as_posix()
+        except ValueError as exc:
+            raise ValueError("release code must be in the data repository's pinned submodule") from exc
+        entry = subprocess.run(["git", "ls-tree", "HEAD", "--", relative], cwd=repo_root, capture_output=True, text=True, check=True).stdout.split()
+        if len(entry) != 4 or entry[0:2] != ["160000", "commit"]:
+            raise ValueError("release code directory must be a committed submodule")
+    actual = subprocess.run(["git", "rev-parse", "HEAD"], cwd=code_root, capture_output=True, text=True, check=True).stdout.strip()
+    if relative != "." and actual != entry[2]:
+        raise ValueError("release code checkout does not match the data commit's submodule")
+    dirty = subprocess.run(["git", "status", "--porcelain", "--untracked-files=normal"], cwd=code_root, capture_output=True, text=True, check=True).stdout
+    if dirty:
+        raise ValueError("release code checkout contains uncommitted changes")
+    return actual
 
 
 def _validate_assets(repo_root: Path) -> None:
@@ -60,12 +83,12 @@ def _validate_assets(repo_root: Path) -> None:
                 raise ValueError(f"manifest asset hash mismatch: {source_id}")
 
 
-def build_release(repo_root: Path, output_root: Path, *, repository: str, ref: str, commit: str, run_id: str, run_attempt: str, base_commit: str | None = None) -> dict:
+def build_release(repo_root: Path, output_root: Path, *, repository: str, ref: str, commit: str, run_id: str, run_attempt: str, base_commit: str | None = None, expected_repository: str = REPOSITORY, code_root: Path | None = None) -> dict:
     """只为预期仓库的 main 提交生成发布目录，不切换 current。"""
 
     repo_root = repo_root.resolve(strict=True)
     output_root = output_root.resolve()
-    if repository != REPOSITORY or ref != REF or SHA_PATTERN.fullmatch(commit) is None:
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*/(?!\.{1,2}$)[A-Za-z0-9_.-]+", expected_repository) is None or repository != expected_repository or ref != REF or SHA_PATTERN.fullmatch(commit) is None:
         raise ValueError("release repository, ref, or commit is invalid")
     if not run_id.isdecimal() or int(run_id) < 1:
         raise ValueError("release run ID is invalid")
@@ -76,6 +99,8 @@ def build_release(repo_root: Path, output_root: Path, *, repository: str, ref: s
     ).stdout.strip()
     if head != commit:
         raise ValueError("release commit does not match checkout HEAD")
+    if code_root is not None:
+        validate_code_checkout(repo_root, code_root)
     if output_root.exists() and any(output_root.iterdir()):
         raise ValueError("release output directory is not empty")
     base_commit = base_commit if base_commit and set(base_commit) != {"0"} else None
@@ -122,6 +147,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Validate sources and package a retrieval index release.")
     parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--repository", required=True, help="expected private data repository owner/name")
     args = parser.parse_args()
     try:
         release = build_release(
@@ -133,6 +159,8 @@ def main() -> None:
             run_id=os.environ.get("GITHUB_RUN_ID", ""),
             run_attempt=os.environ.get("GITHUB_RUN_ATTEMPT", ""),
             base_commit=os.environ.get("LEARN_CORPUS_BASE_COMMIT") or None,
+            expected_repository=args.repository,
+            code_root=CODE_ROOT,
         )
     except (OSError, ValueError) as exc:
         parser.exit(1, f"Release build failed: {exc}\n")

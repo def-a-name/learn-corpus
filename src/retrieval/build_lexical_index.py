@@ -38,7 +38,7 @@ from src.retrieval.index_artifact import (
 )
 from src.retrieval.project_items import project_corpus
 from src.retrieval.text import estimate_evidence_tokens, normalize_index_text
-from src.corpus.paths import REPO_ROOT
+from src.corpus.paths import validate_data_path, REPO_ROOT
 
 
 _ITEM_ID = re.compile(r"^itm_[a-z2-7]{32}$")
@@ -459,6 +459,8 @@ def main() -> None:
     parser.add_argument("--retrieval-root", type=Path, help="Index directory (default: <repo-root>/meta/corpus)")
     parser.add_argument("--publish", action="store_true")
     args = parser.parse_args()
+    if getattr(args, "repo_root", None) is not None:
+        validate_data_path(args.repo_root)
     repo_root = args.repo_root.resolve()
     retrieval_root = args.retrieval_root or (repo_root / "meta" / "corpus")
     projection = project_corpus(repo_root, args.manifest)

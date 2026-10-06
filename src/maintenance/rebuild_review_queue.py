@@ -12,7 +12,7 @@ from typing import Any, Iterable
 
 from src.corpus.document import parse_line_locator
 from src.corpus.manifest import load_manifest
-from src.corpus.paths import MANIFEST_PATH, REPO_ROOT
+from src.corpus.paths import validate_data_path, MANIFEST_PATH, REPO_ROOT
 
 
 DEFAULT_INVENTORY = REPO_ROOT / "meta" / "source-inventory.json"
@@ -213,6 +213,12 @@ def main() -> None:
     )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    if getattr(args, "manifest", None) is not None:
+        validate_data_path(args.manifest)
+    if getattr(args, "inventory", None) is not None:
+        validate_data_path(args.inventory)
+    if getattr(args, "output", None) is not None:
+        validate_data_path(args.output)
     content = build_queue(
         args.manifest,
         args.output,

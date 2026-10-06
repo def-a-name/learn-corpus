@@ -16,7 +16,7 @@ from src.corpus.manifest import (
     ALLOWED_INGEST_STATUSES,
     load_manifest,
 )
-from src.corpus.paths import MANIFEST_PATH, REPO_ROOT
+from src.corpus.paths import validate_data_path, MANIFEST_PATH, REPO_ROOT
 from src.corpus.storage import sha256_file
 from src.ingestion.common import (
     CLAUDE_ASSISTANT_FINAL_DETECTION,
@@ -558,6 +558,10 @@ def main() -> None:
     parser.add_argument("--sources", type=Path, default=REPO_ROOT / "sources")
     parser.add_argument("--manifest", type=Path, default=MANIFEST_PATH)
     args = parser.parse_args()
+    if getattr(args, "manifest", None) is not None:
+        validate_data_path(args.manifest)
+    if getattr(args, "sources", None) is not None:
+        validate_data_path(args.sources)
     errors, warnings = check(args.manifest, args.sources)
     for warning in warnings:
         print(f"WARNING: {warning}")

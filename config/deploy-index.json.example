@@ -1,0 +1,8 @@
+{
+  "service_config": "/opt/learn-corpus/config/config.json",
+  "github_header_file": "github.header.example",
+  "service": "learn-corpus",
+  "service_user": "learn-corpus",
+  "run_id": "latest",
+  "repository": "example-owner/learn-corpus-private"
+}

@@ -1,0 +1,68 @@
+# 可选的同机 HTTPS 反向代理模板，在 Nginx nginx.conf 的 http {} 中 include。
+# 所有地址、证书路径和容量数值均为示例，部署前替换并验证。
+# 链路：客户端 → Nginx HTTPS → 127.0.0.1:2699 → Learn Corpus HTTP。
+
+log_format corpus_safe escape=json
+    '{"time":"$time_iso8601",'
+    '"status":$status,'
+    '"request_time":"$request_time",'
+    '"upstream_status":"$upstream_status",'
+    '"upstream_connect_time":"$upstream_connect_time",'
+    '"upstream_response_time":"$upstream_response_time",'
+    '"bytes_sent":$bytes_sent,'
+    '"limit_req_status":"$limit_req_status"}';
+
+# 整个服务共享入口速率，不使用客户端自报的转发 IP 或 Bearer 作为键。
+limit_req_zone $server_name zone=corpus_entry:1m rate=5r/s;
+
+server {
+    listen 443 ssl;
+    server_name corpus.example.com;
+
+    ssl_certificate /etc/nginx/certs/corpus.example.com/fullchain.pem;
+    ssl_certificate_key /etc/nginx/certs/corpus.example.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    server_tokens off;
+
+    # access_log off
+    access_log /var/log/nginx/learn-corpus-access.log corpus_safe;
+    error_log /dev/null crit;
+
+    client_max_body_size 32k;
+    client_header_timeout 5s;
+    client_body_timeout 5s;
+    large_client_header_buffers 4 8k;
+    keepalive_timeout 15s;
+    send_timeout 10s;
+
+    # 突发额度内立即处理，超额立即拒绝；healthz 和未知路由同样经过这里。
+    limit_req zone=corpus_entry burst=10 nodelay;
+    limit_req_status 429;
+
+    location / {
+        # 与 config.json.example 的 http.host/http.port 对齐；路径原样转发。
+        proxy_pass http://127.0.0.1:2699;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_set_header Host $http_host;
+        proxy_set_header Authorization $http_authorization;
+
+        # 应用只校验直接连接它的对端 IP，不解析客户端地址转发头。
+        # 清空这些头；同机代理对应的 allowed_peers 为 127.0.0.1。
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-For "";
+        proxy_set_header Forwarded "";
+        proxy_set_header X-Real-IP "";
+
+        # 让应用从收到请求头后开始计量完整 body 接收时限。
+        proxy_request_buffering off;
+        # 不将检索响应缓冲到代理临时文件。
+        proxy_buffering off;
+        proxy_connect_timeout 3s;
+        proxy_send_timeout 10s;
+        # 应大于示例应用的 body 接收 5 秒与 core 处理 5 秒之和，并预留余量。
+        proxy_read_timeout 20s;
+        proxy_next_upstream off;
+        proxy_intercept_errors off;
+    }
+}

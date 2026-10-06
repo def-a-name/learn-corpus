@@ -31,7 +31,7 @@ from src.service.config import load_service_config, read_config_object
 from src.service.errors import HTTPFailure
 
 
-REPOSITORY = "def-a-name/learn-corpus"
+REPOSITORY = "example-owner/learn-corpus-private"
 REF = "refs/heads/main"
 SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 API_ROOT = f"https://api.github.com/repos/{REPOSITORY}"
@@ -40,10 +40,10 @@ MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
 RUNS_PER_PAGE = 100
 MAX_RUN_PAGES = 10
 DEPLOYMENT_FIELDS = {
-    "service_config", "github_header_file", "service", "service_user", "run_id",
+    "service_config", "github_header_file", "service", "service_user", "run_id", "repository",
 }
 REQUIRED_DEPLOYMENT_FIELDS = {
-    "service_config", "github_header_file", "service", "service_user",
+    "service_config", "github_header_file", "service", "service_user", "repository",
 }
 
 
@@ -56,6 +56,7 @@ class DeploymentConfig:
     service: str
     service_user: str
     run_id: int | None
+    repository: str = REPOSITORY
 
 
 @dataclass(frozen=True)
@@ -137,6 +138,9 @@ def load_deployment_config(path: Path) -> DeploymentConfig:
     for name in ("service", "service_user"):
         if not isinstance(value[name], str) or not value[name].strip():
             raise ValueError(f"deployment {name} must be a nonempty string")
+    repository = value["repository"]
+    if not isinstance(repository, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*/(?!\.{1,2}$)[A-Za-z0-9_.-]+", repository) is None:
+        raise ValueError("deployment repository must be an explicit owner/name")
     run_id = value.get("run_id", "latest")
     if run_id == "latest":
         run_id = None
@@ -151,6 +155,7 @@ def load_deployment_config(path: Path) -> DeploymentConfig:
         service=value["service"],
         service_user=value["service_user"],
         run_id=run_id,
+        repository=repository,
     )
 
 
@@ -176,8 +181,8 @@ def _github_token(path: Path) -> str:
     return match.group(1)
 
 
-def _request(url: str, token: str, *, binary: bool = False) -> bytes | dict:
-    if not url.startswith(API_ROOT + "/"):
+def _request(url: str, token: str, *, binary: bool = False, repository: str = REPOSITORY) -> bytes | dict:
+    if not url.startswith(f"https://api.github.com/repos/{repository}/"):
         raise ValueError("GitHub API URL is outside the expected repository")
     request = urllib.request.Request(
         url,
@@ -198,14 +203,14 @@ def _request(url: str, token: str, *, binary: bool = False) -> bytes | dict:
     return json.loads(data)
 
 
-def _check_run(run: dict, run_id: int) -> tuple[str, int]:
+def _check_run(run: dict, run_id: int, *, repository: str = REPOSITORY) -> tuple[str, int]:
     if not isinstance(run, dict) or not isinstance(run.get("repository"), dict):
         raise ValueError("workflow run response is invalid")
     commit = run.get("head_sha")
     attempt = run.get("run_attempt")
     if (
         run.get("id") != run_id
-        or run.get("repository", {}).get("full_name") != REPOSITORY
+        or run.get("repository", {}).get("full_name") != repository
         or run.get("head_branch") != "main"
         or str(run.get("path", "")).split("@")[0] != ".github/workflows/build-index.yml"
         or run.get("status") != "completed"
@@ -219,17 +224,17 @@ def _check_run(run: dict, run_id: int) -> tuple[str, int]:
     return commit, attempt
 
 
-def _latest_run_id(token: str) -> int:
+def _latest_run_id(token: str, *, repository: str = REPOSITORY) -> int:
     """从预期工作流的成功运行中选创建时间最新的一次。"""
 
     latest: tuple[datetime, int] | None = None
     for page in range(1, MAX_RUN_PAGES + 1):
         _progress(f"Checking successful workflow runs (page {page}).")
         url = (
-            f"{API_ROOT}/actions/workflows/build-index.yml/runs"
+            f"https://api.github.com/repos/{repository}/actions/workflows/build-index.yml/runs"
             f"?branch=main&status=success&per_page={RUNS_PER_PAGE}&page={page}"
         )
-        payload = _request(url, token)
+        payload = _request(url, token, repository=repository)
         if not isinstance(payload, dict) or not isinstance(payload.get("workflow_runs"), list):
             raise ValueError("workflow run list response is invalid")
         runs = payload["workflow_runs"]
@@ -238,7 +243,7 @@ def _latest_run_id(token: str) -> int:
         for run in runs:
             if not isinstance(run, dict) or type(run.get("id")) is not int or run["id"] < 1:
                 raise ValueError("workflow run list contains an invalid run ID")
-            _check_run(run, run["id"])
+            _check_run(run, run["id"], repository=repository)
             created_at = run.get("created_at")
             if not isinstance(created_at, str) or not created_at.endswith("Z"):
                 raise ValueError("workflow run list contains an invalid creation time")
@@ -281,7 +286,7 @@ def _check_artifacts(payload: dict, run_id: int, run_attempt: int, commit: str) 
     return artifact_id, digest
 
 
-def _extract_release(data: bytes, target: Path, run_id: int, run_attempt: int, commit: str) -> tuple[dict, Path]:
+def _extract_release(data: bytes, target: Path, run_id: int, run_attempt: int, commit: str, *, repository: str = REPOSITORY) -> tuple[dict, Path]:
     """精确解包三个允许的文件，拒绝路径逃逸和额外内容。"""
 
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
@@ -313,7 +318,7 @@ def _extract_release(data: bytes, target: Path, run_id: int, run_attempt: int, c
             raise ValueError("artifact archive contains unexpected paths")
         if (
             release.get("version") != 2
-            or release.get("repository") != REPOSITORY
+            or release.get("repository") != repository
             or release.get("ref") != REF
             or release.get("run_id") != run_id
             or release.get("run_attempt") != run_attempt
@@ -417,16 +422,17 @@ def deploy(config_path: Path) -> str:
     run_id = deployment.run_id
     if run_id is None:
         _progress("Selecting the latest successful main workflow run.")
-        run_id = _latest_run_id(token)
+        run_id = _latest_run_id(token, repository=deployment.repository)
     _progress(f"Checking workflow run {run_id}.")
-    run = _request(f"{API_ROOT}/actions/runs/{run_id}", token)
-    commit, run_attempt = _check_run(run, run_id)
+    api_root = f"https://api.github.com/repos/{deployment.repository}"
+    run = _request(f"{api_root}/actions/runs/{run_id}", token, repository=deployment.repository)
+    commit, run_attempt = _check_run(run, run_id, repository=deployment.repository)
     _progress(f"Workflow run verified: run {run_id}, attempt {run_attempt}, commit {commit}.")
     _progress("Checking index artifact metadata.")
-    artifacts = _request(f"{API_ROOT}/actions/runs/{run_id}/artifacts?per_page=100", token)
+    artifacts = _request(f"{api_root}/actions/runs/{run_id}/artifacts?per_page=100", token, repository=deployment.repository)
     artifact_id, artifact_digest = _check_artifacts(artifacts, run_id, run_attempt, commit)
     _progress(f"Downloading artifact {artifact_id}.")
-    archive = _request(f"{API_ROOT}/actions/artifacts/{artifact_id}/zip", token, binary=True)
+    archive = _request(f"{api_root}/actions/artifacts/{artifact_id}/zip", token, binary=True, repository=deployment.repository)
     if f"sha256:{hashlib.sha256(archive).hexdigest()}" != artifact_digest:
         raise ValueError("downloaded artifact archive hash mismatch")
     _progress(f"Archive downloaded and SHA-256 verified ({len(archive)} bytes).")
@@ -434,7 +440,7 @@ def deploy(config_path: Path) -> str:
     recovery_failures: list[str] = []
     with tempfile.TemporaryDirectory(prefix=".release-", dir=retrieval_root) as temporary:
         _progress("Extracting and validating release metadata and index files.")
-        release, staged = _extract_release(archive, Path(temporary), run_id, run_attempt, commit)
+        release, staged = _extract_release(archive, Path(temporary), run_id, run_attempt, commit, repository=deployment.repository)
         index_id = release["index_id"]
         target = retrieval_root / index_id
         # 本机版本验证必须在触碰 current/previous 前完成。
