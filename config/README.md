@@ -128,7 +128,7 @@ cp config/config.json.example config/config.json
 
 ## 检索部署所需的代码目录
 
-部署机运行检索并通过现有脚本更新索引时，无需克隆整个仓库。从同一版本的代码中复制以下四个完整目录，保留 `src/` 包结构及 `src/__init__.py`、`src/config.py`：
+部署机运行检索并通过现有脚本更新索引时，无需克隆整个仓库。从同一版本的代码中复制以下四个完整目录，保留 `src/` 包结构及 `src/__init__.py`、`src/config_reader.py`：
 
 ```text
 <部署目录>/
@@ -148,7 +148,7 @@ cp config/config.json.example config/config.json
 | `src/maintenance/` | 使用其中的 `deploy_index` 脚本下载、校验和安装已构建的索引，并管理 systemd 服务 |
 | `src/corpus/` | 现有部署脚本通过索引构建模块引入的共享代码依赖；这是代码目录，不是资料目录 |
 
-`src/config.py` 与 `corpus/workspace.py` 提供统一配置读取和路径解析。仅运行检索服务需要 `service/`、`retrieval/` 与 `corpus/` 以及上述两个顶层 Python 文件；通过 `src.maintenance.deploy_index` 更新索引还需要 `maintenance/` 与 `corpus/`。以目录为单位复制即可，无需逐文件裁剪。部署机不执行导入或重新构建，`src/ingestion/`、原始资料、`sources/` 和 manifest 无需放过去。两个 skill 在 AI 客户端所在环境加载。
+`src/config_reader.py` 与 `corpus/workspace.py` 提供统一配置读取和路径解析。仅运行检索服务需要 `service/`、`retrieval/` 与 `corpus/` 以及上述两个顶层 Python 文件；通过 `src.maintenance.deploy_index` 更新索引还需要 `maintenance/` 与 `corpus/`。以目录为单位复制即可，无需逐文件裁剪。部署机不执行导入或重新构建，`src/ingestion/`、原始资料、`sources/` 和 manifest 无需放过去。两个 skill 在 AI 客户端所在环境加载。
 
 同时准备[requirements.txt](../requirements.txt)并按其中版本安装依赖，以及服务配置、受限 HTTP 凭据、已发布的索引和可写账本目录。`corpus_path` 指向索引根目录，`mcp.ledger.path` 指向独立可写位置。使用索引部署脚本时，还需配置 GitHub 请求头文件、部署配置和 systemd，具体条件见[可选发布流程](#可选的-actions-与-systemd-发布)。
 

@@ -7,7 +7,7 @@ from pathlib import Path
 import subprocess
 from typing import Mapping
 
-from src.config import CONFIG_FIELDS, read_config_object
+from src.config_reader import CONFIG_FIELDS, read_config_object
 from src.service.errors import HTTPFailure
 
 

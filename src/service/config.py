@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from src.config import read_config_object
+from src.config_reader import read_config_object
 from src.corpus.workspace import workspace_data_root
 from src.service.errors import HTTPFailure
 from src.service.ledger_config import (
