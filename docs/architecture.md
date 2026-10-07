@@ -18,17 +18,17 @@ config:
     wrappingWidth: 160
     nodeSpacing: 16
     rankSpacing: 20
-    diagramPadding: 4
+    diagramPadding: 96
     padding: 6
 ---
 flowchart LR
-    R["原始资料"] --> D["① 来源导入"]
+    R["原始资料"] --> D["① 来源<br/>导入"]
     D -->|标准化资料| B["② 索引构建<br/>与发布"]
-    B -->|检索投影| Q["③ 在线检索"]
-    U["用户问题"] --> A["④ LLM 整理"]
+    B -->|检索投影| Q["③ 在线<br/>检索"]
+    U["用户问题"] --> A["④ LLM<br/>整理"]
     A -->|搜索、读取| Q
     Q -->|候选摘要、正文| A
-    A --> O["有来源依据的回答"]
+    A --> O["有来源依据<br/>的回答"]
 ```
 
 图中的资料流向对应三层数据，按用途区分，而不是按存放目录划分：
@@ -173,7 +173,7 @@ config:
     wrappingWidth: 160
     nodeSpacing: 16
     rankSpacing: 20
-    diagramPadding: 4
+    diagramPadding: 64
     padding: 4
 ---
 flowchart LR

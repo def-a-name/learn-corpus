@@ -26,15 +26,15 @@ config:
     minNodeWidth: 0
     wrappingWidth: 160
     rankSpacing: 24
-    diagramPadding: 6
+    diagramPadding: 12
     padding: 6
 ---
 flowchart LR
-    A["会话、笔记、文章"] --> B["导入与标准化"]
-    B --> C["可追溯来源库"]
-    C --> D["离线构建索引"]
-    D --> E["搜索与读取"]
-    E --> F["AI 根据证据回答"]
+    A["会话、笔记、文章"] --> B["导入与<br/>标准化"]
+    B --> C["可追溯<br/>来源库"]
+    C --> D["离线构建<br/>索引"]
+    D --> E["搜索与<br/>读取"]
+    E --> F["AI 根据证据<br/>回答"]
 ```
 
 资料经过整理后构建检索索引。AI 通过 MCP 搜索并读取相关正文，再根据证据回答；服务也提供 REST 接口。本机可使用 stdio 或 HTTP MCP，跨机可使用 HTTP MCP。本机 stdio 由客户端启动服务子进程；网络部署按实际环境配置 HTTPS 入口，Nginx 与 systemd 模板是可选示例，见[配置与部署](config/README.md#使用方式与部署选择)。
