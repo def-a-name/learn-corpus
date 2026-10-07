@@ -35,7 +35,7 @@ venv/bin/python examples/run_example.py
 2. **配置并连接本机 stdio MCP**
 
    ```text
-   参照 config/README.md，为当前工作区配置本机 stdio MCP。
+   参照 config/README.md，为当前工作区配置本机 stdio MCP，包括准备账本目录，并更新 ~/.codex/config.toml 中的 learn_corpus 配置。完成后告诉我如何重连并验证。
    ```
 
    按[服务连接](../docs/usage.md#服务连接)建立连接，让 AI 调用 MCP `status`，确认服务使用刚发布的索引且账本状态正常。已有连接时，重连本机 stdio MCP 以加载新索引；其他部署方式见[索引更新与验证](../config/README.md#索引更新与验证)。

@@ -43,7 +43,9 @@ flowchart LR
 
 ## 开始使用
 
-按[使用指南](docs/usage.md)准备环境、导入第一份资料并连接检索服务；也可先运行[公开示例](examples/README.md)完成一次隔离演示，然后向 AI 描述问题，例如：
+首次使用推荐按[公开示例](examples/README.md#在自己的工作区使用示例)，将 [SQLite FTS5 示例文章](examples/sqlite-fts5.md)作为第一个导入对象，完成导入、索引发布、MCP 配置与检索问答。环境准备、日常更新和常见问题见[使用指南](docs/usage.md)。
+
+也可先运行[临时验证脚本](examples/README.md#运行完整流程)，检查导入到 MCP 正文读取的流程；临时索引退出后回收，自己的工作区仍需完成导入和连接配置。连接检索服务后，向 AI 描述问题，例如：
 
 ```text
 使用 learn-corpus-retrieval 回答：<问题>。
