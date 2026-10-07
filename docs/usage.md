@@ -15,6 +15,8 @@
 
 ## 首次使用
 
+推荐将 [examples/sqlite-fts5.md](../examples/sqlite-fts5.md) 作为第一个导入对象，按[公开示例](../examples/README.md#在自己的工作区使用示例)完成第一次完整操作：准备环境与工作区 → 导入并构建发布索引 → 连接 MCP → 检索问答。来源导入和索引构建不依赖 MCP；尚无可用索引时，MCP 服务会启动失败，因此应在索引发布成功后再建立连接。
+
 ### 环境准备
 
 当前要求 Python 3.10 或更新版本，以及启用 FTS5 的系统 SQLite。本机 stdio 支持 Linux/WSL，首次本机使用可以选择该方式；Windows 原生和 SSH 跨机 stdio 未纳入初版支持范围。
@@ -32,19 +34,21 @@ venv/bin/python -m pip install -r requirements.txt
 
 ### 资料导入
 
-从一份你希望保存的 Markdown 笔记或文章开始，明确文件路径与来源类型。例如：
+首次推荐导入仓库自带的 SQLite FTS5 示例文章。从代码目录打开 AI 客户端，明确文件路径与来源类型：
 
 ```text
-使用 learn-corpus-ingestion，将 /path/to/first-note.md 导入进资料库，并构建发布本地检索索引。
+使用 learn-corpus-ingestion，将 examples/sqlite-fts5.md 作为文章类型导入当前工作区，并构建发布本地检索索引。
 ```
 
-也可以指定 Claude Code、Codex 或受支持的网页会话导出。格式适配、筛选及验证由导入 skill 处理。
+完整的示例操作见 [examples/README.md](../examples/README.md#在自己的工作区使用示例)。也可以从自己的 Markdown 笔记或文章开始，或指定 Claude Code、Codex、受支持的网页会话导出；明确路径与来源类型，格式适配、筛选及验证由导入 skill 处理。
 
 成功后，`sources/` 保存标准化来源，`meta/manifest.json` 登记已接受的来源，`meta/corpus/current` 指向已发布的检索索引。导入和索引构建是两个操作，上面的请求明确包含构建与发布。空语料不能直接构建可用索引。
 
 如果出现 `review`，表示本批存在需要处理的审核问题；整批被阻断时，不提交本批新来源。已有索引仍可用，不代表本次导入已成功。
 
 ### 服务连接
+
+先确认当前工作区的索引已构建并发布，再配置和连接服务。仅完成来源导入还不足以启动 MCP；服务不会自动导入资料或构建索引。
 
 MCP 是 AI 客户端调用工具的协议。客户端（host）管理连接，可选择本机 stdio 或网络 HTTP；REST 则供直接调用 HTTP API 的程序使用。
 

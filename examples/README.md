@@ -1,5 +1,7 @@
 # 公开示例
 
+首次使用推荐将 [sqlite-fts5.md](sqlite-fts5.md) 作为第一个导入对象，按[在自己的工作区使用示例](#在自己的工作区使用示例)完成导入、索引发布、MCP 连接与检索问答。需要先验证安装是否可用时，也可以运行下面的临时验证脚本。
+
 [sqlite-fts5.md](sqlite-fts5.md) 是 [SQLite FTS5 官方文档](https://www.sqlite.org/fts5.html)的 Markdown 演示副本。保留所选文档的正文、标题、来源 URL 及页面原有更新时间；去掉剪藏保存日期、标签和空元数据，将网页相对链接转为官方绝对地址，并去除行尾空白。它不是原始剪藏的无损副本，也不代表当前网站的最新版本。
 
 SQLite 官方声明其交付代码与文档属于 public domain，见[官方版权说明](https://www.sqlite.org/copyright.html)。示例文章的来源与授权独立于本项目 MIT License。
@@ -16,19 +18,29 @@ venv/bin/python examples/run_example.py
 
 输出包括来源数、检索单元数、词法查询、命中与读取数量、来源标题和索引版本。它验证导入到证据读取的运行流程，不生成模型答案或开展检索质量评测。
 
+脚本成功不表示自己的工作区已有索引或 MCP 连接；临时索引会在退出后回收。要在 AI 客户端中使用示例，继续按下一节操作。
+
 ## 在自己的工作区使用示例
 
-以下是可选示范，假定你已按[使用指南](../docs/usage.md#首次使用)准备好依赖、工作区配置、两个 skill 和本机 stdio MCP 连接。从代码目录打开 AI 客户端，在同一对话中依次操作：
+先按[环境准备](../docs/usage.md#环境准备)安装依赖、选择工作区并加载两个 skill，再从代码目录打开 AI 客户端，在同一对话中依次操作。来源导入和索引构建不依赖 MCP；尚无可用索引时，MCP 服务会启动失败，先完成第 1 步，再配置连接。
 
 1. **导入并构建索引**
 
    ```text
-   使用 learn-corpus-ingestion，将 examples/sqlite-fts5.md 作为 article 导入当前工作区，并构建发布本地检索索引。
+   使用 learn-corpus-ingestion，将 examples/sqlite-fts5.md 作为文章类型导入当前工作区，并构建发布本地检索索引。
    ```
 
-   完成后重连本机 stdio MCP，使服务使用新索引；其他部署方式见[索引更新与验证](../config/README.md#索引更新与验证)。
+   确认导入与索引发布均成功后，再进入下一步；仅完成来源导入还不足以启动 MCP。
 
-2. **提问，体验 MCP 检索与回答**
+2. **配置并连接本机 stdio MCP**
+
+   ```text
+   参照 config/README.md，为当前工作区配置本机 stdio MCP。
+   ```
+
+   按[服务连接](../docs/usage.md#服务连接)建立连接，让 AI 调用 MCP `status`，确认服务使用刚发布的索引且账本状态正常。已有连接时，重连本机 stdio MCP 以加载新索引；其他部署方式见[索引更新与验证](../config/README.md#索引更新与验证)。
+
+3. **提问，体验 MCP 检索与回答**
 
    ```text
    使用 learn-corpus-retrieval，通过 MCP 检索刚导入的 SQLite FTS5 示例文章：unicode61 默认如何分词？如何将 - 和 _ 视为词的一部分？请给出配置示例和来源。
@@ -36,7 +48,7 @@ venv/bin/python examples/run_example.py
 
    AI 搜索候选、读取相关正文，再依据正文回答并标明来源。
 
-3. **展示检索摘要**
+4. **展示检索摘要**
 
    ```text
    展示刚才问题的检索摘要。
@@ -44,7 +56,7 @@ venv/bin/python examples/run_example.py
 
    查看检索范围、关键证据、异常或缺口、停止原因及核心来源定位。
 
-4. **展示完整检索过程**
+5. **展示完整检索过程**
 
    ```text
    展示刚才问题的完整检索过程，包括调用记录和已读检索单元明细。
