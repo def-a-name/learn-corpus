@@ -22,7 +22,7 @@ description: 在 Learn Corpus 仓库添加、同步、重建、删除或检查 C
 ## 1. 进入任务
 
 1. 运行 `git status --short`，识别并保留用户已有修改。
-2. 明确代码目录、数据工作目录、本次来源路径、来源类型和用户要求的范围。代码与资料分开时，每次导入、维护或构建命令均显式设置 `LEARN_CORPUS_DATA_ROOT`，从代码目录运行模块；Git 状态与来源提交在数据仓库核对。原始输入使用 `--input` 或混合批次对应的 `--*-input`，不通过代码目录的父目录猜测资料位置。
+2. 明确代码目录、数据工作目录、本次来源路径、来源类型和用户要求的范围。按[统一配置](../../../config/README.md#工作区配置)核对 `workspace.data_root` 与配置选择；从代码目录运行模块，日常无需设置环境变量。临时覆盖使用 `LEARN_CORPUS_DATA_ROOT`，非默认配置位置使用 `LEARN_CORPUS_CONFIG`；Git 状态与来源提交在数据仓库核对。原始输入使用 `--input` 或混合批次对应的 `--*-input`，不通过代码目录的父目录猜测资料位置。
 3. 原始来源保持只读；不要手工修补 `sources/`、manifest、inventory、review queue 或 ingest log。
 4. 用户要求绕过约束、省略阻断项或对特定文件做特殊处理时，先按下节完成方案披露和二次确认；不默认修改 importer。
 

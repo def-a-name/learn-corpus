@@ -300,3 +300,87 @@ raise SystemExit(main())
                 proc.kill()
                 proc.wait(timeout=3)
             proc.stdout.close()
+
+
+@pytest.mark.parametrize("transport", ["http", "stdio"])
+def test_workspace_supplies_index_and_ledger_defaults(unified, tmp_path, monkeypatch, transport):
+    data = tmp_path / "synthetic-external-data"
+    data.mkdir()
+    unified["workspace"] = {"data_root": data.name}
+    unified.pop("corpus_path")
+    unified["mcp"]["ledger"].pop("path")
+    unified["mcp"]["transport"] = transport
+    monkeypatch.setenv("LEARN_CORPUS_DATA_ROOT", str(tmp_path / "synthetic-unrelated-override"))
+    selected = load_service_config(write_config(tmp_path, unified))
+    assert selected.runtime.corpus_path == data / "meta/corpus"
+    assert selected.ledger.path == data / "var/execution-ledger.sqlite3"
+
+
+def test_workspace_preserves_explicit_service_paths_without_sources(unified, tmp_path):
+    unified["workspace"] = {"data_root": "synthetic-offline-data"}
+    unified["mcp"]["transport"] = "stdio"
+    selected = load_service_config(write_config(tmp_path, unified))
+    assert selected.runtime.corpus_path == Path(unified["corpus_path"])
+    assert selected.ledger.path == tmp_path / unified["mcp"]["ledger"]["path"]
+    assert not (tmp_path / "synthetic-offline-data").exists()
+
+
+@pytest.mark.parametrize("workspace", [None, [], "synthetic-value", {"data_root": ""},
+                                        {"data_root": True}, {"data_root": None},
+                                        {"data_rooot": "synthetic-value"}])
+def test_invalid_workspace_is_rejected_by_service(unified, tmp_path, workspace):
+    unified["workspace"] = workspace
+    with pytest.raises(ValueError, match="cannot load service configuration"):
+        load_service_config(write_config(tmp_path, unified))
+
+
+def test_server_uses_selected_workspace_config_without_flag(unified, tmp_path, monkeypatch):
+    unified["mcp"]["transport"] = "stdio"
+    path = write_config(tmp_path, unified)
+    monkeypatch.setenv("LEARN_CORPUS_CONFIG", str(path))
+    monkeypatch.setattr(sys, "argv", ["server"])
+    from src.service.stdio import stdio_server
+    calls = []
+    monkeypatch.setattr(stdio_server, "main", lambda *args: calls.append(args) or 0)
+    assert server.main() == 0
+    assert len(calls) == 1
+    assert calls[0][0].corpus_path == Path(unified["corpus_path"])
+
+
+def test_server_explicit_config_overrides_environment_selection(unified, tmp_path, monkeypatch):
+    unified["mcp"]["transport"] = "stdio"
+    path = write_config(tmp_path, unified)
+    monkeypatch.setenv("LEARN_CORPUS_CONFIG", str(tmp_path / "synthetic-missing-config.json"))
+    monkeypatch.setattr(sys, "argv", ["server", "--config", str(path)])
+    from src.service.stdio import stdio_server
+    monkeypatch.setattr(stdio_server, "main", lambda *args: 0)
+    assert server.main() == 0
+
+
+def test_server_reports_missing_default_config_without_traceback(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["server"])
+    monkeypatch.setattr(server, "find_config_path", lambda *args: None)
+    assert server.main() == 2
+    output = capsys.readouterr()
+    assert output.out == "" and "no configuration file was found" in output.err
+    assert "Traceback" not in output.err
+
+
+def test_service_symlink_config_uses_actual_file_for_all_paths(unified, tmp_path):
+    target = tmp_path / "synthetic-actual"
+    target.mkdir()
+    unified["workspace"] = {"data_root": "synthetic-data"}
+    unified["corpus_path"] = "synthetic-index"
+    unified["mcp"]["transport"] = "stdio"
+    path = write_config(target, unified)
+    link = tmp_path / "synthetic-link.json"
+    link.symlink_to(path)
+    selected = load_service_config(link)
+    assert selected.runtime.corpus_path == target / "synthetic-index"
+    assert selected.ledger.path == target / unified["mcp"]["ledger"]["path"]
+    unified.pop("corpus_path")
+    unified["mcp"]["ledger"].pop("path")
+    write_config(target, unified)
+    selected = load_service_config(link)
+    assert selected.runtime.corpus_path == target / "synthetic-data/meta/corpus"
+    assert selected.ledger.path == target / "synthetic-data/var/execution-ledger.sqlite3"

@@ -28,7 +28,7 @@ venv/bin/python -m pip install -r requirements.txt
 
 使用支持项目 skill 的 AI 客户端打开仓库。两个 skill 位于 `.agents/skills/`；客户端不能自动发现时，让它加载[来源导入 skill](../.agents/skills/learn-corpus-ingestion/SKILL.md)和[检索 skill](../.agents/skills/learn-corpus-retrieval/SKILL.md)。在仓库内执行操作还应遵循 [AGENTS.md](../AGENTS.md)。
 
-导入前选择数据工作目录，并让执行导入和维护的进程设置 `LEARN_CORPUS_DATA_ROOT`。该目录须已存在；所有默认来源与登记路径都从它解析。未设置时沿用仓库根目录的旧布局，独立代码与私有资料建议按[工作目录与仓库关系](workspaces.md)配置。原始输入目录需显式指定，导入 CLI 不再猜测仓库旁边的目录。
+导入前按[工作区配置](../config/README.md#工作区配置)选择资料保存位置。推荐私有仓库 + `engine/` submodule，也支持非 Git 数据目录和同仓库默认目录；配置统一保存在 `config.json`，日常无需设置环境变量。原始输入目录在导入时显式指定。
 
 ### 资料导入
 

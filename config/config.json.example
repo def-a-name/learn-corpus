@@ -1,5 +1,7 @@
 {
-  "corpus_path": "../meta/corpus",
+  "workspace": {
+    "data_root": ".."
+  },
   "corpus_timeout_ms": 5000,
   "http": {
     "host": "127.0.0.1",
@@ -15,7 +17,6 @@
   "mcp": {
     "transport": "http",
     "ledger": {
-      "path": "../var/execution-ledger.sqlite3",
       "busy_timeout_ms": 1000,
       "max_tasks": 10000,
       "max_mb": 256

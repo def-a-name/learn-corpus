@@ -3,18 +3,23 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
 from src.service.config import load_service_config
+from src.corpus.workspace import CODE_ROOT, find_config_path
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Serve read-only retrieval over HTTP or MCP stdio")
-    parser.add_argument("--config", type=Path, required=True, help="Path to the service JSON configuration")
+    parser.add_argument("--config", type=Path, help="Path to the unified JSON configuration (defaults to the workspace configuration)")
     arguments = parser.parse_args()
     try:
-        selected = load_service_config(arguments.config)
+        config_path = arguments.config or find_config_path(CODE_ROOT, os.environ)
+        if config_path is None:
+            raise ValueError("no configuration file was found; use --config or create config/config.json")
+        selected = load_service_config(config_path)
     except ValueError as exc:
         print(f"Service configuration error: {exc}.", file=sys.stderr)
         return 2

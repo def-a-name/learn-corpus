@@ -4,7 +4,7 @@
 
 部署机运行检索并使用脚本更新索引时，可按[部署代码目录](../config/README.md#检索部署所需的代码目录)复制 `service/`、`retrieval/`、`maintenance/` 与 `corpus/`，保留 `src/` 包结构，无需克隆整个仓库。
 
-从代码根目录执行命令，来源与维护的默认路径使用 `LEARN_CORPUS_DATA_ROOT`；未设置时保留原有单仓库布局。`src/corpus/paths.py` 的 `CODE_ROOT` 表示代码位置，`DATA_ROOT` 表示资料位置，历史内部名称 `REPO_ROOT` 保留为数据根目录别名。配置方式与 CLI 兼容变化见[工作目录说明](../docs/workspaces.md)。
+从代码根目录执行命令，来源与维护通过统一 `config.json` 的 `workspace.data_root` 选择资料位置，未配置时使用同仓库布局。`src/corpus/paths.py` 的 `CODE_ROOT` 表示代码位置，`DATA_ROOT` 表示资料位置，内部名称 `REPO_ROOT` 为数据根目录别名。上手配置见[配置说明](../config/README.md#工作区配置)，双仓库维护见[仓库关系](../docs/workspaces.md)。
 
 ## 模块职责
 

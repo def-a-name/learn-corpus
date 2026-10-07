@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from src.service.json_boundary import parse_json
+from src.config import read_config_object
+from src.corpus.workspace import workspace_data_root
 from src.service.errors import HTTPFailure
 from src.service.ledger_config import (
     LedgerConfig, TaskLimitsConfig, parse_ledger_config, parse_task_limits_config,
@@ -17,8 +18,6 @@ if TYPE_CHECKING:
     from src.service.stdio.stdio_config import StdioConfig
 
 
-_CONFIG_MAX_JSON_KEYS = 4096
-_CONFIG_MAX_JSON_ARRAY_ITEMS = 1024
 _HTTP_KEYS = {
     "credentials_file", "allowed_peers", "allowed_hosts", "allowed_origins",
     "global_concurrency", "client_concurrency", "body_timeout_ms", "host", "port",
@@ -41,22 +40,6 @@ def _reject_unknown_fields(value: dict, allowed: set[str], section: str) -> None
         raise ValueError(f"{section} configuration contains unknown fields: {', '.join(unknown)}")
 
 
-def read_config_object(path: Path) -> dict:
-    """有界读取统一配置对象。"""
-
-    with path.open("rb") as stream:
-        raw = stream.read(65537)
-    if len(raw) > 65536:
-        raise ValueError("configuration exceeds size limit")
-    value = parse_json(
-        raw, max_keys=_CONFIG_MAX_JSON_KEYS,
-        max_array_items=_CONFIG_MAX_JSON_ARRAY_ITEMS,
-    )
-    if not isinstance(value, dict):
-        raise ValueError("configuration must be an object")
-    return value
-
-
 @dataclass(frozen=True)
 class ServiceConfig:
     """一次启动只选择一种 transport；未选择的部分不生成运行配置。"""
@@ -72,15 +55,20 @@ class ServiceConfig:
 def parse_service_config(value: dict, path: Path) -> ServiceConfig:
     """选择统一配置的活动分支。"""
 
+    path = path.expanduser().resolve()
     common_keys = {"corpus_path", "corpus_timeout_ms"}
-    _reject_unknown_fields(value, common_keys | {"http", "mcp"}, "service")
-    _require_fields(value, common_keys | {"mcp"}, "service")
+    _reject_unknown_fields(value, common_keys | {"workspace", "http", "mcp"}, "service")
+    _require_fields(value, {"corpus_timeout_ms", "mcp"}, "service")
+    data_root = workspace_data_root(value.get("workspace", {}), path)
     mcp = value["mcp"]
     if not isinstance(mcp, dict):
         raise ValueError("MCP configuration must be an object")
     _reject_unknown_fields(mcp, {"transport", "ledger", "task_limits", "stdio"}, "MCP")
     _require_fields(mcp, {"transport", "ledger"}, "MCP")
-    ledger = parse_ledger_config(mcp["ledger"], path)
+    ledger_value = mcp["ledger"]
+    if isinstance(ledger_value, dict):
+        ledger_value = {"path": str(data_root / "var/execution-ledger.sqlite3"), **ledger_value}
+    ledger = parse_ledger_config(ledger_value, path)
     task_limits = parse_task_limits_config(mcp.get("task_limits"))
     transport = mcp["transport"]
     if transport not in ("http", "stdio"):
@@ -97,7 +85,8 @@ def parse_service_config(value: dict, path: Path) -> ServiceConfig:
         {"frame_timeout_ms", "write_timeout_ms", "shutdown_timeout_ms"},
         "stdio",
     )
-    common = {name: value[name] for name in common_keys if name in value}
+    common = {"corpus_path": str(data_root / "meta/corpus"),
+              **{name: value[name] for name in common_keys if name in value}}
     if transport == "stdio":
         from src.service.stdio.stdio_config import parse_stdio_config
 

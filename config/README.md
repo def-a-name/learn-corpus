@@ -1,9 +1,10 @@
-# 服务与部署配置
+# 工作区、服务与部署配置
 
 首次使用见[使用指南](../docs/usage.md)，服务与数据的职责见[架构说明](../docs/architecture.md)。本页保留运行参数、客户端连接及发布维护的详细参考。
 
 | 使用目标 | 阅读位置 |
 |---|---|
+| 选择资料保存位置、初始化工作区 | [工作区配置](#工作区配置) |
 | 选择连接与部署方式 | [使用方式与部署选择](#使用方式与部署选择) |
 | 部署机只运行检索 | [检索部署所需的代码目录](#检索部署所需的代码目录) |
 | 文件所有者与访问权限 | [运行身份与文件权限](#运行身份与文件权限) |
@@ -11,6 +12,101 @@
 | HTTP MCP / REST | [HTTP 服务配置](#http-服务配置)、[访问凭据](#访问凭据)、[HTTP MCP 连接](#codex-http-mcp-连接) |
 | 运行故障 | [运行问题排查](#运行问题排查) |
 | 部署与索引维护 | [索引构建与发布](#索引构建与发布)、[Nginx](#nginx-代理配置)、[systemd](#systemd-服务配置)、[维护检查清单](#运维检查清单) |
+
+## 工作区配置
+
+`config.json` 同时配置资料保存位置和检索服务。通常只需选择一种目录布局；原始笔记、会话导出和文章仍在导入时指定，输入文件保持只读。
+
+| 布局 | 适合什么情况 | 配置位置 |
+|---|---|---|
+| 私有仓库 + `engine/` submodule（推荐） | 希望分别维护通用代码与个人资料，并固定代码版本 | 私有仓库的 `config/config.json` |
+| 独立数据目录 | 只想把资料放在指定位置，无需 Git | 代码仓库的 `config/config.json` |
+| 同仓库默认目录 | 想先在克隆的仓库里使用，减少目录准备 | 导入可不建配置；服务使用 `config/config.json` |
+
+### 推荐：私有仓库引用公开代码
+
+新建私有工作区并添加公开代码：
+
+```bash
+mkdir learn-corpus-private
+cd learn-corpus-private
+git init
+git submodule add https://github.com/def-a-name/learn-corpus.git engine
+mkdir config
+cp engine/config/config.json.example config/config.json
+```
+
+模板中的 `workspace` 已适用于这个布局，无需改路径：
+
+```json
+"workspace": {
+  "data_root": ".."
+}
+```
+
+`..` 相对于实际配置文件所在目录，因此指向私有根目录。程序识别 `engine/` 是 Git submodule 后，默认读取所属仓库的 `config/config.json`；从 `engine/` 执行命令即可，无需 export 环境变量。
+
+```text
+learn-corpus-private/
+├── engine/                 # 公开代码、skill、文档和功能测试
+├── config/config.json      # 个人统一配置
+├── sources/                # 导入后的标准化来源
+├── meta/                   # 登记与检索索引
+└── var/                    # 服务执行账本
+```
+
+在私有根目录的 `.gitignore` 中加入以下本地状态规则；`sources/` 与登记文件可以在私有仓库提交：
+
+```gitignore
+/config/*.json
+/config/*.header
+/meta/corpus/
+/var/
+__pycache__/
+*.py[cod]
+```
+
+再从 `engine/` 安装依赖并按[使用指南](../docs/usage.md#资料导入)开始导入。`sources/`、manifest 和索引由程序生成，不手工建立空登记文件。这个结构只需要本地 Git；需要远端备份时，为外层数据仓库创建私有远端。代码与数据的提交、升级步骤见[仓库关系](../docs/workspaces.md)。
+
+### 使用独立数据目录
+
+数据目录可以不是 Git 仓库，也可以是代码目录内的自定义子目录；使用后者时，将该子目录加入代码仓库的 `.gitignore`。先创建它，再在代码目录复制模板：
+
+```bash
+mkdir -p /absolute/path/to/my-corpus
+cp config/config.json.example config/config.json
+```
+
+将模板中的 `workspace.data_root` 改为该目录的绝对路径：
+
+```json
+"workspace": {
+  "data_root": "/absolute/path/to/my-corpus"
+}
+```
+
+照常从代码目录执行导入、维护与本地索引构建，结果写入数据目录。无需配置私有远端或 submodule；Git 提交对照和 Actions 发布才需要数据仓库历史。
+
+### 使用同仓库默认目录
+
+不配置 workspace 时，导入与维护以代码仓库根目录为数据目录，生成仓库内的 `sources/`、`meta/`。准备服务时复制 `config.json.example`，保留 `workspace.data_root = ".."` 即为同一布局。
+
+公开仓库的 `.gitignore` 默认忽略个人 `sources/`、`meta/` 和运行状态。若要将资料纳入同一 Git 历史，使用私有远端并按实际需要调整忽略规则。
+
+### 路径与配置选择
+
+`workspace.data_root` 的相对路径以实际配置文件所在目录解析（配置文件为符号链接时使用目标文件目录），与运行命令时的 cwd 无关。来源操作要求目录已存在；目录名不影响选择，程序不猜测原始输入位置。选定独立数据目录后，输出必须留在该目录内；submodule 里的代码目录也不接受来源输出。符号链接按实际目标检查。
+
+索引默认位于 `<data_root>/meta/corpus`，账本默认位于 `<data_root>/var/execution-ledger.sqlite3`。同机使用通常只改 `workspace.data_root`。部署机或特殊布局可另填 `corpus_path`、`mcp.ledger.path`；这些显式路径仍相对于配置文件解析，并优先于上述默认值。服务只读取索引，不要求部署机具有原始资料或标准化来源。
+
+自动选择配置的顺序为：明确设置的 `LEARN_CORPUS_CONFIG` → Git submodule 所属仓库的 `config/config.json` → 代码目录的 `config/config.json`。只使用选中的一份文件，不合并配置。没有配置时，来源操作使用同仓库默认目录；服务启动会提示先准备配置。配置存在但损坏、指定文件缺失或数据目录无效时，命令报错，不自动换到另一个目录。
+
+日常配置不需要 `.env`。保留两个可选环境变量，供临时操作、测试或自动化使用：
+
+- `LEARN_CORPUS_CONFIG`：选择非默认位置的一份统一配置。例如从代码目录运行 `LEARN_CORPUS_CONFIG=/path/to/config.json venv/bin/python -m src.maintenance.find_unprocessed`。相对文件名以进程 cwd 解析。
+- `LEARN_CORPUS_DATA_ROOT`：临时覆盖来源处理的数据目录，优先于 workspace 配置；现有 CI 和公开示例用它选择临时工作区。它不覆盖服务的索引或账本配置。
+
+服务的 `--config FILE` 优先于自动配置选择；省略时使用同一套发现规则。已有配置字段 `corpus_path` 和账本 `path` 继续按原路径语义处理；HTTP/MCP 协议、索引与账本格式不因 workspace 配置改变。
 
 ## 使用方式与部署选择
 
@@ -32,12 +128,13 @@
 
 ## 检索部署所需的代码目录
 
-部署机运行检索并通过现有脚本更新索引时，无需克隆整个仓库。从同一版本的代码中复制以下四个完整目录，保留 `src/` 包结构及 `src/__init__.py`：
+部署机运行检索并通过现有脚本更新索引时，无需克隆整个仓库。从同一版本的代码中复制以下四个完整目录，保留 `src/` 包结构及 `src/__init__.py`、`src/config.py`：
 
 ```text
 <部署目录>/
 └── src/
     ├── __init__.py
+    ├── config.py
     ├── service/
     ├── retrieval/
     ├── maintenance/
@@ -51,7 +148,7 @@
 | `src/maintenance/` | 使用其中的 `deploy_index` 脚本下载、校验和安装已构建的索引，并管理 systemd 服务 |
 | `src/corpus/` | 现有部署脚本通过索引构建模块引入的共享代码依赖；这是代码目录，不是资料目录 |
 
-仅运行检索服务需要 `service/` 与 `retrieval/`；通过 `src.maintenance.deploy_index` 更新索引还需要 `maintenance/` 与 `corpus/`。以目录为单位复制即可，无需逐文件裁剪。部署机不执行导入或重新构建，`src/ingestion/`、原始资料、`sources/` 和 manifest 无需放过去。两个 skill 在 AI 客户端所在环境加载。
+`src/config.py` 与 `corpus/workspace.py` 提供统一配置读取和路径解析。仅运行检索服务需要 `service/`、`retrieval/` 与 `corpus/` 以及上述两个顶层 Python 文件；通过 `src.maintenance.deploy_index` 更新索引还需要 `maintenance/` 与 `corpus/`。以目录为单位复制即可，无需逐文件裁剪。部署机不执行导入或重新构建，`src/ingestion/`、原始资料、`sources/` 和 manifest 无需放过去。两个 skill 在 AI 客户端所在环境加载。
 
 同时准备[requirements.txt](../requirements.txt)并按其中版本安装依赖，以及服务配置、受限 HTTP 凭据、已发布的索引和可写账本目录。`corpus_path` 指向索引根目录，`mcp.ledger.path` 指向独立可写位置。使用索引部署脚本时，还需配置 GitHub 请求头文件、部署配置和 systemd，具体条件见[可选发布流程](#可选的-actions-与-systemd-发布)。
 
@@ -67,7 +164,7 @@ venv/bin/python -m src.service.server --config config/config.json
 
 | 示例 | 用途与安装位置 |
 |---|---|
-| [config.json.example](config.json.example) | HTTP/stdio 统一配置；默认 HTTP 字段匹配同机 HTTPS 代理，其他场景按下文调整；复制为 `config/config.json`，由 `--config` 指定 |
+| [config.json.example](config.json.example) | workspace 与 HTTP/stdio 统一配置；默认 HTTP 字段匹配同机 HTTPS 代理，其他场景按下文调整；复制为 `config/config.json`，由 `--config` 指定 |
 | [deploy-index.json.example](deploy-index.json.example) | 可选的 Actions/systemd 索引发布配置；适用条件见[可选的 Actions 与 systemd 发布](#可选的-actions-与-systemd-发布) |
 | [github.header.example](github.header.example) | 可选发布流程的 GitHub API 请求头格式；实际 PAT 文件须满足下文的权限校验，并可由部署脚本执行身份读取，不使用仓库里的示例 |
 | [credentials.json.example](credentials.json.example) | 服务端 Bearer 凭据；路径由 `credentials_file` 指定 |
@@ -94,9 +191,11 @@ venv/bin/python -m src.service.server --config config/config.json
 
 ## 服务配置与启动
 
-日常索引更新、客户端重连、故障判断与账本轮换的检查顺序见文末[运维检查清单](#运维检查清单)。实际配置路径以启动参数 `--config` 为准，相对路径以该配置文件所在目录解析。
+日常索引更新、客户端重连、故障判断与账本轮换的检查顺序见文末[运维检查清单](#运维检查清单)。实际配置可由 `--config` 指定，省略时按[配置选择规则](#路径与配置选择)读取。相对路径以实际配置文件所在目录解析。
 
 从仓库根目录使用同一个入口，具体模式由 `mcp.transport` 选择。新环境先准备配置；已有配置时只调整所需字段，不覆盖运行配置。
+
+以下命令针对同仓库默认布局；submodule 或独立数据目录应使用已选定的配置位置，并在 `<data_root>/var` 准备账本目录，不重复覆盖现有配置。
 
 以下是本机 HTTP 初始化示例，假设由之后运行服务的同一账户执行，且该账户可写项目目录。新环境先将示例复制为真实配置；下面的公开凭据只用于本机启动检查，不能用于部署：
 
@@ -107,7 +206,7 @@ chmod 0600 config/credentials.json
 install -d -m 0700 var
 ```
 
-stdio 只需服务配置和账本目录，不要求 HTTP 凭据文件。改由其他账户运行服务时，按[运行身份与文件权限](#运行身份与文件权限)准备所有者和访问权限；仅由管理员执行上述复制命令，不会自动让其他运行账户能够读取 `0600` 凭据或写入 `0700` 目录。
+stdio 只需统一配置和数据工作区内的账本目录，不要求 HTTP 凭据文件。改由其他账户运行服务时，按[运行身份与文件权限](#运行身份与文件权限)准备所有者和访问权限；仅由管理员执行上述复制命令，不会自动让其他运行账户能够读取 `0600` 凭据或写入 `0700` 目录。
 
 启动前按下文的[本机 stdio](#本机-stdio-连接)或[HTTP 配置](#http-服务配置)调整连接字段。在 venv 已安装且 `meta/corpus/current` 已构建的前提下，使用以下入口：
 
@@ -117,7 +216,7 @@ venv/bin/python -m src.service.server --config config/config.json
 
 - `mcp.transport = "http"`：启动 HTTP 服务，提供 REST API 与 `/mcp`，凭据和网络边界使用 `http` 配置。
 - `mcp.transport = "stdio"`：仅启动管道 MCP，不创建 HTTP 应用或监听端口，也不提供 REST API；正常由 MCP host 执行上述命令并管理管道与进程。
-- 公共字段为 `corpus_path` 和 `corpus_timeout_ms`。HTTP 专属项放在 `http`，MCP execution ledger 放在 `mcp.ledger`，新任务执行限制放在 `mcp.task_limits`，stdio 专属时限放在 `mcp.stdio`。
+- 工作区字段为 `workspace.data_root`。服务公共字段为 `corpus_timeout_ms` 和可选的 `corpus_path`（默认工作区下的 `meta/corpus`）。HTTP 专属项放在 `http`，MCP execution ledger 放在 `mcp.ledger`，新任务执行限制放在 `mcp.task_limits`，stdio 专属时限放在 `mcp.stdio`。
 - 统一格式必须显式选择 `http` 或 `stdio`；不支持 `both` 或按环境自动选择。未选分支可省略；保留时只检查对象结构与已知字段，运行参数只校验选中分支。stdio 不要求 HTTP 凭据文件存在，也不应用 HTTP 认证和并发字段。未知字段、重复 JSON key 和混用新旧结构均拒绝。
 
 `config.json` 选择的是本进程启动模式，不会修改 Codex 配置或关闭已由其他进程运行的服务。host 仍须对应配置 HTTP `url` 或 stdio `command`；切换后重新建立连接，不能只改 server 配置就期待 host 自动换 transport。
@@ -130,7 +229,7 @@ venv/bin/python -m src.service.server --config config/config.json
 
 stdio 入口由客户端启动独立子进程，直接读取本机检索索引，不启动 HTTP 服务。当前使用 POSIX 非阻塞管道，支持范围为 Linux/WSL；Windows 原生管道与 SSH 跨机 stdio 尚未纳入支持范围。跨机使用可选择 HTTP MCP。
 
-使用同一份 [config.json.example](config.json.example) 创建 `config/config.json`，将 `mcp.transport` 改为 `"stdio"`，并将 `corpus_path` 指向启动环境内的索引根目录。`http` 分区可保留或省略；相对路径以配置文件目录为基准，索引必须已离线构建，服务不导入来源或自动重建。入口为：
+使用同一份 [config.json.example](config.json.example) 创建 `config/config.json`，将 `mcp.transport` 改为 `"stdio"`，确认 workspace 指向自己的资料目录；索引另行安装时用 `corpus_path` 指向启动环境内的索引根目录。`http` 分区可保留或省略；相对路径以配置文件目录为基准，索引必须已离线构建，服务不导入来源或自动重建。入口为：
 
 ```bash
 venv/bin/python -m src.service.server --config config/config.json
@@ -151,7 +250,7 @@ tool_timeout_sec = 30
 
 | stdio 配置项 | 含义与默认值 |
 |---|---|
-| `corpus_path` | 必填，索引根目录 |
+| `corpus_path` | 可省略，默认 `<data_root>/meta/corpus`；显式填写时为索引根目录 |
 | `corpus_timeout_ms` | 必填，与 HTTP 共用 core 时限语义 |
 | `mcp.transport` | 必须为 `"stdio"`，仅启动管道 MCP |
 | `mcp.stdio.frame_timeout_ms` | 默认 5000；从收到一帧首字节到完整换行的时限，连接空闲不计时 |
@@ -170,13 +269,13 @@ stdout 只输出协议消息，工具错误和 JSON-RPC 错误通过它返回 ho
 
 ## MCP 任务与执行账本
 
-HTTP 与 stdio MCP 共用 `mcp.ledger` 配置；REST 不创建或更新任务。`path` 必填，相对路径以统一配置文件所在目录为基准。账本目录须预先存在且 group/other 权限位为零，通常设为 `0700`；数据库创建并最终设为 `0600`，实际运行账户需能读写并调整文件权限，见[权限说明](#运行身份与文件权限)。账本保存 query、`source_title`、`heading_path`、path 和 locator 等敏感元数据，但不保存旧的检索单元 `title`、snippet、正文、凭据或模型推理，不应放在 `sources/`、immutable 检索索引或仓库跟踪目录内。
+HTTP 与 stdio MCP 共用 `mcp.ledger` 配置；REST 不创建或更新任务。`path` 可省略，默认使用 workspace 下的 `var/execution-ledger.sqlite3`；显式相对路径以实际统一配置文件所在目录为基准。账本目录须预先存在且 group/other 权限位为零，通常设为 `0700`；数据库创建并最终设为 `0600`，实际运行账户需能读写并调整文件权限，见[权限说明](#运行身份与文件权限)。账本保存 query、`source_title`、`heading_path`、path 和 locator 等敏感元数据，但不保存旧的检索单元 `title`、snippet、正文、凭据或模型推理，不应放在 `sources/`、immutable 检索索引或仓库跟踪目录内。
 
 配置文件由用户或 agent 按部署目标修改；执行账本由服务维护，不通过 SQL 手改任务、次数或预算。索引、登记与日志同样通过项目入口更新，范围见[产物维护边界](../docs/usage.md#产物维护边界)。
 
 | 配置项 | 含义与默认值 |
 |---|---|
-| `mcp.ledger.path` | 必填，独立可写 SQLite 文件 |
+| `mcp.ledger.path` | 默认 `<data_root>/var/execution-ledger.sqlite3`，独立可写 SQLite 文件 |
 | `mcp.ledger.busy_timeout_ms` | 默认 1000；SQLite 锁等待上限，超时后工具 fail closed |
 | `mcp.ledger.max_tasks` | 默认 10000；达到后拒绝创建新任务 |
 | `mcp.ledger.max_mb` | 默认 256；按 1 MiB = 1,048,576 bytes 换算，达到后拒绝创建新任务 |
@@ -199,7 +298,7 @@ HTTP 与 stdio MCP 共用 `mcp.ledger` 配置；REST 不创建或更新任务。
 
 公开响应上限固定为 65,536 bytes；请求头固定为总计 8,192 bytes、最多 64 个 header、Authorization 最多 256 bytes。REST 请求 JSON 总计最多 32 个 key；MCP 请求总计最多 256 个 key，其中 `params._meta` 最多 192 个 key、紧凑 UTF-8 JSON 编码最多 8 KiB。两者单个数组均最多 20 项、整份消息嵌套深度最多 8 层；key 数包含所有嵌套对象。MCP 元数据预算独立于业务参数校验，不允许通过元数据扩展工具参数。这些是代码中的协议和资源边界，不是部署调优项，`config.json` 中出现同名字段会按未知字段拒绝。Nginx 仍应独立限制其接收边界，代理限制与应用常量不构成同一配置来源。
 
-`corpus_path` 指向索引数据目录，不是 `src/retrieval/` 代码目录，也不是单个 SQLite 文件；旧配置项 `retrieval_root` 已替换为 `corpus_path`。相对路径以 **配置文件所在目录** 为基准；若将配置安装到 `/etc/learn-corpus/config.json`，应将示例 `corpus_path` 改为实际索引的绝对路径。服务启动时固定 current 检索索引；修改配置、凭据或切换 current 后需重启。统一入口只接受 `--config`；活动分支缺少必填字段、字段值无效或出现未知字段时，服务说明原因并以状态码 2 退出。
+`corpus_path` 指向索引数据目录，不是 `src/retrieval/` 代码目录，也不是单个 SQLite 文件；未填写时使用 workspace 下的 `meta/corpus`。相对路径以 **配置文件所在目录** 为基准；若将配置安装到 `/etc/learn-corpus/config.json`，应明确设置 `workspace.data_root` 或 `corpus_path` 为部署机实际路径。服务启动时固定 current 检索索引；修改配置、凭据或切换 current 后需重启。统一入口可用 `--config` 选择配置；活动分支缺少必填字段、字段值无效或出现未知字段时，服务说明原因并以状态码 2 退出。
 
 ## HTTP 服务配置
 
@@ -421,7 +520,7 @@ cd /opt/learn-corpus
 
 ## 运维检查清单
 
-操作前确定实际服务配置、`corpus_path`、`mcp.ledger.path`、systemd 单元及使用该账本/索引的 host；路径以实际 `--config` 所指文件为准，相对路径以该配置所在目录解析。不要复制示例路径覆盖生产配置，也不要输出凭据。导入阶段异常先按[导入失败处理](../docs/usage.md#导入失败处理)核对。
+操作前确定实际服务配置、`corpus_path`、`mcp.ledger.path`、systemd 单元及使用该账本/索引的 host；路径以实际选中的配置文件为准，相对路径以该配置所在目录解析。不要复制示例路径覆盖生产配置，也不要输出凭据。导入阶段异常先按[导入失败处理](../docs/usage.md#导入失败处理)核对。
 
 ### 索引更新与验证
 

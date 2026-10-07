@@ -137,6 +137,163 @@ def test_invalid_workspace_fails_before_writing(workspace):
     env["LEARN_CORPUS_DATA_ROOT"] = ""
     result = run("src.maintenance.find_unprocessed", check=False)
     assert result.returncode != 0 and "nonempty" in result.stderr
-    env["LEARN_CORPUS_DATA_ROOT"] = str(engine / "src")
+    not_directory = data / "synthetic-not-directory"
+    not_directory.write_text("synthetic")
+    env["LEARN_CORPUS_DATA_ROOT"] = str(not_directory)
     result = run("src.maintenance.find_unprocessed", check=False)
-    assert result.returncode != 0 and "code directory" in result.stderr
+    assert result.returncode != 0 and "existing directory" in result.stderr
+
+
+def _clear_workspace_overrides(env):
+    env.pop("LEARN_CORPUS_DATA_ROOT", None)
+    env.pop("LEARN_CORPUS_CONFIG", None)
+
+
+def test_config_import_build_and_nongit_check_share_data_root(workspace):
+    data, engine, env, run = workspace
+    _clear_workspace_overrides(env)
+    config = engine / "config"
+    config.mkdir()
+    (config / "config.json").write_text(json.dumps({"workspace": {"data_root": "../.."}}))
+    raw = data.parent / "synthetic-config-input"
+    raw.mkdir()
+    (raw / "note.md").write_text("# Synthetic config note\n\nquasar atlas\n")
+    run("src.ingestion.import_notes", "--input", raw, "--include", "note.md")
+    run("src.maintenance.check_corpus")
+    run("src.retrieval.build_lexical_index")
+    assert (data / "meta/manifest.json").is_file()
+    assert list((data / "meta/corpus").glob("*/corpus.sqlite"))
+    assert not (data / ".git").exists()
+    assert not (engine / "sources").exists()
+    assert not (engine / "meta").exists()
+
+
+def test_submodule_discovers_private_config_before_code_config(tmp_path):
+    data = tmp_path / "synthetic-private"
+    public = tmp_path / "synthetic-public"
+    public.mkdir()
+    shutil.copytree(Path(__file__).resolve().parents[1] / "src", public / "src",
+                    ignore=shutil.ignore_patterns("__pycache__"))
+    for repo in [public, data]:
+        repo.mkdir(exist_ok=True)
+        subprocess.run(["git", "init", "-q", repo], check=True)
+        (repo / "synthetic-marker").write_text("synthetic\n")
+        subprocess.run(["git", "-C", repo, "add", "."], check=True)
+        subprocess.run(["git", "-C", repo, "-c", "user.name=Synthetic User", "-c",
+                        "user.email=synthetic@example.test", "commit", "-qm", "Synthetic baseline"], check=True)
+    subprocess.run(["git", "-C", data, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(public), "engine"], check=True)
+    (data / "config").mkdir()
+    (data / "config/config.json").write_text('{"workspace":{"data_root":".."}}')
+    engine = data / "engine"
+    (engine / "config").mkdir()
+    (engine / "config/config.json").write_text('{"workspace":{"data_root":"synthetic-missing"}}')
+    env = dict(os.environ)
+    _clear_workspace_overrides(env)
+    env.pop("PYTHONPATH", None)
+    result = subprocess.run([sys.executable, "-B", "-c", "from src.corpus.paths import DATA_ROOT; print(DATA_ROOT)"], cwd=engine, env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(data)
+
+
+@pytest.mark.parametrize("selection", ["default", "custom", "override", "single"])
+def test_workspace_selection_is_independent_of_process_cwd(workspace, selection):
+    data, engine, env, run = workspace
+    _clear_workspace_overrides(env)
+    (engine / "config").mkdir()
+    config = engine / "config/config.json"
+    config.write_text('{"workspace":{"data_root":"../.."}}')
+    expected = data
+    if selection == "custom":
+        config = data / "synthetic-custom.json"
+        config.write_text('{"workspace":{"data_root":"."}}')
+        env["LEARN_CORPUS_CONFIG"] = str(config)
+    elif selection == "override":
+        expected = data.parent / "synthetic-override"
+        expected.mkdir()
+        env["LEARN_CORPUS_DATA_ROOT"] = str(expected)
+    elif selection == "single":
+        config.unlink()
+        expected = engine
+    result = subprocess.run([sys.executable, "-B", "-c", "from src.corpus.paths import DATA_ROOT; print(DATA_ROOT)"],
+                            cwd=data.parent, env={**env, "PYTHONPATH": str(engine)}, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(expected)
+
+
+@pytest.mark.parametrize("raw, message", [
+    ('{"workspace":{"data_root":"synthetic-missing"}}', "existing directory"),
+    ('{"workspace":{"data_root":"../synthetic-missing"}}', "existing directory"),
+    ('{"workspace":{"data_root":""}}', "nonempty directory"),
+    ('{"workspace":{"data_root":false}}', "nonempty directory"),
+    ('{"workspace":{"data_rooot":".."}}', "unknown fields"),
+    ('{"workspace":null}', "must be an object"),
+    ('{"workspace":{"data_root":"..","data_root":"../.."}}', "invalid JSON"),
+    ('{"workspace":', "invalid JSON"),
+    ('{"synthetic_secret":"synthetic-sensitive-value"}', "unknown fields"),
+])
+def test_invalid_config_fails_before_any_data_write(workspace, raw, message):
+    data, engine, env, run = workspace
+    _clear_workspace_overrides(env)
+    (engine / "config").mkdir()
+    (engine / "config/config.json").write_text(raw)
+    result = run("src.maintenance.find_unprocessed", check=False)
+    assert result.returncode != 0 and message in result.stderr
+    assert "synthetic-sensitive-value" not in result.stderr
+    assert not (data / "meta").exists()
+    assert not (engine / "meta").exists()
+
+
+@pytest.mark.parametrize("selection", ["empty", "missing", "directory"])
+def test_explicit_config_selection_never_falls_back(workspace, selection):
+    data, engine, env, run = workspace
+    _clear_workspace_overrides(env)
+    env["LEARN_CORPUS_CONFIG"] = {"empty": "", "missing": str(data / "synthetic-missing.json"),
+                                 "directory": str(data)}[selection]
+    result = run("src.maintenance.find_unprocessed", check=False)
+    assert result.returncode != 0 and "LEARN_CORPUS_CONFIG" in result.stderr
+    assert not (engine / "meta").exists()
+
+
+@pytest.mark.parametrize("destination", ["outside", "code", "symlink"])
+def test_config_workspace_enforces_output_boundary(workspace, destination):
+    data, engine, env, run = workspace
+    _clear_workspace_overrides(env)
+    (engine / "config").mkdir()
+    (engine / "config/config.json").write_text('{"workspace":{"data_root":"../.."}}')
+    test_explicit_workspace_rejects_escaped_outputs(workspace, destination)
+
+
+@pytest.mark.parametrize("selection", ["no-file", "empty", "nested"])
+def test_same_repository_and_nested_data_layouts_import_normally(workspace, selection):
+    data, engine, env, run = workspace
+    _clear_workspace_overrides(env)
+    expected = engine
+    if selection != "no-file":
+        (engine / "config").mkdir()
+        if selection == "empty":
+            content = '{}'
+        else:
+            expected = engine / "synthetic-data"
+            expected.mkdir()
+            content = '{"workspace":{"data_root":"../synthetic-data"}}'
+        (engine / "config/config.json").write_text(content)
+    raw = data.parent / "synthetic-layout-input"
+    raw.mkdir()
+    (raw / "note.md").write_text("# Synthetic layout note\n\nquasar atlas\n")
+    run("src.ingestion.import_notes", "--input", raw, "--include", "note.md")
+    assert (expected / "meta/manifest.json").is_file()
+    assert list((expected / "sources/notes").glob("*.md"))
+    assert not (data / "meta").exists()
+
+
+def test_config_symlink_uses_actual_file_directory(workspace):
+    data, engine, env, run = workspace
+    _clear_workspace_overrides(env)
+    (data / "config").mkdir()
+    target = data / "config/config.json"
+    target.write_text('{"workspace":{"data_root":".."}}')
+    (engine / "config").mkdir()
+    (engine / "config/config.json").symlink_to(target)
+    result = subprocess.run([sys.executable, "-B", "-c", "from src.corpus.paths import DATA_ROOT; print(DATA_ROOT)"], cwd=engine, env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(data)
