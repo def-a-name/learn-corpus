@@ -16,14 +16,40 @@ venv/bin/python examples/run_example.py
 
 输出包括来源数、检索单元数、词法查询、命中与读取数量、来源标题和索引版本。它验证导入到证据读取的运行流程，不生成模型答案或开展检索质量评测。
 
-## 保留自己的示例数据
+## 在自己的工作区使用示例
 
-需要继续检索时，按[工作目录说明](../docs/workspaces.md)选择已存在的数据目录，从代码根目录执行：
+以下是可选示范，假定你已按[使用指南](../docs/usage.md#首次使用)准备好依赖、工作区配置、两个 skill 和本机 stdio MCP 连接。从代码目录打开 AI 客户端，在同一对话中依次操作：
 
-```bash
-export LEARN_CORPUS_DATA_ROOT=/absolute/path/to/data-workspace
-venv/bin/python -m src.ingestion.import_articles --input examples --include sqlite-fts5.md
-venv/bin/python -m src.retrieval.build_lexical_index --publish
-```
+1. **导入并构建索引**
 
-随后按[配置说明](../config/README.md)设置 `corpus_path` 和账本位置，由 MCP 客户端连接服务。命中摘要用于发现候选，引用依据来自进一步读取的正文。
+   ```text
+   使用 learn-corpus-ingestion，将 examples/sqlite-fts5.md 作为 article 导入当前工作区，并构建发布本地检索索引。
+   ```
+
+   完成后重连本机 stdio MCP，使服务使用新索引；其他部署方式见[索引更新与验证](../config/README.md#索引更新与验证)。
+
+2. **提问，体验 MCP 检索与回答**
+
+   ```text
+   使用 learn-corpus-retrieval，通过 MCP 检索刚导入的 SQLite FTS5 示例文章：unicode61 默认如何分词？如何将 - 和 _ 视为词的一部分？请给出配置示例和来源。
+   ```
+
+   AI 搜索候选、读取相关正文，再依据正文回答并标明来源。
+
+3. **展示检索摘要**
+
+   ```text
+   展示刚才问题的检索摘要。
+   ```
+
+   查看检索范围、关键证据、异常或缺口、停止原因及核心来源定位。
+
+4. **展示完整检索过程**
+
+   ```text
+   展示刚才问题的完整检索过程，包括调用记录和已读检索单元明细。
+   ```
+
+   在摘要基础上展开实际记录；受响应限制省略或无法恢复的信息应明确说明。
+
+后两步沿用刚才的检索任务，无需重新搜索或读取正文。
