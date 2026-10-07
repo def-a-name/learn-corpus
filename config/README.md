@@ -444,7 +444,7 @@ journalctl -u learn-corpus -f
 venv/bin/python -m src.retrieval.build_lexical_index --publish
 ```
 
-不加 `--publish` 时只构建，不切换 `current`。使用本地索引无需 Actions、GitHub PAT、Nginx 或 systemd；服务配置的 `corpus_path` 指向索引根目录。更新后重启 HTTP 服务或重连 stdio，调用 `status` 核对版本，旧索引保留规则见[重启与重连](#服务重启客户端重连与旧索引保留)。
+不加 `--publish` 时只构建，不切换 `current`。使用本地索引无需 Actions、GitHub PAT、Nginx 或 systemd；服务配置的 `corpus_path` 指向索引根目录。本地命令不重启服务，也不包含部署脚本的服务验收与回滚流程。构建后按[索引更新与验证](#索引更新与验证)完成运行版本验收。
 
 ### 可选的 Actions 与 systemd 发布
 
@@ -500,7 +500,6 @@ cd /opt/learn-corpus
 | `current` 缺失、损坏或索引不可用 | 确认索引已构建并发布、链接在索引根目录内且产物校验通过；服务不会自动重建 |
 | 服务配置被拒绝 | 检查显式 transport、必填字段、未知字段及 JSON 格式；相对路径以配置文件所在目录为基准 |
 | ledger 无法创建或打开 | 按[权限说明](#运行身份与文件权限)检查实际运行身份、目录遍历与读写权限、group/other 位，以及 schema、锁与磁盘情况；不删除活动数据库消除错误 |
-| 导入新资料后仍检索到旧版本 | 确认新索引已构建发布，HTTP 已重启或 stdio 已重连；用 MCP `status` 核对版本 |
 
 启动参数见[服务配置与启动](#服务配置与启动)，切换版本见[索引更新与验证](#索引更新与验证)。更新链接不等于运行进程已经换用新索引。
 
@@ -511,10 +510,10 @@ cd /opt/learn-corpus
 | 客户端没有 Learn Corpus 工具 | host 是否配置正确的 HTTP URL 或 stdio command/cwd；是否重新建立连接 |
 | stdio 进程看起来在等待 | stdio 等待 host 通过 stdin 发送协议消息；正常由客户端管理，不是交互式 CLI |
 | HTTP 返回 401 或 403 | Bearer 编码与凭据、直接 peer、Host 和 Origin 是否符合实际配置 |
-| 返回 429 / `rate_limited` | 并发或入口限制已触发；核对在途操作和配置，不能把拒绝当成没有检索证据 |
+| 返回 429 / `rate_limited` | 并发或入口限制已触发；核对在途操作和配置 |
 | 握手成功但没有可用证据正文 | host 是否消费 `structuredContent`，以及业务工具是否成功；工具注册成功不等于搜索和读取均已通过 |
 
-客户端示例见[本机 stdio](#本机-stdio-连接)和[HTTP MCP 连接](#codex-http-mcp-连接)。保留安全的错误码、请求标识与索引版本，反馈前去除凭据、查询正文、私人路径和来源内容。
+客户端示例见[本机 stdio](#本机-stdio-连接)和[HTTP MCP 连接](#codex-http-mcp-连接)。需要反馈时，按使用指南的[反馈问题](../docs/usage.md#反馈问题)整理信息。
 
 <a id="首版维护检查清单"></a>
 
@@ -524,15 +523,17 @@ cd /opt/learn-corpus
 
 ### 索引更新与验证
 
-1. 本地在来源导入与相应验证完成后，按明确授权构建索引。需要更新本地 `current` 时使用 `venv/bin/python -m src.retrieval.build_lexical_index --publish`；不加 `--publish` 只构建，不切换服务使用目标。该本地命令不重启服务、不中转 Actions artifact，也没有部署脚本的服务验收/回滚流程。
-2. 使用 Actions/systemd 发布时，按[可选发布流程](#可选的-actions-与-systemd-发布)选择目标 run，执行 `src.maintenance.deploy_index`。它只安装索引，不升级代码、依赖或配置；保留输出中的 run ID、attempt、commit 与 `index_id`。artifact 有效期为 7 天，缺失/过期不得将旧包冒充目标构建。其他运行方式按实际索引安装与进程管理方式处理。
-3. 检查退出状态和最终结果，而不只看构建完成或进程已启动。确认实际 `current` 指向目标索引；HTTP 使用带认证的 `/v1/status` 或 MCP `status`，stdio 使用 MCP `status` 核对 `index_id`。部署脚本的本机回环验收成功后，实际通过 HTTPS/MCP 使用时仍须验证该入口；前者成功不自动证明代理、凭据或 host 连接正常。
+1. 确认来源导入与相应验证已完成，再按[本地构建与使用](#本地构建与使用)执行已授权的构建；需要更新本地 `current` 时选择发布模式。
+2. 使用 Actions/systemd 发布时，按[可选发布流程](#可选的-actions-与-systemd-发布)选择目标 run 并执行发布。核对输出中的 run ID、attempt、commit 与 `index_id`；产物缺失或过期时重新构建目标提交，不用旧包替代。其他运行方式按实际索引安装与进程管理方式处理。
+3. 检查退出状态和最终结果，确认实际 `current` 指向目标索引，并按[重启与重连](#服务重启客户端重连与旧索引保留)让服务加载目标版本。HTTP 使用带认证的 `/v1/status` 或 MCP `status`，stdio 使用 MCP `status` 核对 `index_id`。部署脚本的本机回环验收成功后，实际通过 HTTPS/MCP 使用时仍须验证该入口；前者成功不自动证明代理、凭据或 host 连接正常。
 4. 使用部署脚本时，报告回滚成功后核对运行服务与原索引一致；报告回滚/清理失败时保留现场、日志和安装文件，停止继续切换，逐项查明链接、服务与文件状态。不要仅凭 `previous` 存在就手工覆盖 `current`，也不要用删除目录消除报错。
 
 ### 服务重启、客户端重连与旧索引保留
 
-- HTTP：部署脚本切换索引后会重启对应 systemd 服务；使用本地发布命令切换索引，或修改配置、凭据后，也需要重启该 HTTP 进程。重启后查服务状态及带认证的业务 status。HTTP host 通常不必因同 URL 的服务重启修改连接配置；如 host 缓存错误或工具列表，按其支持的方式重新连接/发现工具，不保证所有 host 自动恢复。
-- stdio：必须由 host 结束旧服务子进程并重新建立 stdio 连接，才能加载新版索引/配置；只改链接、只刷新界面或只新建检索 task 不保证启动新进程。重连后调用 MCP `status` 核对 `index_id`。
+重启或重连后的版本验收按[索引更新与验证](#索引更新与验证)执行。
+
+- HTTP：部署脚本切换索引后会重启对应 systemd 服务；使用本地发布命令切换索引，或修改配置、凭据后，也需要重启该 HTTP 进程。HTTP host 通常不必因同 URL 的服务重启修改连接配置；如 host 缓存错误或工具列表，按其支持的方式重新连接/发现工具，不保证所有 host 自动恢复。
+- stdio：必须由 host 结束旧服务子进程并重新建立 stdio 连接，才能加载新版索引/配置；只改链接、只刷新界面或只新建检索 task 不保证启动新进程。
 - 已有 MCP task 固定索引和创建时的 limits，不因服务重启或配置修改而迁移。不要把旧任务直接当成新版任务，也不要为规避上限重建同一任务；需要明确新目标或处理版本变更时向用户说明，不能声称可无损续接旧上下文。
 - 所有仍固定旧索引的 HTTP/stdio 进程退出前，保留旧目录。`current`、`previous` 不等于全部活跃进程的引用清单；首版没有自动索引回收和保留期限策略，本说明不授权清理其他旧索引。
 
