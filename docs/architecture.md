@@ -9,21 +9,25 @@ Learn Corpus 将资料接收、索引构建、在线检索和 AI 回答分开。
 ```mermaid
 ---
 config:
+  look: classic
+  layout: dagre
   themeVariables:
     fontSize: 14px
   flowchart:
-    nodeSpacing: 25
-    rankSpacing: 30
-    diagramPadding: 8
-    padding: 8
+    minNodeWidth: 0
+    wrappingWidth: 160
+    nodeSpacing: 16
+    rankSpacing: 20
+    diagramPadding: 4
+    padding: 6
 ---
-flowchart TD
+flowchart LR
     R["原始资料"] --> D["① 来源导入"]
-    D -->|标准化资料| B["② 索引构建与发布"]
+    D -->|标准化资料| B["② 索引构建<br/>与发布"]
     B -->|检索投影| Q["③ 在线检索"]
     U["用户问题"] --> A["④ LLM 整理"]
     A -->|搜索、读取| Q
-    Q -->|搜索->候选摘要<br/>读取->来源正文| A
+    Q -->|候选摘要、正文| A
     A --> O["有来源依据的回答"]
 ```
 
@@ -50,31 +54,40 @@ flowchart TD
 ```mermaid
 ---
 config:
+  look: classic
+  layout: dagre
   themeVariables:
     fontSize: 14px
   flowchart:
-    nodeSpacing: 20
-    rankSpacing: 20
+    minNodeWidth: 0
+    wrappingWidth: 180
+    nodeSpacing: 16
+    rankSpacing: 12
     diagramPadding: 4
     padding: 4
 ---
-flowchart TD
-    R["指定的原始资料"] --> P["识别类型，选取导入策略"]
-    P --> CL["CC 导出文件<br/>筛选问答"]
-    P --> CX["Codex 会话<br/>提取问答"]
-    P --> WC["网页会话<br/>解析角色"]
-    P --> MD["笔记与文章<br/>保留结构"]
-    CL --> D["敏感信息脱敏"]
-    CX --> D
-    WC --> D
-    MD --> D
-    D --> F["汇总候选 Markdown、元数据及附件"]
-    F --> C["检查身份、冲突与输入版本"]
-    C --> Q{"存在阻断问题？"}
-    Q -->|是| U["报告问题，由用户处理"]
-    U -->|重新导入| P
-    Q -->|否| W["写入资料并更新登记"]
-    W --> N["标准化资料层<br/>Markdown 文档与登记附件"]
+flowchart LR
+    subgraph AD["来源适配"]
+        direction TB
+        R["指定的原始资料"] --> P["识别类型<br/>选取导入策略"]
+        P --> CL["Claude Code 导出<br/>筛选问答"]
+        P --> CX["Codex 会话<br/>提取问答"]
+        P --> WC["网页会话<br/>解析角色"]
+        P --> MD["笔记与文章<br/>保留结构"]
+        CL --> D["敏感信息脱敏"]
+        CX --> D
+        WC --> D
+        MD --> D
+        D --> F["汇总候选资料<br/>正文、元数据与附件"]
+    end
+    subgraph BATCH["共同批次"]
+        direction TB
+        C["检查身份、冲突<br/>与输入版本"] --> Q{"阻断？"}
+        Q -->|是| U["报告问题<br/>用户处理后重新导入"]
+        Q -->|否| W["写入资料<br/>更新登记与日志"]
+        W --> N["标准化资料层<br/>Markdown 与登记附件"]
+    end
+    AD --> BATCH
 ```
 
 图中的四条分支是来源适配，各自负责以下处理：
@@ -88,7 +101,7 @@ flowchart TD
 
 各分支先准备候选资料与写入计划，**正式写入时交给共同批次层**。提交前检查来源身份、目标冲突和输入版本是否一致，并更新本批输入分析（inventory，记录输入的分析结果）与审核队列（review queue，列出待处理问题）。检查涉及原始文件、附件及来源登记表，准备后发生变化时需要重新准备。被规则正常排除的输入不等于阻断问题。
 
-图中的**写入资料并更新登记**包括：写入 Markdown 文档和登记附件，保存来源登记表（manifest，记录资料身份、路径、hash 与处理状态），追加变更日志（ingest log，记录实际的来源文件变动）。图中合并展示，实际仍按这一顺序执行。
+图中的**写入资料、更新登记与日志**包括：写入 Markdown 文档和登记附件，保存来源登记表（manifest，记录资料身份、路径、hash 与处理状态），追加变更日志（ingest log，记录实际的来源文件变动）。图中合并展示，实际仍按这一顺序执行。
 
 **标准化资料的正文统一保存为带 YAML front matter 的 Markdown 文件**，即在文件开头用 YAML 元数据块登记来源 ID、类型、原始路径、内容 hash、locator（原始内容的定位标记）和导入器版本。会话正文保留问答及角色结构，笔记和文章正文保留章节结构。图片和附件按来源规则另存并登记，正文中的资源引用指向相应位置。后续构建读取统一的文档与登记信息，再按会话或文档结构生成检索投影。
 
@@ -151,18 +164,22 @@ MCP 是 AI 使用检索工具的主要入口，REST 用于辅助检查、调试�
 ```mermaid
 ---
 config:
+  look: classic
+  layout: dagre
   themeVariables:
     fontSize: 14px
   flowchart:
-    nodeSpacing: 20
-    rankSpacing: 25
+    minNodeWidth: 0
+    wrappingWidth: 160
+    nodeSpacing: 16
+    rankSpacing: 20
     diagramPadding: 4
     padding: 4
 ---
-flowchart TD
+flowchart LR
     A["AI 客户端"] -->|HTTP MCP| H["HTTP 入口<br/>认证与访问检查"]
     A -->|stdio 管道| S["stdio 入口<br/>消息与管道处理"]
-    H --> M["MCP 协议与工具适配"]
+    H --> M["MCP 适配<br/>协议与工具"]
     S --> M
     M --> T["任务管理<br/>归属、限制与记录"]
     T --> C
@@ -207,22 +224,22 @@ REST 与 MCP 复用同一搜索算法和正文读取实现；在同一 HTTP 进�
 ```mermaid
 ---
 config:
+  look: classic
+  layout: dagre
   themeVariables:
-    fontSize: 13px
+    fontSize: 14px
   sequence:
-    actorFontSize: 13
-    messageFontSize: 13
-    noteFontSize: 13
-    width: 120
+    actorFontSize: 14
+    messageFontSize: 14
+    width: 100
     height: 32
-    actorMargin: 30
-    messageMargin: 18
+    actorMargin: 24
+    messageMargin: 12
     boxMargin: 6
-    noteMargin: 6
     diagramMarginX: 12
     diagramMarginY: 8
     mirrorActors: false
-    wrap: true
+    wrap: false
 ---
 sequenceDiagram
     participant T as MCP 任务层
@@ -231,7 +248,7 @@ sequenceDiagram
     participant I as 检索索引
     T->>L: 创建任务：保存任务与限制
     activate L
-    L-->>T: 任务标识与调用限制<br/>提交写事务，关闭连接
+    L-->>T: 任务标识与调用限制
     deactivate L
     T->>L: 准入：检查任务并预留额度
     activate L
@@ -245,15 +262,13 @@ sequenceDiagram
     activate L
     L-->>T: 提交写事务，关闭连接
     deactivate L
-    Note over T: 回答与证据
     T->>L: 按需查询过程明细
     activate L
-    L-->>T: 调用、额度与引用<br/>提交读事务，关闭连接
+    L-->>T: 调用、额度与引用
     deactivate L
-    Note over T: 检索过程记录
 ```
 
-创建、准入和结算各自使用 `BEGIN IMMEDIATE` 写事务，过程查询使用 `BEGIN` 读事务，成功时均以 `COMMIT` 结束。索引检索期间不持有账本写事务，也没有跨两个数据库的共同事务；查询过程明细只读取账本记录，不读取证据正文或扣除检索额度。
+创建、准入和结算各自使用 `BEGIN IMMEDIATE` 写事务，过程查询使用 `BEGIN` 读事务，成功时均以 `COMMIT` 结束并关闭连接。索引检索期间不持有账本写事务，也没有跨两个数据库的共同事务；查询过程明细只读取账本记录，不读取证据正文或扣除检索额度。
 
 > 预算与额度是对证据长度的估算，它不表示模型的真实计费 token。
 
@@ -282,13 +297,15 @@ AI 依据检索 skill 判断是否进入检索、选择下一步并组织回答�
 ```mermaid
 ---
 config:
+  look: classic
+  layout: dagre
   themeVariables:
     fontSize: 13px
   state:
     fontSize: 13
-    padding: 6
-    nodeSpacing: 20
-    rankSpacing: 25
+    padding: 4
+    nodeSpacing: 16
+    rankSpacing: 18
 ---
 stateDiagram-v2
     direction TB

@@ -12,4 +12,4 @@ jobs:
   build:
     uses: OWNER/learn-corpus/.github/workflows/build-index.yml@PUBLIC_CODE_COMMIT
     with:
-      repository: OWNER/learn-corpus-private
+      repository: def-a-name/learn-corpus-private

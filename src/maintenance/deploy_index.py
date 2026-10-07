@@ -31,10 +31,8 @@ from src.service.config import load_service_config, read_config_object
 from src.service.errors import HTTPFailure
 
 
-REPOSITORY = "example-owner/learn-corpus-private"
 REF = "refs/heads/main"
 SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
-API_ROOT = f"https://api.github.com/repos/{REPOSITORY}"
 INDEX_ID_PATTERN = re.compile(r"idx_[0-9a-f]{20}")
 MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
 RUNS_PER_PAGE = 100
@@ -56,7 +54,7 @@ class DeploymentConfig:
     service: str
     service_user: str
     run_id: int | None
-    repository: str = REPOSITORY
+    repository: str
 
 
 @dataclass(frozen=True)
@@ -181,7 +179,7 @@ def _github_token(path: Path) -> str:
     return match.group(1)
 
 
-def _request(url: str, token: str, *, binary: bool = False, repository: str = REPOSITORY) -> bytes | dict:
+def _request(url: str, token: str, *, binary: bool = False, repository: str) -> bytes | dict:
     if not url.startswith(f"https://api.github.com/repos/{repository}/"):
         raise ValueError("GitHub API URL is outside the expected repository")
     request = urllib.request.Request(
@@ -203,7 +201,7 @@ def _request(url: str, token: str, *, binary: bool = False, repository: str = RE
     return json.loads(data)
 
 
-def _check_run(run: dict, run_id: int, *, repository: str = REPOSITORY) -> tuple[str, int]:
+def _check_run(run: dict, run_id: int, *, repository: str) -> tuple[str, int]:
     if not isinstance(run, dict) or not isinstance(run.get("repository"), dict):
         raise ValueError("workflow run response is invalid")
     commit = run.get("head_sha")
@@ -224,7 +222,7 @@ def _check_run(run: dict, run_id: int, *, repository: str = REPOSITORY) -> tuple
     return commit, attempt
 
 
-def _latest_run_id(token: str, *, repository: str = REPOSITORY) -> int:
+def _latest_run_id(token: str, *, repository: str) -> int:
     """从预期工作流的成功运行中选创建时间最新的一次。"""
 
     latest: tuple[datetime, int] | None = None
@@ -286,7 +284,7 @@ def _check_artifacts(payload: dict, run_id: int, run_attempt: int, commit: str) 
     return artifact_id, digest
 
 
-def _extract_release(data: bytes, target: Path, run_id: int, run_attempt: int, commit: str, *, repository: str = REPOSITORY) -> tuple[dict, Path]:
+def _extract_release(data: bytes, target: Path, run_id: int, run_attempt: int, commit: str, *, repository: str) -> tuple[dict, Path]:
     """精确解包三个允许的文件，拒绝路径逃逸和额外内容。"""
 
     with zipfile.ZipFile(io.BytesIO(data)) as archive:

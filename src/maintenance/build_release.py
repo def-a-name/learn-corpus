@@ -18,7 +18,6 @@ from src.retrieval.index_artifact import validate_index_artifact
 from src.retrieval.project_items import project_corpus
 
 
-REPOSITORY = "example-owner/learn-corpus-private"
 REF = "refs/heads/main"
 SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
 
@@ -83,7 +82,7 @@ def _validate_assets(repo_root: Path) -> None:
                 raise ValueError(f"manifest asset hash mismatch: {source_id}")
 
 
-def build_release(repo_root: Path, output_root: Path, *, repository: str, ref: str, commit: str, run_id: str, run_attempt: str, base_commit: str | None = None, expected_repository: str = REPOSITORY, code_root: Path | None = None) -> dict:
+def build_release(repo_root: Path, output_root: Path, *, repository: str, ref: str, commit: str, run_id: str, run_attempt: str, base_commit: str | None = None, expected_repository: str, code_root: Path | None = None) -> dict:
     """只为预期仓库的 main 提交生成发布目录，不切换 current。"""
 
     repo_root = repo_root.resolve(strict=True)

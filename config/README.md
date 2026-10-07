@@ -351,7 +351,7 @@ venv/bin/python -m src.retrieval.build_lexical_index --publish
 
 以下是现有维护脚本支持的发布流程：Actions 构建索引、下载 artifact，再由部署机手动安装并管理 systemd 服务。它只适用于已配置该工作流的仓库及符合脚本要求的 Linux 部署环境，不是使用项目的必要步骤。
 
-构建 CLI 使用 `--repository owner/name`，部署配置使用必填的 `repository` 字段，分别显式指定并校验数据仓库来源；原有部署配置升级时必须补上该字段。私有数据 commit 固定代码 submodule，代码与数据的对应关系见[工作目录说明](../docs/workspaces.md)。具体校验见 [build_release.py](../src/maintenance/build_release.py) 和 [deploy_index.py](../src/maintenance/deploy_index.py)。部署脚本要求 HTTP 服务监听回环地址或 `0.0.0.0`，且允许回环验收；只监听非回环私有 IP 的分机部署不能直接使用该脚本。它不依赖特定代理或中转链路，也不验收 HTTPS 入口。
+构建 CLI 使用 `--repository owner/name`，部署配置使用必填的 `repository` 字段，分别显式指定并校验数据仓库来源；原有部署配置升级时必须补上该字段。构建函数及部署辅助函数的仓库参数也必须显式传入，代码不提供默认仓库；配置示例中的仓库名按实际数据仓库替换。私有数据 commit 固定代码 submodule，代码与数据的对应关系见[工作目录说明](../docs/workspaces.md)。具体校验见 [build_release.py](../src/maintenance/build_release.py) 和 [deploy_index.py](../src/maintenance/deploy_index.py)。部署脚本要求 HTTP 服务监听回环地址或 `0.0.0.0`，且允许回环验收；只监听非回环私有 IP 的分机部署不能直接使用该脚本。它不依赖特定代理或中转链路，也不验收 HTTPS 入口。
 
 构建产物称为 **retrieval index（检索索引）**，版本字段统一为 `index_id`，ID 为 `idx_…`，产物目录为 `<corpus_path>/<index_id>/`，元数据文件为 `index.json`。发布包的 `release.json` 使用 `version=2`，execution ledger 使用 schema 3；旧产物、旧接口字段和旧账本直接拒绝，不自动迁移。切换新版代码前须重新构建检索索引，将 `corpus_path` 指向预先创建的干净目录，账本使用新的数据库文件；客户端同步新的 REST/MCP 字段并重新发现工具。部署脚本可从空目录安装首个索引并创建 `current`；服务代码、配置、真实凭据和账本目录仍须事先准备，脚本不负责升级或迁移它们。
 

@@ -25,6 +25,8 @@ from src.retrieval.build_lexical_index import build_index, publish_index  # noqa
 from test_build_lexical_index import fixture_projection, make_item  # noqa: E402
 
 
+REPOSITORY = "synthetic-owner/synthetic-release-data"
+API_ROOT = f"https://api.github.com/repos/{REPOSITORY}"
 COMMIT = "a" * 40
 RUN_ID = 12345
 RUN_ATTEMPT = 2
@@ -33,6 +35,26 @@ CURRENT_INDEX_ID = "idx_" + "d" * 20
 PREVIOUS_INDEX_ID = "idx_" + "e" * 20
 DIGEST = "sha256:" + "b" * 64
 DATABASE_HASH = "sha256:" + "c" * 64
+
+
+@pytest.mark.parametrize("operation, args, kwargs", [
+    (deployment.DeploymentConfig, (), {
+        "service_config": Path("synthetic-service.json"),
+        "github_header_file": Path("synthetic-github.header"),
+        "service": "synthetic-service", "service_user": "synthetic-user", "run_id": RUN_ID,
+    }),
+    (deployment._request, (f"{API_ROOT}/actions/runs/{RUN_ID}", "synthetic-token"), {}),
+    (deployment._check_run, ({}, RUN_ID), {}),
+    (deployment._latest_run_id, ("synthetic-token",), {}),
+    (deployment._extract_release, (b"synthetic-archive", Path("synthetic-staging"), RUN_ID, RUN_ATTEMPT, COMMIT), {}),
+    (build_release, (Path("synthetic-data"), Path("synthetic-output")), {
+        "repository": REPOSITORY, "ref": deployment.REF, "commit": COMMIT,
+        "run_id": str(RUN_ID), "run_attempt": str(RUN_ATTEMPT),
+    }),
+], ids=["deployment-config", "github-request", "workflow-run", "latest-run", "release-archive", "release-build"])
+def test_repository_is_required_before_external_operations(operation, args, kwargs) -> None:
+    with pytest.raises(TypeError, match="repository"):
+        operation(*args, **kwargs)
 
 
 def test_explicit_repository_is_preserved_and_invalid_origin_is_rejected(tmp_path, monkeypatch):
@@ -47,7 +69,7 @@ def test_explicit_repository_is_preserved_and_invalid_origin_is_rejected(tmp_pat
     with pytest.raises(ValueError, match="expected repository"):
         deployment._check_run(run_record(RUN_ID), RUN_ID, repository=repository)
     with pytest.raises(ValueError, match="outside the expected repository"):
-        deployment._request(f"{deployment.API_ROOT}/actions/runs/{RUN_ID}", "synthetic-token", repository=repository)
+        deployment._request(f"{API_ROOT}/actions/runs/{RUN_ID}", "synthetic-token", repository=repository)
     for invalid in ["owner/repo/extra", "../repo", "https://example.test/repo", "owner/repo?secret", "owner/repo\n"]:
         value["repository"] = invalid
         config.write_text(json.dumps(value))
@@ -98,7 +120,7 @@ def test_release_code_must_match_clean_committed_submodule(tmp_path):
 def run_record(run_id: int, created_at: str = "2026-01-02T00:00:00Z") -> dict:
     return {
         "id": run_id,
-        "repository": {"full_name": deployment.REPOSITORY},
+        "repository": {"full_name": REPOSITORY},
         "head_branch": "main",
         "path": ".github/workflows/build-index.yml@refs/heads/main",
         "status": "completed",
@@ -112,7 +134,7 @@ def run_record(run_id: int, created_at: str = "2026-01-02T00:00:00Z") -> dict:
 def archive_bytes(*, extra: str | None = None, version: int = 2, index_prefix: str = "") -> bytes:
     metadata = {
         "version": version,
-        "repository": deployment.REPOSITORY,
+        "repository": REPOSITORY,
         "ref": deployment.REF,
         "commit": COMMIT,
         "run_id": RUN_ID,
@@ -133,7 +155,7 @@ def archive_bytes(*, extra: str | None = None, version: int = 2, index_prefix: s
 
 def test_accepts_matching_run_and_artifact_metadata() -> None:
     run = run_record(RUN_ID)
-    assert deployment._check_run(run, RUN_ID) == (COMMIT, RUN_ATTEMPT)
+    assert deployment._check_run(run, RUN_ID, repository=REPOSITORY) == (COMMIT, RUN_ATTEMPT)
     artifact = {
         "artifacts": [{
             "name": f"learn-corpus-index-{RUN_ID}-{RUN_ATTEMPT}",
@@ -148,7 +170,7 @@ def test_accepts_matching_run_and_artifact_metadata() -> None:
         deployment._check_artifacts({"artifacts": []}, RUN_ID, RUN_ATTEMPT, COMMIT)
     run["head_branch"] = "test"
     with pytest.raises(ValueError, match="workflow run"):
-        deployment._check_run(run, RUN_ID)
+        deployment._check_run(run, RUN_ID, repository=REPOSITORY)
 
 
 def test_latest_run_selects_newest_successful_main_build(monkeypatch) -> None:
@@ -160,9 +182,9 @@ def test_latest_run_selects_newest_successful_main_build(monkeypatch) -> None:
             run_record(102, "2026-01-02T00:00:00Z"),
         ],
     })
-    assert deployment._latest_run_id("synthetic-token") == 103
+    assert deployment._latest_run_id("synthetic-token", repository=REPOSITORY) == 103
     assert urls == [
-        f"{deployment.API_ROOT}/actions/workflows/build-index.yml/runs"
+        f"{API_ROOT}/actions/workflows/build-index.yml/runs"
         "?branch=main&status=success&per_page=100&page=1"
     ]
 
@@ -177,7 +199,7 @@ def test_latest_run_checks_later_pages(monkeypatch) -> None:
         return {"workflow_runs": [run_record(101, "2026-01-02T00:00:00Z")]}
 
     monkeypatch.setattr(deployment, "_request", request)
-    assert deployment._latest_run_id("synthetic-token") == 101
+    assert deployment._latest_run_id("synthetic-token", repository=REPOSITORY) == 101
     assert len(pages) == 2
 
 
@@ -190,23 +212,23 @@ def test_latest_run_requires_explicit_id_when_search_limit_is_reached(monkeypatc
 
     monkeypatch.setattr(deployment, "_request", request)
     with pytest.raises(ValueError, match="set run_id in deployment configuration"):
-        deployment._latest_run_id("synthetic-token")
+        deployment._latest_run_id("synthetic-token", repository=REPOSITORY)
     assert len(pages) == deployment.MAX_RUN_PAGES
 
 
 def test_latest_run_fails_closed_on_missing_or_invalid_listing(monkeypatch) -> None:
     monkeypatch.setattr(deployment, "_request", lambda url, token, **kwargs: {"workflow_runs": []})
     with pytest.raises(ValueError, match="no successful main"):
-        deployment._latest_run_id("synthetic-token")
+        deployment._latest_run_id("synthetic-token", repository=REPOSITORY)
     invalid = run_record(101)
     invalid["path"] = ".github/workflows/other.yml@refs/heads/main"
     monkeypatch.setattr(deployment, "_request", lambda url, token, **kwargs: {"workflow_runs": [invalid]})
     with pytest.raises(ValueError, match="expected repository"):
-        deployment._latest_run_id("synthetic-token")
+        deployment._latest_run_id("synthetic-token", repository=REPOSITORY)
     invalid = run_record(101, "invalid-time")
     monkeypatch.setattr(deployment, "_request", lambda url, token, **kwargs: {"workflow_runs": [invalid]})
     with pytest.raises(ValueError, match="creation time"):
-        deployment._latest_run_id("synthetic-token")
+        deployment._latest_run_id("synthetic-token", repository=REPOSITORY)
 
 
 def test_cli_only_accepts_required_config(monkeypatch, capsys, tmp_path: Path) -> None:
@@ -237,7 +259,7 @@ def test_deployment_config_selects_run_and_resolves_paths(tmp_path: Path, run_id
     config_path.parent.mkdir()
     config_path.write_text(json.dumps({
         "service_config": "../service.json",
-        "repository": deployment.REPOSITORY,
+        "repository": REPOSITORY,
         "github_header_file": "header",
         "service": "synthetic-service",
         "service_user": "synthetic-user",
@@ -283,7 +305,7 @@ def test_deployment_config_rejects_invalid_fields(tmp_path: Path, extra, message
     config_path = tmp_path / "deploy.json"
     config = {
         "service_config": "service.json",
-        "repository": deployment.REPOSITORY,
+        "repository": REPOSITORY,
         "github_header_file": "header",
         "service": "synthetic-service",
         "service_user": "synthetic-user",
@@ -351,6 +373,7 @@ def test_latest_missing_artifact_does_not_fall_back(tmp_path: Path, monkeypatch)
         service="synthetic-service",
         service_user="synthetic-user",
         run_id=None,
+        repository=REPOSITORY,
     ))
     monkeypatch.setattr(deployment, "load_service_config", lambda path: SimpleNamespace(
         transport="http",
@@ -386,21 +409,23 @@ def test_latest_missing_artifact_does_not_fall_back(tmp_path: Path, monkeypatch)
 def test_extract_rejects_extra_archive_member(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="unexpected paths"):
         deployment._extract_release(
-            archive_bytes(extra="../escape.txt"), tmp_path, RUN_ID, RUN_ATTEMPT, COMMIT
+            archive_bytes(extra="../escape.txt"), tmp_path, RUN_ID, RUN_ATTEMPT, COMMIT,
+            repository=REPOSITORY,
         )
     assert not (tmp_path.parent / "escape.txt").exists()
 
 
 def test_extract_rejects_old_release_version_before_writing(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="release metadata does not match workflow run"):
-        deployment._extract_release(archive_bytes(version=1), tmp_path, RUN_ID, RUN_ATTEMPT, COMMIT)
+        deployment._extract_release(archive_bytes(version=1), tmp_path, RUN_ID, RUN_ATTEMPT, COMMIT, repository=REPOSITORY)
     assert not list(tmp_path.iterdir())
 
 
 def test_extract_rejects_nested_index_layout_before_writing(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="unexpected paths"):
         deployment._extract_release(
-            archive_bytes(index_prefix="indexes/"), tmp_path, RUN_ID, RUN_ATTEMPT, COMMIT
+            archive_bytes(index_prefix="indexes/"), tmp_path, RUN_ID, RUN_ATTEMPT, COMMIT,
+            repository=REPOSITORY,
         )
     assert not list(tmp_path.iterdir())
 
@@ -412,7 +437,8 @@ def test_extract_checks_release_binding_before_index_validation(tmp_path: Path, 
         lambda path: {"source_digest": DIGEST, "database_sha256": DATABASE_HASH},
     )
     release, index_path = deployment._extract_release(
-        archive_bytes(), tmp_path, RUN_ID, RUN_ATTEMPT, COMMIT
+        archive_bytes(), tmp_path, RUN_ID, RUN_ATTEMPT, COMMIT,
+        repository=REPOSITORY,
     )
     assert release["index_id"] == INDEX_ID
     assert index_path == tmp_path / INDEX_ID
@@ -421,7 +447,7 @@ def test_extract_checks_release_binding_before_index_validation(tmp_path: Path, 
 
 def test_cross_domain_redirect_drops_github_token() -> None:
     request = deployment.urllib.request.Request(
-        f"{deployment.API_ROOT}/actions/artifacts/987/zip",
+        f"{API_ROOT}/actions/artifacts/987/zip",
         headers={"Authorization": "Bearer synthetic-fixture"},  # secret-scan: allow - synthetic token fixture
     )
     redirected = deployment._SafeRedirect().redirect_request(
@@ -499,11 +525,12 @@ def test_build_release_from_synthetic_committed_note(tmp_path: Path) -> None:
     output = tmp_path / "release"
     release = build_release(
         repo, output,
-        repository=deployment.REPOSITORY,
+        repository=REPOSITORY,
         ref=deployment.REF,
         commit=commit,
         run_id=str(RUN_ID),
         run_attempt=str(RUN_ATTEMPT),
+        expected_repository=REPOSITORY,
     )
     index_path = output / release["index_id"]
     assert {path.name for path in index_path.iterdir()} == {"index.json", "corpus.sqlite"}
@@ -517,7 +544,8 @@ def test_build_release_from_synthetic_committed_note(tmp_path: Path) -> None:
     extracted = tmp_path / "synthetic-extracted"
     extracted.mkdir()
     extracted_release, extracted_index = deployment._extract_release(
-        archive_output.getvalue(), extracted, RUN_ID, RUN_ATTEMPT, commit
+        archive_output.getvalue(), extracted, RUN_ID, RUN_ATTEMPT, commit,
+        repository=REPOSITORY,
     )
     assert extracted_release == release
     assert (extracted_index / "corpus.sqlite").read_bytes() == (index_path / "corpus.sqlite").read_bytes()
@@ -543,6 +571,7 @@ def _stub_deployment(monkeypatch, retrieval_root: Path, *, run_id: int | None = 
         service="synthetic-service",
         service_user="synthetic-user",
         run_id=run_id,
+        repository=REPOSITORY,
     ))
     monkeypatch.setattr(deployment, "load_service_config", lambda path: config)
     monkeypatch.setattr(deployment, "_github_token", lambda path: "synthetic-token")
@@ -664,7 +693,7 @@ def ready_deployment(tmp_path: Path, monkeypatch):
     ))
     artifact = build_index(projection, tmp_path / "synthetic-artifact")
     metadata = {
-        "version": 2, "repository": deployment.REPOSITORY, "ref": deployment.REF,
+        "version": 2, "repository": REPOSITORY, "ref": deployment.REF,
         "commit": COMMIT, "run_id": RUN_ID, "run_attempt": RUN_ATTEMPT,
         "index_id": artifact.index_id, "source_digest": artifact.source_digest,
         "database_sha256": artifact.database_sha256,
