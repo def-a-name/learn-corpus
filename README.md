@@ -43,41 +43,40 @@ flowchart LR
 
 ## 开始使用
 
-首次使用推荐按[公开示例](examples/README.md#在自己的工作区使用示例)，将 [SQLite FTS5 示例文章](examples/sqlite-fts5.md)作为第一个导入对象，完成导入、索引发布、MCP 配置与检索问答。环境准备、日常更新和常见问题见[使用指南](docs/usage.md)。
+使用时需要支持 MCP 的 AI 客户端，并加载[来源导入 skill](.agents/skills/learn-corpus-ingestion/SKILL.md)和[检索 skill](.agents/skills/learn-corpus-retrieval/SKILL.md)。
 
-也可先运行[临时验证脚本](examples/README.md#运行完整流程)，检查导入到 MCP 正文读取的流程；临时索引退出后回收，自己的工作区仍需完成导入和连接配置。连接检索服务后，向 AI 描述问题，例如：
+首次使用推荐按[公开示例](examples/README.md#在工作区应用示例)，将 [SQLite FTS5 示例文章](examples/sqlite-fts5.md)作为第一个导入对象，完成导入、索引发布、MCP 配置与检索问答。
+
+也可先运行[验证脚本](examples/README.md#全流程验证脚本)，检查导入到 MCP 正文读取的流程；临时索引退出后回收，自己的工作区仍需完成导入和连接配置。连接检索服务后，向 AI 描述问题，例如：
 
 ```text
 使用 learn-corpus-retrieval 回答：<问题>。
 ```
 
-AI 做出回答之后，可以向它索要检索过程。检索过程有 2 档详细程度：
+AI 做出回答之后，可以向它索要两种详细程度的检索过程：
 
-- **提问：** 围绕具体问题检索资料，给出有来源的回答。
 - **展示检索摘要：** 概括检索范围、关键证据、异常或缺口、停止原因，并给出核心来源定位。
 - **展示完整检索过程：** 在检索摘要基础上，进一步展开调用记录和已读检索单元的明细；受响应限制省略的部分会明确说明。
-
-使用时需要支持 MCP 的 AI 客户端，并加载[来源导入 skill](.agents/skills/learn-corpus-ingestion/SKILL.md)和[检索 skill](.agents/skills/learn-corpus-retrieval/SKILL.md)。
 
 ## 使用须知
 
 - 当前采用词法检索，效果受资料覆盖和实际用词影响；回答仍可能遗漏或误判。
 - 标准化来源经过筛选和清洗，不是原始记录的无损归档，也不保证完全脱敏；资料和检索索引应妥善保护。
-- 当前提供来源导入和只读检索。详细功能边界、运行前提及维护要求见[使用指南](docs/usage.md#使用须知)。
+- 当前提供来源导入与标准化、检索索引构建、只读搜索与正文读取，以及 REST、HTTP MCP 和 stdio MCP 接口；不提供 Memory 提取、Wiki 生成或整理、向量或语义检索、服务端模型回答、人工审核 Web 界面、来源或知识写回接口及公网 OAuth。
 
 ## 文档与帮助
 
 | 内容 | 阅读位置 |
 |---|---|
-| 首次使用、日常更新和常见问题 | [使用指南](docs/usage.md) |
+| 环境准备、资料更新、功能边界和常见问题 | [使用指南](docs/usage.md) |
 | 数据流、模块边界及关键设计 | [架构说明](docs/architecture.md) |
 | 本机连接、HTTP 配置、部署和运行排查 | [配置与部署](config/README.md) |
+| 源码模块与手动命令入口 | [源码说明](src/README.md) |
+| 开发与提交约定 | [AGENTS.md](AGENTS.md) |
 
 <a id="导入失败后的处理边界"></a>
 
-导入或检索问题见[使用指南的常见问题](docs/usage.md#常见问题)。反馈时说明预期行为、实际结果和错误阶段，去除凭据、私人路径与来源内容。
-
-开发者可从[源码说明](src/README.md)查找模块与命令入口，开发约定见 [AGENTS.md](AGENTS.md)。
+反馈问题时说明预期行为、实际结果和错误阶段，去除凭据、私人路径与来源内容。
 
 <a id="参考项目"></a>
 

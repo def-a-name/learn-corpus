@@ -15,7 +15,7 @@
 
 ## 首次使用
 
-推荐将 [examples/sqlite-fts5.md](../examples/sqlite-fts5.md) 作为第一个导入对象，按[公开示例](../examples/README.md#在自己的工作区使用示例)完成第一次完整操作：准备环境与工作区 → 导入并构建发布索引 → 连接 MCP → 检索问答。来源导入和索引构建不依赖 MCP；尚无可用索引时，MCP 服务会启动失败，因此应在索引发布成功后再建立连接。
+推荐将 [examples/sqlite-fts5.md](../examples/sqlite-fts5.md) 作为第一个导入对象，按[公开示例](../examples/README.md#在工作区应用示例)完成第一次完整操作：准备环境与工作区 → 导入并构建发布索引 → 连接 MCP → 检索问答。来源导入和索引构建不依赖 MCP；尚无可用索引时，MCP 服务会启动失败，因此应在索引发布成功后再建立连接。
 
 ### 环境准备
 
@@ -40,7 +40,7 @@ venv/bin/python -m pip install -r requirements.txt
 使用 learn-corpus-ingestion，将 examples/sqlite-fts5.md 作为文章类型导入当前工作区，并构建发布本地检索索引。
 ```
 
-完整的示例操作见 [examples/README.md](../examples/README.md#在自己的工作区使用示例)。也可以从自己的 Markdown 笔记或文章开始，或指定 Claude Code、Codex、受支持的网页会话导出；明确路径与来源类型，格式适配、筛选及验证由导入 skill 处理。
+完整的示例操作见 [examples/README.md](../examples/README.md#在工作区应用示例)。也可以从自己的 Markdown 笔记或文章开始，或指定 Claude Code、Codex、受支持的网页会话导出；明确路径与来源类型，格式适配、筛选及验证由导入 skill 处理。
 
 成功后，`sources/` 保存标准化来源，`meta/manifest.json` 登记已接受的来源，`meta/corpus/current` 指向已发布的检索索引。导入和索引构建是两个操作，上面的请求明确包含构建与发布。空语料不能直接构建可用索引。
 
