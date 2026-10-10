@@ -74,7 +74,7 @@ flowchart LR
         P --> CX["Codex 会话<br/>提取问答"]
         P --> WC["网页会话<br/>解析角色"]
         P --> MD["笔记与文章<br/>保留结构"]
-        CL --> D["敏感信息脱敏"]
+        CL --> D["信息脱敏"]
         CX --> D
         WC --> D
         MD --> D

@@ -80,18 +80,21 @@ AI 做出回答之后，可以向它索要两种详细程度的检索过程：
 
 <a id="参考项目"></a>
 
-## 参考项目与资料
+## 致谢
 
-项目开发参考了以下开源仓库的代码与设计：
+项目开发过程中得到了众多开源帮助，特此感谢：
+
+项目：
 
 - [QMD](https://github.com/tobi/qmd)
 - [Letta Code](https://github.com/letta-ai/letta-code)
 
-全文检索与迭代检索的参考资料：
+参考资料：
 
-- [Iter-RetGen：Enhancing Retrieval-Augmented Large Language Models with Iterative Retrieval-Generation Synergy](https://aclanthology.org/2023.findings-emnlp.620/)
-- [FLARE：Active Retrieval Augmented Generation](https://arxiv.org/abs/2305.06983)
 - [SQLite FTS5 Extension](https://www.sqlite.org/fts5.html)
+- [Karpathy's LLM Wiki idea](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)
+
+社区：[LINUX DO 社区](https://linux.do)
 
 本项目采用 [MIT License](LICENSE)。演示文章的来源与授权说明单独记录，不由项目许可证重新授权。
 
